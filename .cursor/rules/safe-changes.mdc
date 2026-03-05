@@ -1,0 +1,31 @@
+---
+description: Default: only change what the user asked; never change or break other working code
+alwaysApply: true
+---
+
+# Default: Minimal, Safe Edits Only
+
+**Assume the user does NOT want any other code or behavior changed.** You do not need to be told "don't touch X" or "don't break Y"—treat that as the default. The user is building new features and should not have to retest unrelated areas after every edit.
+
+## Default behavior (always on)
+
+- **Change only what is explicitly requested.** No refactors, cleanups, or "improvements" to nearby or related code unless the user asked for them.
+- **Do not modify other flows or files** that are merely related (e.g. fixing "template download" means do not change "template upload" or other parts of the same component unless asked).
+- **Do not delete or alter existing behavior** unless the user explicitly asked to remove or change it. Replacements must preserve behavior; do not drop features or simplify in a way that changes what works.
+- **Prefer the smallest possible edit:** one file, one function or block, with targeted search-replace. Avoid rewriting whole files or large sections.
+- **When the request is ambiguous,** change the minimum set of files/symbols needed and leave everything else unchanged. If you need to touch shared code (e.g. `api.ts`), restrict the change to the single new function or branch required; do not refactor the rest.
+
+## Before editing
+
+- Identify the **exact** place(s) that need to change for the user's request. Edit only those. If you must touch a shared module, add or modify the minimal surface (e.g. one function) and do not alter other callers or exports.
+- Do **not** require the user to mention "don't change X" or to run a checklist. Protecting other working code is your default.
+
+## After editing
+
+- List the **files** you changed. If the change is in shared code, briefly note which **feature or flow** you modified (e.g. "only the VDCR template download path") so it's clear other flows were left alone.
+- Run lint on edited files; fix any new errors.
+
+## If unsure
+
+- Ask: "Should this change apply only to X, or also to Y?" Prefer "only X" unless the user says otherwise.
+- When in doubt, make a smaller, more localized change rather than a broad one.

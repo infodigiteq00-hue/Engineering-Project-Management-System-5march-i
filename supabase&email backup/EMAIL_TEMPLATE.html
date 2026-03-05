@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome Email Template</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f3f4f6;
+            line-height: 1.6;
+            color: #1f2937;
+        }
+        
+        .email-container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            overflow: hidden;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+        
+        .header {
+            background-color: #ffffff;
+            padding: 32px 24px 24px;
+            text-align: center;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        
+        .header-intro {
+            margin: 0 0 12px 0;
+            font-size: 18px;
+            font-weight: 600;
+            color: #1f2937;
+        }
+        
+        .logo {
+            display: block;
+            margin: 0 auto 12px;
+            height: 48px;
+            width: auto;
+            max-width: 220px;
+            object-fit: contain;
+        }
+        
+        .header-tagline {
+            margin: 0;
+            font-size: 14px;
+            color: #6b7280;
+        }
+        
+        .content {
+            padding: 32px 24px;
+        }
+        
+        .welcome-section {
+            margin-bottom: 28px;
+        }
+        
+        .welcome-section h2 {
+            color: #1f2937;
+            font-size: 22px;
+            margin: 0 0 8px 0;
+            font-weight: 600;
+        }
+        
+        .welcome-section p {
+            color: #6b7280;
+            font-size: 15px;
+            margin: 0;
+        }
+        
+        .details-section {
+            margin-bottom: 28px;
+        }
+        
+        .details-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+        }
+        
+        .info-table {
+            width: 100%;
+            border-collapse: collapse;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        
+        .info-row {
+            border-bottom: 1px solid #d1d5db;
+        }
+        
+        .info-row:last-child {
+            border-bottom: none;
+        }
+        
+        .info-label {
+            width: 140px;
+            padding: 14px 16px;
+            font-size: 13px;
+            font-weight: 500;
+            color: #6b7280;
+            background-color: #f9fafb;
+        }
+        
+        .info-value {
+            padding: 14px 16px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #1f2937;
+        }
+        
+        .cta-section {
+            text-align: center;
+            margin: 28px 0;
+        }
+        
+        .cta-button {
+            display: inline-block;
+            background-color: #1e40af;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 14px 28px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 15px;
+            text-align: center;
+        }
+        
+        .next-steps {
+            background-color: #f9fafb;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 20px;
+        }
+        
+        .next-steps h3 {
+            color: #1f2937;
+            margin: 0 0 12px 0;
+            font-size: 15px;
+            font-weight: 600;
+        }
+        
+        .next-steps ul {
+            color: #4b5563;
+            margin: 0;
+            padding-left: 20px;
+            font-size: 14px;
+            line-height: 1.8;
+        }
+        
+        .next-steps li {
+            margin-bottom: 4px;
+        }
+        
+        .footer {
+            background-color: #f9fafb;
+            padding: 24px;
+            text-align: center;
+            border-top: 1px solid #e5e7eb;
+        }
+        
+        .footer p {
+            color: #6b7280;
+            font-size: 13px;
+            margin: 6px 0;
+        }
+        
+        .footer a {
+            color: #1e40af;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        
+        .footer a:hover {
+            text-decoration: underline;
+        }
+        
+        .footer-copyright {
+            margin-top: 16px;
+            font-size: 12px;
+            color: #9ca3af;
+        }
+        
+        @media (max-width: 600px) {
+            .email-container {
+                margin: 0;
+            }
+            
+            .content {
+                padding: 24px 20px;
+            }
+            
+            .header {
+                padding: 24px 20px 20px;
+            }
+            
+            .info-label,
+            .info-value {
+                display: block;
+                width: 100%;
+                padding: 10px 16px;
+            }
+            
+            .info-label {
+                background-color: #f9fafb;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                padding-bottom: 4px;
+            }
+            
+            .info-value {
+                padding-top: 4px;
+                padding-bottom: 12px;
+                border-bottom: 1px solid #e5e7eb;
+            }
+            
+            .info-row:last-child .info-value {
+                border-bottom: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="email-container" style="border: 1px solid #d1d5db; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+        <!-- Header with Logo -->
+        <div class="header" style="border-bottom: 1px solid #d1d5db;">
+            <p class="header-intro">Welcome to</p>
+            <img src="https://www.projectflo.io/Group%20134614.png" alt="Project Σ.io by Digiteq Solution" class="logo" />
+            <p class="header-tagline">The future of project management for engineering companies.</p>
+        </div>
+        
+        <!-- Content -->
+        <div class="content">
+            <div class="welcome-section">
+                <h2>Welcome, {{to_name}}</h2>
+                <p>Your account has been successfully created and you're ready to get started.</p>
+            </div>
+            
+            <div class="details-section">
+                <div class="details-title">Your Account Details</div>
+                <table class="info-table" cellpadding="0" cellspacing="0" border="0" style="border: 1px solid #d1d5db; border-collapse: collapse; width: 100%;">
+                    <tr class="info-row">
+                        <td class="info-label" style="border-bottom: 1px solid #d1d5db;">Company</td>
+                        <td class="info-value" style="border-bottom: 1px solid #d1d5db;">{{company_name}}</td>
+                    </tr>
+                    <tr class="info-row">
+                        <td class="info-label" style="border-bottom: 1px solid #d1d5db;">Your Role</td>
+                        <td class="info-value" style="border-bottom: 1px solid #d1d5db;">{{role}}</td>
+                    </tr>
+                    <tr class="info-row">
+                        <td class="info-label" style="border-bottom: 1px solid #d1d5db;">Login Email</td>
+                        <td class="info-value" style="border-bottom: 1px solid #d1d5db;">{{to_email}}</td>
+                    </tr>
+                    
+                </table>
+            </div>
+            
+            <div class="cta-section">
+                <a href="https://www.projectflo.io/signup" class="cta-button">Create Your Account</a>
+            </div>
+            
+            <div class="next-steps" style="border: 1px solid #d1d5db; border-radius: 6px;">
+                <h3>Next Steps</h3>
+                <ul>
+                    <li>Click "Create Your Account" to set up your password</li>
+                    <li>Use your email: <strong>{{to_email}}</strong></li>
+                    <li>Choose a secure password</li>
+                    <li>Access your personalized dashboard</li>
+                </ul>
+            </div>
+        </div>
+        
+        <!-- Footer -->
+        <div class="footer" style="border-top: 1px solid #d1d5db;">
+            <p><strong>Need Help?</strong></p>
+            <p>Our support team is here to assist you every step of the way.</p>
+            <p>Email us at <a href="mailto:info@digiteqsolution.com">info@digiteqsolution.com</a></p>
+            
+        </div>
+    </div>
+</body>
+</html>
