@@ -1178,6 +1178,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
   };
 
+  // Load project members when projectId is set (e.g. after project create) so PM/VDCR show in EQU Team tab even before equipment loads
+  useEffect(() => {
+    if (projectId && projectId !== 'standalone') {
+      loadProjectMembers();
+    }
+  }, [projectId]);
+
   // Listen for team member changes from Settings tab
   useEffect(() => {
     const handleTeamMemberChange = () => {
@@ -10441,15 +10448,30 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                 }
                               }
                             } else {
-                              // For project equipment: use equipment_team_positions (allEquipmentTeamMembers) first, then projectMembers
-                              if (allEquipmentTeamMembers[item.id] && allEquipmentTeamMembers[item.id].length > 0) {
-                                assignedMembers = allEquipmentTeamMembers[item.id];
-                              } else {
-                                assignedMembers = projectMembers.filter(member => {
-                                  return member.equipment_assignments &&
-                                    (member.equipment_assignments.includes(item.id) ||
-                                     member.equipment_assignments.includes("All Equipment"));
-                                });
+                              // For project equipment: merge projectMembers (PM/VDCR with "All Equipment") and equipment_team_positions so both always show
+                              const fromProjectMembers = projectMembers.filter(member => {
+                                return member.equipment_assignments &&
+                                  (member.equipment_assignments.includes(item.id) ||
+                                   member.equipment_assignments.includes("All Equipment"));
+                              });
+                              const fromEquipmentPositions = (allEquipmentTeamMembers[item.id] && allEquipmentTeamMembers[item.id].length > 0)
+                                ? allEquipmentTeamMembers[item.id]
+                                : [];
+                              const seenKey = (m: any) => {
+                                const email = (m.email || '').toString().toLowerCase().trim();
+                                const name = (m.name || m.person_name || '').toString().trim();
+                                const pos = (m.position || m.position_name || '').toString().trim();
+                                return email ? `e:${email}` : `n:${name}|${pos}`;
+                              };
+                              const seen = new Set<string>();
+                              assignedMembers = [];
+                              for (const m of fromProjectMembers) {
+                                const key = seenKey(m);
+                                if (!seen.has(key)) { seen.add(key); assignedMembers.push(m); }
+                              }
+                              for (const m of fromEquipmentPositions) {
+                                const key = seenKey(m);
+                                if (!seen.has(key)) { seen.add(key); assignedMembers.push(m); }
                               }
                             }
                             
