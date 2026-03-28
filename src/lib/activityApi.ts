@@ -444,6 +444,7 @@ export const activityApi = {
   // Get VDCR activity logs by project
   async getVDCRActivityLogs(projectId: string, filters?: {
     vdcrId?: string;
+    vdcrIds?: string[];
     activityType?: string;
     userId?: string;
     dateFrom?: string;
@@ -455,12 +456,14 @@ export const activityApi = {
       // console.log('📋 Fetching VDCR activity logs for project:', projectId);
       
       // Build the select query first - this is critical for PostgREST
-      let selectQuery = `select=*,created_by_user:created_by(full_name,email),vdcr_record:vdcr_id(document_name,status)`;
+      let selectQuery = `select=*,created_by_user:created_by(full_name,email),vdcr_record:vdcr_id(document_name,status,department)`;
       
       // Start with the base query and select
       let query = `/vdcr_activity_logs?project_id=eq.${projectId}&${selectQuery}`;
       
-      if (filters?.vdcrId) {
+      if (filters?.vdcrIds?.length) {
+        query += `&vdcr_id=in.(${filters.vdcrIds.join(',')})`;
+      } else if (filters?.vdcrId) {
         query += `&vdcr_id=eq.${filters.vdcrId}`;
       }
       if (filters?.activityType) {

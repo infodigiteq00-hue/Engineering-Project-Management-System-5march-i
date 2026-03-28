@@ -3375,6 +3375,38 @@ Industry: Petrochemical`;
         return;
       }
       
+      const normalize = (v: any) => String(v || '').trim().toLowerCase();
+      let existingProjectMembers: any[] = [];
+      try {
+        const rows = await fastAPI.getProjectMembers(projectId);
+        existingProjectMembers = Array.isArray(rows) ? rows : [];
+      } catch {
+        existingProjectMembers = [];
+      }
+
+      // Prevent duplicate PM/VDCR rows on project edit:
+      // - same role + same email -> skip
+      // - same role exists with different email/name -> update existing row
+      // - no row for role -> create
+      const upsertManagerMember = async (role: 'project_manager' | 'vdcr_manager', payload: any) => {
+        const roleMembers = existingProjectMembers.filter((m: any) => m?.role === role);
+        const targetEmail = normalize(payload.email);
+        const exactMatch = roleMembers.find((m: any) => normalize(m?.email) === targetEmail);
+        if (exactMatch) return;
+
+        const roleRowToUpdate = roleMembers.find((m: any) => !!m?.id);
+        if (roleRowToUpdate?.id) {
+          await fastAPI.updateProjectMember(roleRowToUpdate.id, payload);
+          existingProjectMembers = existingProjectMembers.map((m: any) =>
+            m?.id === roleRowToUpdate.id ? { ...m, ...payload } : m
+          );
+          return;
+        }
+
+        await fastAPI.createProjectMember(payload);
+        existingProjectMembers = [...existingProjectMembers, payload];
+      };
+
       // Add Project Manager to project_members table (only with resolved email – no @company.com)
       if (formData.projectManager && formData.projectManager.trim() !== '') {
         const { email: projectManagerEmail, phone: projectManagerPhone } = await resolveManagerEmail(formData.projectManager, 'project_manager');
@@ -3393,7 +3425,7 @@ Industry: Petrochemical`;
             access_level: 'editor',
             avatar: formData.projectManager.split(' ').map(n => n[0]).join('').toUpperCase()
           };
-          await fastAPI.createProjectMember(projectManagerData);
+          await upsertManagerMember('project_manager', projectManagerData);
         }
       }
       
@@ -3415,7 +3447,7 @@ Industry: Petrochemical`;
             access_level: 'editor',
             avatar: formData.vdcrManager.split(' ').map(n => n[0]).join('').toUpperCase()
           };
-          await fastAPI.createProjectMember(vdcrManagerData);
+          await upsertManagerMember('vdcr_manager', vdcrManagerData);
         }
       }
       
@@ -3484,10 +3516,32 @@ Industry: Petrochemical`;
       try {
         const projId = Array.isArray(createdProject) && createdProject.length > 0 ? createdProject[0].id : (createdProject as any)?.id;
         if (!projId) return;
+        const normalize = (v: any) => String(v || '').trim().toLowerCase();
+        let existingRows: any[] = [];
+        try {
+          const rows = await fastAPI.getProjectMembers(projId);
+          existingRows = Array.isArray(rows) ? rows : [];
+        } catch {
+          existingRows = [];
+        }
+        const upsertFallback = async (role: 'project_manager' | 'vdcr_manager', payload: any) => {
+          const roleMembers = existingRows.filter((m: any) => m?.role === role);
+          const targetEmail = normalize(payload.email);
+          const exactMatch = roleMembers.find((m: any) => normalize(m?.email) === targetEmail);
+          if (exactMatch) return;
+          const roleRowToUpdate = roleMembers.find((m: any) => !!m?.id);
+          if (roleRowToUpdate?.id) {
+            await fastAPI.updateProjectMember(roleRowToUpdate.id, payload);
+            existingRows = existingRows.map((m: any) => m?.id === roleRowToUpdate.id ? { ...m, ...payload } : m);
+            return;
+          }
+          await fastAPI.createProjectMember(payload);
+          existingRows = [...existingRows, payload];
+        };
         if (formData.projectManager && formData.projectManager.trim() !== '') {
           const { email: pmEmail, phone: pmPhone } = await resolveManagerEmail(formData.projectManager, 'project_manager');
           if (pmEmail) {
-            await fastAPI.createProjectMember({
+            await upsertFallback('project_manager', {
               project_id: projId,
               name: formData.projectManager,
               email: pmEmail,
@@ -3501,7 +3555,7 @@ Industry: Petrochemical`;
         if (formData.vdcrManager && formData.vdcrManager.trim() !== '') {
           const { email: vdcrEmail, phone: vdcrPhone } = await resolveManagerEmail(formData.vdcrManager, 'vdcr_manager');
           if (vdcrEmail) {
-            await fastAPI.createProjectMember({
+            await upsertFallback('vdcr_manager', {
               project_id: projId,
               name: formData.vdcrManager,
               email: vdcrEmail,
@@ -4197,6 +4251,11 @@ Industry: Petrochemical`;
               onChange={(e) => handleFileUpload('unpricedPOFile', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
               className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-9 sm:h-10 leading-9 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
+            {formData.unpricedPOFile?.length ? (
+  <p className="text-xs text-gray-600 mt-1">
+    {formData.unpricedPOFile.length} file(s) selected
+  </p>
+) : null}
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Unpriced PO documents */}
             {isEditMode && existingDocuments.unpricedPODocuments.length > 0 && (
@@ -4244,6 +4303,11 @@ Industry: Petrochemical`;
               onChange={(e) => handleFileUpload('designInputsPID', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
               className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
+            {formData.designInputsPID?.length ? (
+  <p className="text-xs text-gray-600 mt-1">
+    {formData.designInputsPID.length} file(s) selected
+  </p>
+) : null}
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Design Inputs documents */}
             {isEditMode && existingDocuments.designInputsDocuments.length > 0 && (
@@ -4291,6 +4355,11 @@ Industry: Petrochemical`;
               onChange={(e) => handleFileUpload('clientReferenceDoc', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
               className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
+            {formData.clientReferenceDoc?.length ? (
+  <p className="text-xs text-gray-600 mt-1">
+    {formData.clientReferenceDoc.length} file(s) selected
+  </p>
+) : null}
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Client Reference documents */}
             {isEditMode && existingDocuments.clientReferenceDocuments.length > 0 && (
@@ -4338,6 +4407,11 @@ Industry: Petrochemical`;
               onChange={(e) => handleFileUpload('otherDocuments', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
               className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
+            {formData.otherDocuments?.length ? (
+  <p className="text-xs text-gray-600 mt-1">
+    {formData.otherDocuments.length} file(s) selected
+  </p>
+) : null}
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Other documents */}
             {isEditMode && existingDocuments.otherDocuments.length > 0 && (

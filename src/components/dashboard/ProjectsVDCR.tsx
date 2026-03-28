@@ -701,7 +701,7 @@ const ProjectsVDCR = ({ projectId, projectName, onBack, onViewDetails, onViewEqu
 
         // Fallback: Create document file from VDCR record data if no document_url
         if (!documentFile && record.document_name) {
-          const documentUrl = latestDocumentUrl || record.document_url || `/documents/vdcr/${record.id}`;
+          const documentUrl = latestDocumentUrl || record.document_url || null;
 
           documentFile = {
             id: `doc-${record.id}`,
@@ -744,8 +744,8 @@ const ProjectsVDCR = ({ projectId, projectName, onBack, onViewDetails, onViewEqu
           updated_at: record.updated_at,
           remarks: record.remarks,
           updatedBy: record.updated_by_user?.full_name || record.updated_by || 'Unknown User',
-          // Use latest document URL from revision events, fallback to original document_url, then fallback path
-          documentUrl: latestDocumentUrl || documentFile?.filePath || (record.document_name ? `/documents/vdcr/${record.id}` : undefined),
+          // Use latest document URL from revision events, then original/documentFile URL; no fake fallback path.
+          documentUrl: latestDocumentUrl || documentFile?.filePath || undefined,
           documentFile: documentFile,
           revisionEvents: revisionEvents,
           projectDocumentationStartDate: record.project_documentation_start_date 

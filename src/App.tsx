@@ -13,6 +13,7 @@ import SignUp from "./pages/SignUp";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 import NoPermission from "./components/NoPermission";
+import ClientProjectView from "./pages/ClientProjectView";
 
 const queryClient = new QueryClient();
 
@@ -44,6 +45,7 @@ const App = () => (
             <Route path="/signup" element={<SignUp />} />
             <Route path="/forgot-password" element={<ForgotPassword />} />
             <Route path="/reset-password" element={<ResetPassword />} />
+            <Route path="/view/:token" element={<ClientProjectView />} />
 
             {/* Protected routes */}
             <Route path="/" element={<RoleBasedRoute />} />

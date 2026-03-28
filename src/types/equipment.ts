@@ -139,6 +139,9 @@ export interface EquipmentActivityCompletion {
   completed_by_display_name?: string | null;
   notes?: string | null;
   image_url?: string | null;
+  image_count?: number; // Number of images uploaded when marked complete (0+)
+  inspection_report_count?: number; // Number of inspection report PDFs (if applicable)
+  department?: string | null; // Department selected when marking complete (for docs dashboard / inspection reports by department)
   updated_on: string; // Set by backend
   updated_by?: string | null; // Set by backend
 }

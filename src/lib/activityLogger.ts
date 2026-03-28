@@ -45,7 +45,9 @@ export enum ActivityType {
   PROGRESS_ENTRY_ADDED = 'progress_entry_added',
   PROGRESS_ENTRY_UPDATED = 'progress_entry_updated',
   PROGRESS_ENTRY_DELETED = 'progress_entry_deleted',
-  
+  /** QAP: task/activity marked complete (shown in recent activity) */
+  ACTIVITY_COMPLETED = 'activity_completed',
+
   // VDCR actions
   VDCR_CREATED = 'vdcr_created',
   VDCR_UPDATED = 'vdcr_updated',
@@ -228,14 +230,14 @@ export const logTechnicalSectionDetailedUpdate = async (projectId: string, equip
   });
 };
 
-// Document logging
-export const logDocumentUploaded = async (projectId: string | null, equipmentId: string, equipmentType: string, tagNumber: string, documentType: string, fileName: string) => {
+// Document logging (documentId stored so "View document" in activity detail can open this specific doc)
+export const logDocumentUploaded = async (projectId: string | null, equipmentId: string, equipmentType: string, tagNumber: string, documentType: string, fileName: string, documentId?: string) => {
   await logActivity({
     projectId,
     equipmentId,
     activityType: ActivityType.DOCUMENT_UPLOADED,
     actionDescription: `${documentType} document "${fileName}" uploaded for "${equipmentType}" (${tagNumber})`,
-    metadata: { equipmentType, tagNumber, documentType, fileName }
+    metadata: { equipmentType, tagNumber, documentType, fileName, ...(documentId ? { document_id: documentId } : {}) }
   });
 };
 
@@ -249,13 +251,59 @@ export const logDocumentDeleted = async (projectId: string | null, equipmentId: 
   });
 };
 
-export const logProgressImageUploaded = async (projectId: string | null, equipmentId: string, equipmentType: string, tagNumber: string, imageDescription?: string) => {
+// progressImageId stored so "View image" in activity detail can open this specific image
+export const logProgressImageUploaded = async (projectId: string | null, equipmentId: string, equipmentType: string, tagNumber: string, imageDescription?: string, progressImageId?: string) => {
   await logActivity({
     projectId,
     equipmentId,
     activityType: ActivityType.PROGRESS_IMAGE_UPLOADED,
     actionDescription: `Progress image uploaded for "${equipmentType}" (${tagNumber})${imageDescription ? `: ${imageDescription}` : ''}`,
-    metadata: { equipmentType, tagNumber, imageDescription }
+    metadata: { equipmentType, tagNumber, imageDescription, ...(progressImageId ? { progress_image_id: progressImageId } : {}) }
+  });
+};
+
+/** QAP: log when a task/activity is marked complete (shown in recent activity with remarks, inspection report count) */
+export const logActivityCompleted = async (
+  projectId: string | null,
+  equipmentId: string,
+  equipmentType: string,
+  tagNumber: string,
+  activityName: string,
+  completedOn: string,
+  completedByDisplayName?: string | null,
+  department?: string | null,
+  updatedByDisplayName?: string | null,
+  completionId?: string,
+  notes?: string | null,
+  inspectionReportCount?: number,
+  imageCount?: number
+) => {
+  const dateStr = (() => {
+    try {
+      const d = new Date(completedOn);
+      return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    } catch {
+      return completedOn;
+    }
+  })();
+  await logActivity({
+    projectId,
+    equipmentId,
+    activityType: ActivityType.ACTIVITY_COMPLETED,
+    actionDescription: `${activityName} was completed on ${dateStr}${completedByDisplayName ? ` by ${completedByDisplayName}` : ''}.`,
+    metadata: {
+      equipmentType,
+      tagNumber,
+      activityName,
+      completedOn,
+      completedByDisplayName: completedByDisplayName ?? null,
+      department: department ?? null,
+      updatedByDisplayName: updatedByDisplayName ?? null,
+      ...(completionId ? { completion_id: completionId } : {}),
+      ...(notes != null && notes !== '' ? { remarks: notes } : {}),
+      ...(typeof inspectionReportCount === 'number' && inspectionReportCount > 0 ? { inspection_report_count: inspectionReportCount } : {}),
+      ...(typeof imageCount === 'number' && imageCount > 0 ? { image_count: imageCount } : {}),
+    },
   });
 };
 

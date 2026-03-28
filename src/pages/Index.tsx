@@ -142,6 +142,9 @@ const Index = () => {
   const [currentPage, setCurrentPage] = useState<number>(1);
   const itemsPerPage = 8;
 
+  // Project card metrics (doc %, manufacturing %, inspection/TPI % and counts) for 2×2 progress grid
+  const [projectCardMetrics, setProjectCardMetrics] = useState<Record<string, { docProgressPct: number; manufacturingProgressPct: number; inspectionTpiPct: number; inspectionTpiTotal?: number; inspectionTpiDone?: number }>>({});
+
   // Cached summary stats state (for instant display)
   const [cachedSummaryStats, setCachedSummaryStats] = useState<{ totalProjects: number; totalEquipment: number } | null>(null);
   
@@ -465,10 +468,20 @@ const Index = () => {
             // Equipment will be cached separately per-project when needed
             equipment: [] // Empty array for cached version - will be loaded on-demand
           };
+            const docTotal = Number(project.doc_total) ?? 0;
+            const docCode1 = Number(project.doc_code1) ?? 0;
+            const docCode2 = Number(project.doc_code2) ?? 0;
+            const docCode3 = Number(project.doc_code3) ?? 0;
+            const docCode4 = Number(project.doc_code4) ?? 0;
 
             return {
               ...projectMetadata,
               equipment: equipmentData,
+              doc_total: docTotal,
+              doc_code1: docCode1,
+              doc_code2: docCode2,
+              doc_code3: docCode3,
+              doc_code4: docCode4,
             };
           });
 
@@ -476,6 +489,35 @@ const Index = () => {
           setProjects(transformedProjects as any);
           setFilteredProjects(transformedProjects as any);
           setLoading(false);
+          // Doc % from project list (same source as documentation tab); merge RPC when it returns
+          const metricsFromProjects: Record<string, { docProgressPct: number; manufacturingProgressPct: number; inspectionTpiPct: number; inspectionTpiTotal?: number; inspectionTpiDone?: number }> = {};
+          (supabaseProjects as any[]).forEach((p: any) => {
+            const total = Number(p.doc_total) ?? 0;
+            const c1 = Number(p.doc_code1) ?? 0;
+            const c2 = Number(p.doc_code2) ?? 0;
+            const c3 = Number(p.doc_code3) ?? 0;
+            const c4 = Number(p.doc_code4) ?? 0;
+            let docPct = 0;
+            if (total > 0) {
+              const share = 100 / total;
+              docPct = c1 * share * 1 + c2 * share * 0.8 + c3 * share * 0.5 + c4 * share * 0;
+            }
+            const equipmentData = Array.isArray(p.equipment) ? p.equipment : [];
+            const mfgPct = equipmentData.length > 0
+              ? equipmentData.reduce((s: number, eq: any) => s + (Number(eq.progress) || 0), 0) / equipmentData.length
+              : 0;
+            metricsFromProjects[p.id] = {
+              docProgressPct: Math.round(docPct * 10) / 10,
+              manufacturingProgressPct: mfgPct,
+              inspectionTpiPct: 0,
+              inspectionTpiTotal: 0,
+              inspectionTpiDone: 0,
+            };
+          });
+          setProjectCardMetrics(metricsFromProjects);
+          fastAPI.getProjectCardMetrics(transformedProjects.map((p: any) => p.id)).then((rpc) => {
+            setProjectCardMetrics((prev) => ({ ...prev, ...rpc }));
+          }).catch(() => {});
           const projectCount = transformedProjects.length;
           const completedCount = (transformedProjects as any[]).filter((p: any) => p.status === 'completed').length;
           const prevCounters = getCache<{ projects: number; standaloneEquipment: number; completionCertificates: number }>(CACHE_KEYS.TAB_COUNTERS);
@@ -521,6 +563,17 @@ const Index = () => {
           if (cached && Array.isArray(cached) && cached.length > 0) {
             setProjects(cached);
             setFilteredProjects(cached);
+            const metricsFromCache: Record<string, { docProgressPct: number; manufacturingProgressPct: number; inspectionTpiPct: number; inspectionTpiTotal?: number; inspectionTpiDone?: number }> = {};
+            cached.forEach((p: any) => {
+              const total = Number(p.doc_total) ?? 0;
+              const c1 = Number(p.doc_code1) ?? 0, c2 = Number(p.doc_code2) ?? 0, c3 = Number(p.doc_code3) ?? 0, c4 = Number(p.doc_code4) ?? 0;
+              let docPct = total > 0 ? (c1 * 1 + c2 * 0.8 + c3 * 0.5 + c4 * 0) * (100 / total) : 0;
+              const equipmentData = Array.isArray(p.equipment) ? p.equipment : [];
+              const mfgPct = equipmentData.length > 0 ? equipmentData.reduce((s: number, eq: any) => s + (Number(eq.progress) || 0), 0) / equipmentData.length : 0;
+              metricsFromCache[p.id] = { docProgressPct: Math.round(docPct * 10) / 10, manufacturingProgressPct: mfgPct, inspectionTpiPct: 0, inspectionTpiTotal: 0, inspectionTpiDone: 0 };
+            });
+            setProjectCardMetrics(metricsFromCache);
+            fastAPI.getProjectCardMetrics(cached.map((p: any) => p.id)).then((rpc) => setProjectCardMetrics((prev) => ({ ...prev, ...rpc }))).catch(() => {});
           }
         }
         setLoading(false);
@@ -563,6 +616,444 @@ const Index = () => {
   const [mainTab, setMainTab] = useState<'projects' | 'equipment' | 'tasks' | 'certificates'>('projects');
   // Store the previous tab before navigating to project view (for back navigation)
   const [previousTab, setPreviousTab] = useState<'projects' | 'equipment' | 'tasks' | 'certificates' | null>(null);
+
+  // Manage Weightage modal state (per-project VDCR doc weighting for documentation progress)
+  const [weightageModalProjectId, setWeightageModalProjectId] = useState<string | null>(null);
+  const [weightageActiveTab, setWeightageActiveTab] = useState<'documentation' | 'manufacturing'>('documentation');
+  const [weightageDocs, setWeightageDocs] = useState<{ id: string; sr_no: string; document_name: string; code_status: string; weight_pct: number; isFixed: boolean; input: string }[]>([]);
+  const [weightageManufacturingEquipments, setWeightageManufacturingEquipments] = useState<
+    { id: string; title: string; tag_number: string; weight_pct: number; isFixed: boolean; input: string }[]
+  >([]);
+  const [weightageLoading, setWeightageLoading] = useState(false);
+  const [weightageSaving, setWeightageSaving] = useState(false);
+  const [codeCompletionFactors, setCodeCompletionFactors] = useState<
+    { code_status: 'Code 1' | 'Code 2' | 'Code 3' | 'Code 4'; label: string; percentage: string; defaultPercentage: number }[]
+  >([
+    { code_status: 'Code 1', label: 'Code 1', percentage: '100', defaultPercentage: 100 },
+    { code_status: 'Code 2', label: 'Code 2', percentage: '80', defaultPercentage: 80 },
+    { code_status: 'Code 3', label: 'Code 3', percentage: '50', defaultPercentage: 50 },
+    { code_status: 'Code 4', label: 'Code 4', percentage: '0', defaultPercentage: 0 },
+  ]);
+
+  const openManageWeightage = async (projectId: string) => {
+    try {
+      setWeightageLoading(true);
+      setWeightageModalProjectId(projectId);
+      setWeightageActiveTab('documentation');
+
+      const [docs, weights, factors, equipment, equipmentWeightsRaw] = await Promise.all([
+        fastAPI.getProjectVdcrDocsForWeighting(projectId),
+        fastAPI.getProjectVdcrWeights(projectId),
+        fastAPI.getProjectVdcrCodeCompletionFactors(projectId),
+        fastAPI.getEquipmentByProject(projectId),
+        fastAPI.getProjectEquipmentWeights(projectId).catch(() => ({} as Record<string, number>)),
+      ]);
+      const equipmentWeights = equipmentWeightsRaw && typeof equipmentWeightsRaw === 'object' ? equipmentWeightsRaw : {};
+
+      const docsArray = Array.isArray(docs) ? docs : [];
+      const totalDocs = docsArray.length;
+      let defaultShare = totalDocs > 0 ? 100 / totalDocs : 0;
+
+      const rows = docsArray.map((d: any) => {
+        const id = String(d.id);
+        const existingWeight = weights[id];
+        const hasCustom = existingWeight != null && !Number.isNaN(existingWeight);
+        const base = hasCustom ? Number(existingWeight) : defaultShare;
+        return {
+          id,
+          sr_no: String(d.sr_no ?? ''),
+          document_name: String(d.document_name ?? ''),
+          code_status: String(d.code_status ?? ''),
+          weight_pct: base,
+          // On initial load, treat all rows as flexible so that changes to one row
+          // rebalance the others. Rows become fixed only when the user edits them.
+          isFixed: false,
+          input: Number.isFinite(base) ? base.toFixed(1) : '',
+        };
+      });
+
+      // Normalize to 100% only when we did NOT load custom weights (avoid overwriting saved weights when opening panel)
+      const hasSavedDocWeights = docsArray.some((d: any) => {
+        const w = weights[String(d.id)];
+        return w != null && !Number.isNaN(Number(w));
+      });
+      if (!hasSavedDocWeights) {
+        const fixedTotal = rows.filter(r => r.isFixed).reduce((sum, r) => sum + (r.weight_pct || 0), 0);
+        const flexible = rows.filter(r => !r.isFixed);
+        const remaining = Math.max(0, 100 - fixedTotal);
+        if (flexible.length > 0) {
+          const per = remaining / flexible.length;
+          for (const r of flexible) {
+            r.weight_pct = per;
+          }
+        }
+      }
+
+      setWeightageDocs(rows);
+
+      // Prepare manufacturing rows – use saved weights if present, else equal share; normalize to 100%
+      const equipmentArray = Array.isArray(equipment) ? equipment : [];
+      const totalEquipments = equipmentArray.length;
+      const defaultEquipmentShare = totalEquipments > 0 ? 100 / totalEquipments : 0;
+      let equipmentRows = equipmentArray.map((eq: any) => {
+        const id = String(eq.id);
+        const existingWeight = equipmentWeights[id];
+        const base = existingWeight != null && !Number.isNaN(existingWeight)
+          ? Number(existingWeight)
+          : defaultEquipmentShare;
+        return {
+          id,
+          title: String(eq.manufacturing_serial ?? eq.any_personal_title ?? eq.name ?? eq.type ?? 'Untitled equipment'),
+          tag_number: String(eq.tag_number ?? ''),
+          weight_pct: base,
+          isFixed: false,
+          input: Number.isFinite(base) ? base.toFixed(1) : '',
+        };
+      });
+      // Normalize so total is exactly 100% (fixes stale or bad stored data)
+      const mfgTotal = equipmentRows.reduce((sum, eq) => sum + (eq.weight_pct || 0), 0);
+      if (equipmentRows.length > 0 && Number.isFinite(mfgTotal) && mfgTotal > 0 && Math.abs(mfgTotal - 100) > 0.01) {
+        const scale = 100 / mfgTotal;
+        equipmentRows = equipmentRows.map((eq) => {
+          const w = (eq.weight_pct || 0) * scale;
+          return { ...eq, weight_pct: w, input: w.toFixed(1) };
+        });
+      }
+      setWeightageManufacturingEquipments(equipmentRows);
+
+      // Initialize per-code completion factors (0–100%) for this project.
+      setCodeCompletionFactors((prev) =>
+        prev.map((entry) => {
+          const existing = factors?.[entry.code_status];
+          if (existing == null || Number.isNaN(existing)) {
+            return {
+              ...entry,
+              percentage: entry.defaultPercentage.toString(),
+            };
+          }
+          const numeric = Math.max(0, Math.min(100, Number(existing)));
+          return {
+            ...entry,
+            percentage: numeric.toString(),
+          };
+        })
+      );
+    } catch (error: any) {
+      console.error('❌ Failed to open Manage Weightage modal:', error);
+      toast({
+        title: 'Error',
+        description: error?.response?.data?.message || error?.message || 'Failed to load documents for weightage.',
+        variant: 'destructive',
+      });
+      setWeightageModalProjectId(null);
+    } finally {
+      setWeightageLoading(false);
+    }
+  };
+
+  const recalculateFlexibleWeights = () => {
+    setWeightageDocs((prev) => {
+      const docs = [...prev];
+      const fixedTotal = docs.filter(d => d.isFixed).reduce((sum, d) => sum + (d.weight_pct || 0), 0);
+      const flexibleDocs = docs.filter(d => !d.isFixed);
+      const remaining = Math.max(0, 100 - fixedTotal);
+      if (flexibleDocs.length > 0) {
+        const per = remaining / flexibleDocs.length;
+        flexibleDocs.forEach(d => {
+          d.weight_pct = per;
+          d.input = per.toFixed(1);
+        });
+      }
+      return docs;
+    });
+  };
+
+  const handleWeightChange = (id: string, value: string) => {
+    // Allow easy typing: digits and a single decimal point.
+    let cleaned = value.replace(/[^0-9.]/g, '');
+    const parts = cleaned.split('.');
+    if (parts.length > 2) {
+      cleaned = parts[0] + '.' + parts.slice(1).join('');
+    }
+    if (cleaned.length > 5) cleaned = cleaned.slice(0, 5);
+
+    setWeightageDocs((prev) => {
+      const docs = prev.map((d) => {
+        if (d.id !== id) return d;
+        if (cleaned === '') {
+          // Let the field be empty while typing; treat as 0 for now but keep isFixed so we don't auto-fill.
+          return { ...d, input: '', weight_pct: 0, isFixed: true };
+        }
+        const numeric = parseFloat(cleaned);
+        const clamped = isNaN(numeric) ? 0 : Math.max(0, Math.min(100, numeric)); // 0–100 with decimals
+        return {
+          ...d,
+          input: cleaned,
+          weight_pct: clamped,
+          isFixed: true,
+        };
+      });
+
+      // Recalculate flexible docs after applying this change (do NOT touch fixed docs)
+      const fixedTotal = docs.filter(d => d.isFixed).reduce((sum, d) => sum + (d.weight_pct || 0), 0);
+      const flexibleDocs = docs.filter(d => !d.isFixed);
+      const remaining = Math.max(0, 100 - fixedTotal);
+      if (flexibleDocs.length > 0) {
+        const per = remaining / flexibleDocs.length;
+        flexibleDocs.forEach(d => {
+          d.weight_pct = per;
+          d.input = per.toFixed(1);
+        });
+      }
+
+      return docs;
+    });
+  };
+
+  const adjustWeightByStep = (id: string, delta: number) => {
+    setWeightageDocs((prev) => {
+      const docs = prev.map((d) => {
+        if (d.id !== id) return d;
+        const current = d.input === '' ? 0 : parseFloat(d.input) || 0;
+        const next = Math.max(0, Math.min(100, current + delta));
+        return {
+          ...d,
+          input: next.toFixed(1),
+          weight_pct: next,
+          isFixed: true,
+        };
+      });
+
+      const fixedTotal = docs.filter(d => d.isFixed).reduce((sum, d) => sum + (d.weight_pct || 0), 0);
+      const flexibleDocs = docs.filter(d => !d.isFixed);
+      const remaining = Math.max(0, 100 - fixedTotal);
+      if (flexibleDocs.length > 0) {
+        const per = remaining / flexibleDocs.length;
+        flexibleDocs.forEach(d => {
+          d.weight_pct = per;
+          d.input = per.toFixed(1);
+        });
+      }
+
+      return docs;
+    });
+  };
+
+  const handleResetWeightage = () => {
+    if (!weightageDocs.length) return;
+    const confirmed = window.confirm('Reset all document weights to equal percentages (default)?');
+    if (!confirmed) return;
+
+    setWeightageDocs((prev) => {
+      const docs = [...prev];
+      if (!docs.length) return docs;
+      const per = 100 / docs.length;
+      return docs.map((d) => ({
+        ...d,
+        weight_pct: per,
+        isFixed: false,
+        input: String(Math.round(per)),
+      }));
+    });
+  };
+
+  const handleResetManufacturingWeightage = () => {
+    if (!weightageManufacturingEquipments.length) return;
+    const confirmed = window.confirm('Reset all equipment weights to equal percentages (default)?');
+    if (!confirmed) return;
+
+    setWeightageManufacturingEquipments((prev) => {
+      const list = [...prev];
+      if (!list.length) return list;
+      const per = 100 / list.length;
+      return list.map((eq) => ({
+        ...eq,
+        weight_pct: per,
+        isFixed: false,
+        input: per.toFixed(1),
+      }));
+    });
+  };
+
+  // Manufacturing weight change – same logic as handleWeightChange (documentation)
+  const handleManufacturingWeightChange = (id: string, value: string) => {
+    let cleaned = value.replace(/[^0-9.]/g, '');
+    const parts = cleaned.split('.');
+    if (parts.length > 2) {
+      cleaned = parts[0] + '.' + parts.slice(1).join('');
+    }
+    if (cleaned.length > 5) cleaned = cleaned.slice(0, 5);
+
+    setWeightageManufacturingEquipments((prev) => {
+      const list = prev.map((eq) => {
+        if (eq.id !== id) return eq;
+        if (cleaned === '') {
+          return { ...eq, input: '', weight_pct: 0, isFixed: true };
+        }
+        const numeric = parseFloat(cleaned);
+        const clamped = isNaN(numeric) ? 0 : Math.max(0, Math.min(100, numeric));
+        return { ...eq, input: cleaned, weight_pct: clamped, isFixed: true };
+      });
+
+      const fixedTotal = list.filter((eq) => eq.isFixed).reduce((sum, eq) => sum + (eq.weight_pct || 0), 0);
+      const flexibleList = list.filter((eq) => !eq.isFixed);
+      const remaining = Math.max(0, 100 - fixedTotal);
+      if (flexibleList.length > 0) {
+        const per = remaining / flexibleList.length;
+        flexibleList.forEach((eq) => {
+          eq.weight_pct = per;
+          eq.input = per.toFixed(1);
+        });
+      }
+
+      return list;
+    });
+  };
+
+  // Manufacturing step adjust – same logic as adjustWeightByStep (documentation)
+  const adjustManufacturingWeightByStep = (id: string, delta: number) => {
+    setWeightageManufacturingEquipments((prev) => {
+      const list = prev.map((eq) => {
+        if (eq.id !== id) return eq;
+        const current = eq.input === '' ? 0 : parseFloat(eq.input) || 0;
+        const next = Math.max(0, Math.min(100, current + delta));
+        return { ...eq, input: next.toFixed(1), weight_pct: next, isFixed: true };
+      });
+
+      const fixedTotal = list.filter((eq) => eq.isFixed).reduce((sum, eq) => sum + (eq.weight_pct || 0), 0);
+      const flexibleList = list.filter((eq) => !eq.isFixed);
+      const remaining = Math.max(0, 100 - fixedTotal);
+      if (flexibleList.length > 0) {
+        const per = remaining / flexibleList.length;
+        flexibleList.forEach((eq) => {
+          eq.weight_pct = per;
+          eq.input = per.toFixed(1);
+        });
+      }
+
+      return list;
+    });
+  };
+
+  const handleCodeCompletionFactorChange = (code_status: 'Code 1' | 'Code 2' | 'Code 3' | 'Code 4', value: string) => {
+    let cleaned = value.replace(/[^0-9.]/g, '');
+    const parts = cleaned.split('.');
+    if (parts.length > 2) {
+      cleaned = parts[0] + '.' + parts.slice(1).join('');
+    }
+    if (cleaned.length > 5) cleaned = cleaned.slice(0, 5);
+
+    setCodeCompletionFactors((prev) =>
+      prev.map((entry) => {
+        if (entry.code_status !== code_status) return entry;
+        if (cleaned === '') {
+          return { ...entry, percentage: '' };
+        }
+        const numeric = parseFloat(cleaned);
+        const clamped = isNaN(numeric) ? 0 : Math.max(0, Math.min(100, numeric));
+        return { ...entry, percentage: clamped.toString() };
+      })
+    );
+  };
+
+  const handleResetCodeCompletionFactors = () => {
+    setCodeCompletionFactors((prev) =>
+      prev.map((entry) => ({
+        ...entry,
+        percentage: entry.defaultPercentage.toString(),
+      }))
+    );
+  };
+
+  const handleSaveWeightage = async () => {
+    if (!weightageModalProjectId) return;
+    try {
+      setWeightageSaving(true);
+
+      const docs = weightageDocs;
+      const total = docs.reduce((sum, d) => sum + (d.weight_pct || 0), 0);
+      if (!Number.isFinite(total) || total <= 0) {
+        toast({
+          title: 'Invalid Weights',
+          description: 'Total weight must be greater than 0%.',
+          variant: 'destructive',
+        });
+        setWeightageSaving(false);
+        return;
+      }
+
+      // Require total to be very close to 100 to avoid confusing scaling (allow small decimal tolerance)
+      if (Math.abs(total - 100) > 0.1) {
+        toast({
+          title: 'Please Adjust Weights',
+          description: `Total weight must equal 100%. It is currently ${total.toFixed(1)}%.`,
+          variant: 'destructive',
+        });
+        setWeightageSaving(false);
+        return;
+      }
+
+      // Require at least one code to have 100% completion value so max progress can still reach 100%.
+      const hasFullCode = codeCompletionFactors.some((entry) => {
+        const numeric = parseFloat(entry.percentage);
+        const clamped = Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) : entry.defaultPercentage;
+        return Math.abs(clamped - 100) < 0.1;
+      });
+      if (!hasFullCode) {
+        toast({
+          title: 'Please Set One Code to 100%',
+          description: 'At least one code (e.g. Code 1) must have a completion value of 100% so overall documentation can reach 100%.',
+          variant: 'destructive',
+        });
+        setWeightageSaving(false);
+        return;
+      }
+
+      const payload = docs.map((d) => ({
+        vdcr_record_id: d.id,
+        weight_pct: Math.max(0, d.weight_pct),
+      }));
+
+      await fastAPI.saveProjectVdcrWeights(weightageModalProjectId, payload);
+
+      // Save per-code completion factors for this project.
+      const factorPayload = codeCompletionFactors.map((entry) => {
+        const numeric = parseFloat(entry.percentage);
+        const clamped = Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) : entry.defaultPercentage;
+        return {
+          code_status: entry.code_status,
+          percentage: clamped,
+        };
+      });
+
+      await fastAPI.saveProjectVdcrCodeCompletionFactors(weightageModalProjectId, factorPayload);
+
+      // Refresh project card metrics so documentation ring reflects new weights
+      try {
+        await fastAPI
+          .getProjectCardMetrics([weightageModalProjectId])
+          .then((rpc) => setProjectCardMetrics((prev) => ({ ...prev, ...rpc })))
+          .catch(() => {});
+      } catch {
+        // Ignore refresh error, weights are still saved
+      }
+
+      toast({
+        title: 'Weights Saved',
+        description: 'Documentation weightage has been updated for this project.',
+      });
+      setWeightageModalProjectId(null);
+    } catch (error: any) {
+      console.error('❌ Error saving documentation weightage:', error);
+      toast({
+        title: 'Error',
+        description: error?.response?.data?.message || error?.message || 'Failed to save documentation weightage.',
+        variant: 'destructive',
+      });
+    } finally {
+      setWeightageSaving(false);
+    }
+  };
 
   // Equipment onboarding lock: firm's Equipment tab is locked for N days after creation (set by super admin)
   const [equipmentLock, setEquipmentLock] = useState<{ isLocked: boolean; daysRemaining: number; totalDays: number } | null>(null);
@@ -1092,7 +1583,18 @@ const Index = () => {
       // Update state with fresh data from Supabase
       setProjects(transformedProjects);
       setFilteredProjects(transformedProjects);
-      
+      const metricsFromProjects: Record<string, { docProgressPct: number; manufacturingProgressPct: number; inspectionTpiPct: number; inspectionTpiTotal?: number; inspectionTpiDone?: number }> = {};
+      (updatedProjects as any[]).forEach((p: any) => {
+        const total = Number(p.doc_total) ?? 0;
+        const c1 = Number(p.doc_code1) ?? 0, c2 = Number(p.doc_code2) ?? 0, c3 = Number(p.doc_code3) ?? 0, c4 = Number(p.doc_code4) ?? 0;
+        let docPct = total > 0 ? (c1 * 1 + c2 * 0.8 + c3 * 0.5 + c4 * 0) * (100 / total) : 0;
+        const equipmentData = Array.isArray(p.equipment) ? p.equipment : [];
+        const mfgPct = equipmentData.length > 0 ? equipmentData.reduce((s: number, eq: any) => s + (Number(eq.progress) || 0), 0) / equipmentData.length : 0;
+        metricsFromProjects[p.id] = { docProgressPct: Math.round(docPct * 10) / 10, manufacturingProgressPct: mfgPct, inspectionTpiPct: 0, inspectionTpiTotal: 0, inspectionTpiDone: 0 };
+      });
+      setProjectCardMetrics(metricsFromProjects);
+      fastAPI.getProjectCardMetrics(transformedProjects.map((p: any) => p.id)).then((rpc) => setProjectCardMetrics((prev) => ({ ...prev, ...rpc }))).catch(() => {});
+
       // Invalidate and update project cards cache (lightweight version)
       // Only cache active projects (not completed), limit to 24 projects max
       const cacheKey = `${CACHE_KEYS.PROJECT_CARDS}_${firmId}_${userRole || 'none'}_${userId || 'none'}`;
@@ -2256,31 +2758,31 @@ Note: Please download the Recommendation Letter template using the link above, f
                         : 'border-gray-100 hover:border-gray-200 hover:shadow-[0_8px_25px_rgba(0,0,0,0.12),0_4px_10px_rgba(0,0,0,0.08)]'
                       }`}
                     >
-                      {/* Premium White Header with Neumorphic Effect */}
-                      <div className="h-auto sm:h-24 bg-white p-4 pb-4 sm:pb-4 text-gray-800 border-b border-gray-100 relative group-hover:shadow-inner transition-all duration-300 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.8),inset_0_-1px_0_0_rgba(0,0,0,0.05)]">
+                      {/* Blue strip title row – client on first line; plant location under on hover; strip expands on hover */}
+                      <div className="min-h-[4.5rem] sm:min-h-[4.25rem] group-hover:min-h-[5.75rem] sm:group-hover:min-h-[5.5rem] bg-blue-600 px-4 pt-3 pb-3 text-white border-b border-blue-700 relative group-hover:bg-blue-700 transition-all duration-200 ease-out">
                         {/* Click Indicator */}
                         <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                          <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+                          <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
                         </div>
                         
                         <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-1 sm:gap-0">
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-1.5 mb-1 sm:mb-1 min-w-0">
-                              <h3 className="text-base sm:text-xl font-bold text-gray-800 min-w-0 truncate" title={project.name}>{project.name}</h3>
+                          <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+                            <div className="flex items-center gap-1.5 mb-0.5 min-w-0">
+                              <h3 className="text-base sm:text-xl font-bold text-white min-w-0 truncate" title={project.name}>{project.name}</h3>
                               <UnreadEntityDot entityKey={`project_${project.id}`} updatedAt={project.updated_at ?? project.last_update} />
                             </div>
-                            <p className="hidden sm:block text-xs text-blue-600 font-medium mb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                              Click to view details →
-                            </p>
-                            <div className="flex flex-row flex-nowrap items-center gap-2 sm:gap-4 text-xs sm:text-sm text-gray-600 mb-1 sm:mb-0 min-w-0 overflow-hidden">
+                            <div className="flex flex-row items-center gap-2 text-xs sm:text-sm text-white/90 min-w-0 overflow-hidden">
                               <span className="flex items-center gap-1 min-w-0 flex-1 overflow-hidden">
-                                <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+                                <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 flex-shrink-0 text-white/90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                                 </svg>
                                 <span className="truncate" title={project.client}>{project.client}</span>
                               </span>
-                              <span className="flex items-center gap-1 min-w-0 flex-1 overflow-hidden">
-                                <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            </div>
+                            {/* Plant location: under client, visible and strip expands on hover */}
+                            <div className="overflow-hidden max-h-0 group-hover:max-h-[1.75rem] transition-[max-height] duration-200 ease-out">
+                              <span className="flex items-center gap-1 min-w-0 overflow-hidden text-xs sm:text-sm text-white/90 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                                <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 flex-shrink-0 text-white/90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
                                 </svg>
@@ -2288,57 +2790,22 @@ Note: Please download the Recommendation Letter template using the link above, f
                               </span>
                             </div>
                           </div>
-                          <div className="flex flex-row items-center justify-between sm:flex-col sm:items-end sm:justify-start gap-1 sm:gap-1 mt-1 sm:mt-0">
-                            {/* Days Counter / Completion Status */}
-                            <div className="text-left sm:text-right min-w-0 sm:min-w-[140px]">
-                              {project.status === 'completed' ? (
-                                <>
-                                  <div className="text-xs text-gray-500 mb-1">Completed on</div>
-                                  <div className="text-lg font-bold text-green-600">
-                                    {project.completedDate 
-                                      ? new Date(project.completedDate).toLocaleDateString('en-US', { 
-                                          month: 'short', 
-                                          day: 'numeric', 
-                                          year: 'numeric' 
-                                        })
-                                      : new Date().toLocaleDateString('en-US', { 
-                                          month: 'short', 
-                                          day: 'numeric', 
-                                          year: 'numeric' 
-                                        })}
-                                  </div>
-                                </>
-                              ) : (
-                                <>
-                                  <div className="text-[10px] sm:text-xs text-gray-500 mb-0.5 sm:mb-1 leading-none">Days to Completion Date</div>
-                                  <div className={`text-sm sm:text-lg font-bold whitespace-nowrap leading-none ${
-                                    isOverdue ? 'text-red-600' : 'text-blue-600'
-                                  }`}>
-                                    {(() => {
-                                      if (!hasValidDeadline) {
-                                        return <span className="text-gray-500">No deadline set</span>;
-                                      } else if (diffDays < 0) {
-                                        return <span className="text-red-600">{Math.abs(diffDays)} days overdue</span>;
-                                      } else if (diffDays === 0) {
-                                        return <span className="text-orange-600">Due today</span>;
-                                      } else {
-                                        return <span>{diffDays} days to go</span>;
-                                      }
-                                    })()}
-                                  </div>
-                                </>
-                              )}
-                            </div>
-                            
-                            {/* Edit & Delete Buttons */}
-                            {userRole !== 'vdcr_manager' && userRole !== 'editor' && userRole !== 'viewer' && (
-                              <div className="flex items-center gap-0.5 sm:gap-1 pb-0 sm:pb-1 flex-shrink-0 min-w-0">
+                          <div className="flex flex-row items-center justify-end sm:flex-col sm:items-end sm:justify-start gap-1 sm:gap-1 mt-1 sm:mt-0">
+                            <div className="flex flex-col items-end gap-1 flex-shrink-0 min-w-0">
+                              {/* PO number: collapsed until hover, then expands and pushes icons down with slide */}
+                              <div className="overflow-hidden max-h-0 group-hover:max-h-[2.25rem] transition-[max-height] duration-200 ease-out">
+                                <span className="block text-xs sm:text-sm text-white/90 truncate max-w-full opacity-0 group-hover:opacity-100 transition-opacity duration-200" title={project.poNumber || '—'}>
+                                  {project.poNumber || '—'}
+                                </span>
+                              </div>
+                              {userRole !== 'vdcr_manager' && userRole !== 'editor' && userRole !== 'viewer' && (
+                              <div className="flex items-center gap-0.5 sm:gap-1 flex-shrink-0 transition-transform duration-200 ease-out">
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleEditProject(project.id);
                                   }}
-                                  className="p-1 sm:p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors min-w-[28px] min-h-[28px] sm:min-w-0 sm:min-h-0 flex items-center justify-center"
+                                  className="p-1 sm:p-1.5 text-white/80 hover:text-white hover:bg-white/20 rounded-md transition-colors min-w-[28px] min-h-[28px] sm:min-w-0 sm:min-h-0 flex items-center justify-center"
                                   title="Edit Project"
                                 >
                                   <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2350,7 +2817,7 @@ Note: Please download the Recommendation Letter template using the link above, f
                                     e.stopPropagation();
                                     handleDeleteProject(project.id);
                                   }}
-                                  className="p-1 sm:p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors min-w-[28px] min-h-[28px] sm:min-w-0 sm:min-h-0 flex items-center justify-center"
+                                  className="p-1 sm:p-1.5 text-white/80 hover:text-white hover:bg-white/20 rounded-md transition-colors min-w-[28px] min-h-[28px] sm:min-w-0 sm:min-h-0 flex items-center justify-center"
                                   title="Delete Project"
                                 >
                                   <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2363,7 +2830,7 @@ Note: Please download the Recommendation Letter template using the link above, f
                                       e.stopPropagation();
                                       handleCompleteProject(project.id);
                                     }}
-                                    className="p-1 sm:p-1.5 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded-md transition-colors min-w-[28px] min-h-[28px] sm:min-w-0 sm:min-h-0 flex items-center justify-center"
+                                    className="p-1 sm:p-1.5 text-white/80 hover:text-white hover:bg-white/20 rounded-md transition-colors min-w-[28px] min-h-[28px] sm:min-w-0 sm:min-h-0 flex items-center justify-center"
                                     title="Mark as Completed"
                                   >
                                     <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2372,7 +2839,8 @@ Note: Please download the Recommendation Letter template using the link above, f
                                   </button>
                                 )}
                               </div>
-                            )}
+                              )}
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -2492,329 +2960,100 @@ Note: Please download the Recommendation Letter template using the link above, f
                         </div>
                       )}
 
-                      {/* Project Details Grid */}
-                      <div className="p-6 border-b border-gray-100 bg-gradient-to-r from-slate-50 to-blue-50">
-                        <div className="grid grid-cols-2 gap-4 text-xs sm:text-sm min-w-0">
-                          <div className="bg-gray-50 rounded-lg p-3 border border-gray-200 min-w-0">
-                            <span className="text-gray-500 text-[10px] sm:text-xs font-medium uppercase tracking-wide">Project Manager</span>
-                            <p className="font-semibold text-gray-800 mt-1 min-w-0 truncate text-xs sm:text-sm" title={project.manager}>{project.manager}</p>
-                          </div>
-                          <div className="bg-gray-50 rounded-lg p-3 border border-gray-200 min-w-0">
-                            <span className="text-gray-500 text-[10px] sm:text-xs font-medium uppercase tracking-wide">PO Number</span>
-                            <p className="font-semibold text-gray-800 mt-1 min-w-0 truncate text-xs sm:text-sm" title={project.poNumber}>{project.poNumber}</p>
-                          </div>
-                          <div className="bg-gray-50 rounded-lg p-3 border border-gray-200 min-w-0">
-                            <span className="text-gray-500 text-[10px] sm:text-xs font-medium uppercase tracking-wide">Completion Date</span>
-                            <p className="font-semibold text-gray-800 mt-1 min-w-0 truncate md:overflow-visible md:whitespace-normal lg-mid:overflow-hidden lg-mid:text-ellipsis lg-mid:whitespace-nowrap text-xs sm:text-sm">
-                              {project.status === 'completed' && project.completedDate
-                                ? new Date(project.completedDate).toISOString().split('T')[0]
-                                : project.deadline}
-                            </p>
-                          </div>
-                          <div className="bg-gray-50 rounded-lg p-3 border border-gray-200 min-w-0">
-                            <span className="text-gray-500 text-[10px] sm:text-xs font-medium uppercase tracking-wide">Equipment</span>
-                            <p className="font-semibold text-gray-800 mt-1 min-w-0 truncate md:overflow-visible md:whitespace-normal lg-mid:overflow-hidden lg-mid:text-ellipsis lg-mid:whitespace-nowrap text-xs sm:text-sm">{project.equipmentCount} units</p>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Equipment Breakdown Section */}
-                      <div className="p-6 bg-gradient-to-r from-slate-50 to-blue-50 border-l-4 border-blue-200 flex-1 flex flex-col min-h-0 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-                        <div className="flex items-center justify-between mb-4">
-                          <span className="text-xs sm:text-sm font-semibold text-gray-700 flex items-center gap-2">
-                            <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            </svg>
-                            Equipment Breakdown
-                          </span>
-                          <span className="text-xs sm:text-sm font-bold text-blue-700 bg-blue-100 px-2 py-1 rounded-full">
-                            {project.equipmentCount} units
-                          </span>
-                        </div>
-                        
-                        {/* Equipment Type Breakdown with Carousel */}
-                        <div className="relative flex-1 flex flex-col">
-                          <div className="grid grid-cols-2 gap-3">
-                            {(() => {
-                              // Use actual project equipment breakdown or show empty state
-                              const equipmentBreakdown = project.equipmentBreakdown || {};
-                              const hasEquipment = Object.values(equipmentBreakdown).some(count => (count as number) > 0);
-                              
-
-                              
-                              if (!hasEquipment) {
-                                return (
-                                  <div className="col-span-2 text-center py-8">
-                                    <div className="text-gray-400 mb-2">
-                                      <svg className="w-12 h-12 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                                      </svg>
-                                    </div>
-                                    <p className="text-sm text-gray-500">No equipment added yet</p>
-                                    <p className="text-xs text-gray-400 mt-1">Project Manager will add equipment details</p>
-                                  </div>
-                                );
-                              }
-                              
-                              // Create equipment types array with actual names
-                              const equipmentTypes = [];
-                              
-                              // Add standard types
-                              if (equipmentBreakdown.pressureVessel > 0) {
-                                equipmentTypes.push({ name: 'Pressure Vessels', count: equipmentBreakdown.pressureVessel, color: 'blue' });
-                              }
-                              if (equipmentBreakdown.heatExchanger > 0) {
-                                equipmentTypes.push({ name: 'Heat Exchangers', count: equipmentBreakdown.heatExchanger, color: 'green' });
-                              }
-                              if (equipmentBreakdown.reactor > 0) {
-                                equipmentTypes.push({ name: 'Reactors', count: equipmentBreakdown.reactor, color: 'purple' });
-                              }
-                              if (equipmentBreakdown.storageTank > 0) {
-                                equipmentTypes.push({ name: 'Storage Tanks', count: equipmentBreakdown.storageTank, color: 'orange' });
-                              }
-                              
-                              // Add actual equipment types (not standard ones)
-                              const standardKeys = ['pressureVessel', 'heatExchanger', 'reactor', 'storageTank'];
-                              Object.entries(equipmentBreakdown).forEach(([key, count]) => {
-                                if (!standardKeys.includes(key) && (count as number) > 0) {
-                                  // Convert key back to readable name (Distillation Column → Column for UI)
-                                  let readableName = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
-                                  if (key === 'distillationcolumn' || readableName === 'Distillationcolumn') readableName = 'Column';
-                                  const colors = ['indigo', 'pink', 'red', 'yellow', 'teal', 'cyan'];
-                                  const colorIndex = equipmentTypes.length % colors.length;
-                                  equipmentTypes.push({ 
-                                    name: readableName, 
-                                    count: count, 
-                                    color: colors[colorIndex] 
-                                  });
-                                }
-                              });
-                              
-                              const currentIndex = equipmentCarouselIndex[project.id] || 0;
-                              const itemsPerPage = 4;
-                              const startIndex = currentIndex * itemsPerPage;
-                              const endIndex = startIndex + itemsPerPage;
-                              const visibleEquipment = equipmentTypes.slice(startIndex, endIndex);
-                              
-                              return visibleEquipment.map((equipment, index) => (
-                                <div key={index} className="bg-white/70 rounded-lg p-3 border border-gray-200 min-w-0">
-                                  <div className="flex items-center justify-between mb-2 min-w-0 gap-1">
-                                    <span className="text-[10px] sm:text-xs font-medium text-gray-600 min-w-0 truncate md:overflow-visible md:whitespace-normal lg-mid:overflow-hidden lg-mid:text-ellipsis lg-mid:whitespace-nowrap" title={equipment.name}>{equipment.name}</span>
-                                    <span className={`text-[10px] sm:text-xs font-bold ${
-                                      equipment.color === 'blue' ? 'text-blue-800' :
-                                      equipment.color === 'green' ? 'text-green-800' :
-                                      equipment.color === 'purple' ? 'text-purple-800' :
-                                      equipment.color === 'orange' ? 'text-orange-800' :
-                                      equipment.color === 'indigo' ? 'text-indigo-800' :
-                                      equipment.color === 'pink' ? 'text-pink-800' :
-                                      equipment.color === 'teal' ? 'text-teal-800' :
-                                      equipment.color === 'amber' ? 'text-amber-800' :
-                                      equipment.color === 'red' ? 'text-red-800' :
-                                      equipment.color === 'yellow' ? 'text-yellow-800' :
-                                      equipment.color === 'cyan' ? 'text-cyan-800' :
-                                      'text-gray-800'
-                                    }`}>{equipment.count}</span>
-                                  </div>
-                                  <div className="flex items-center gap-1">
-                                    {equipment.color === 'blue' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-blue-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-blue-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'green' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-green-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-green-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-green-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'purple' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-purple-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-purple-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-purple-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'orange' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-orange-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-orange-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-orange-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'indigo' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-indigo-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-indigo-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'pink' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-pink-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-pink-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-pink-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'teal' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-teal-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-teal-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-teal-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'amber' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-amber-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-amber-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-amber-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'red' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-red-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-red-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-red-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'yellow' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-yellow-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-yellow-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-yellow-300"></div>
-                                      </>
-                                    )}
-                                    {equipment.color === 'cyan' && (
-                                      <>
-                                        <div className="w-2 h-2 rounded-full bg-cyan-500"></div>
-                                        <div className="w-2 h-2 rounded-full bg-cyan-400"></div>
-                                        <div className="w-2 h-2 rounded-full bg-cyan-300"></div>
-                                      </>
-                                    )}
-                                  </div>
-                                </div>
-                              ));
-                            })()}
-                          </div>
-                          
-                          {/* Carousel Navigation */}
-                          <div className="mt-auto">
-                          {(() => {
-                            // Get equipment breakdown for this project
-                            const equipmentBreakdown = project.equipmentBreakdown || {};
-                            const hasEquipment = Object.values(equipmentBreakdown).some(count => (count as number) > 0);
-                            
-                            if (!hasEquipment) return null;
-                            
-                            // Calculate total equipment types
-                            const equipmentTypes = [];
-                            
-                            // Add standard types
-                            if (equipmentBreakdown.pressureVessel > 0) {
-                              equipmentTypes.push({ name: 'Pressure Vessels', count: equipmentBreakdown.pressureVessel, color: 'blue' });
-                            }
-                            if (equipmentBreakdown.heatExchanger > 0) {
-                              equipmentTypes.push({ name: 'Heat Exchangers', count: equipmentBreakdown.heatExchanger, color: 'green' });
-                            }
-                            if (equipmentBreakdown.reactor > 0) {
-                              equipmentTypes.push({ name: 'Reactors', count: equipmentBreakdown.reactor, color: 'purple' });
-                            }
-                            if (equipmentBreakdown.storageTank > 0) {
-                              equipmentTypes.push({ name: 'Storage Tanks', count: equipmentBreakdown.storageTank, color: 'orange' });
-                            }
-                            
-                            // Add actual equipment types (not standard ones)
-                            const standardKeys = ['pressureVessel', 'heatExchanger', 'reactor', 'storageTank'];
-                            Object.entries(equipmentBreakdown).forEach(([key, count]) => {
-                              if (!standardKeys.includes(key) && (count as number) > 0) {
-                                // Convert key back to readable name (Distillation Column → Column for UI)
-                                let readableName = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
-                                if (key === 'distillationcolumn' || readableName === 'Distillationcolumn') readableName = 'Column';
-                                const colors = ['indigo', 'pink', 'red', 'yellow', 'teal', 'cyan'];
-                                const colorIndex = equipmentTypes.length % colors.length;
-                                equipmentTypes.push({ 
-                                  name: readableName, 
-                                  count: count, 
-                                  color: colors[colorIndex] 
-                                });
-                              }
-                            });
-                            
-                            const totalEquipmentTypes = equipmentTypes.length;
-                            const currentIndex = equipmentCarouselIndex[project.id] || 0;
-                            const itemsPerPage = 4;
-                            const totalPages = Math.ceil(totalEquipmentTypes / itemsPerPage);
-                            const hasMorePages = totalPages > 1;
-                            
-                            if (!hasMorePages) return null;
-                            
-                            return (
-                              <div className="flex items-center justify-center gap-2 mt-4">
-                                <button
-                                  onClick={() => {
-                                    const newIndex = Math.max(0, (equipmentCarouselIndex[project.id] || 0) - 1);
-                                    setEquipmentCarouselIndex(prev => ({
-                                      ...prev,
-                                      [project.id]: newIndex
-                                    }));
-                                  }}
-                                  disabled={currentIndex === 0}
-                                  className={`p-1 rounded-full transition-colors ${
-                                    currentIndex === 0 
-                                      ? 'text-gray-300 cursor-not-allowed' 
-                                      : 'text-blue-600 hover:text-blue-800 hover:bg-blue-50'
-                                  }`}
-                                >
-                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                                  </svg>
-                                </button>
-                                
-                                <div className="flex gap-1">
-                                  {Array.from({ length: totalPages }, (_, i) => (
-                                    <div
-                                      key={i}
-                                      className={`w-2 h-2 rounded-full transition-colors ${
-                                        i === currentIndex 
-                                          ? 'bg-blue-500' 
-                                          : 'bg-gray-300'
-                                      }`}
-                                    ></div>
-                                  ))}
-                                </div>
-                                
-                                <button
-                                  onClick={() => {
-                                    const newIndex = Math.min(
-                                      totalPages - 1,
-                                      (equipmentCarouselIndex[project.id] || 0) + 1
-                                    );
-                                    setEquipmentCarouselIndex(prev => ({
-                                      ...prev,
-                                      [project.id]: newIndex
-                                    }));
-                                  }}
-                                  disabled={currentIndex >= totalPages - 1}
-                                  className={`p-1 rounded-full transition-colors ${
-                                    currentIndex >= totalPages - 1 
-                                      ? 'text-gray-300 cursor-not-allowed' 
-                                      : 'text-blue-600 hover:text-blue-800 hover:bg-blue-50'
-                                  }`}
-                                >
-                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                                  </svg>
-                                </button>
+                      {/* 2×2 Progress grid – screenshot match: same ring size/thickness, colors, fonts, 3D-ish */}
+                      {(() => {
+                        const metrics = projectCardMetrics[project.id];
+                        const docPct = metrics?.docProgressPct ?? 0;
+                        // Manufacturing: use RPC result (weighted by project_equipment_weights when set, else equal 100/n per equipment). Only fall back to local average if RPC not yet available.
+                        const equipmentList = project.equipment && Array.isArray(project.equipment) ? project.equipment : [];
+                        const n = equipmentList.length;
+                        const mfgPctFromEquipment = n > 0
+                          ? equipmentList.reduce((sum: number, eq: any) => sum + (Number(eq.progress) || 0), 0) / n
+                          : null;
+                        const mfgPct = (metrics?.manufacturingProgressPct != null)
+                          ? metrics.manufacturingProgressPct
+                          : (mfgPctFromEquipment !== null ? mfgPctFromEquipment : 0);
+                        const inspPct = metrics?.inspectionTpiPct ?? 0;
+                        const RING_SIZE = 84;
+                        const STROKE_WIDTH = 10;
+                        const CircularBar = ({ value, strokeColor, trackColor }: { value: number; strokeColor: string; trackColor: string }) => {
+                          const radius = (RING_SIZE / 2) - STROKE_WIDTH / 2 - 1;
+                          const c = 2 * Math.PI * radius;
+                          const offset = c * (1 - Math.min(100, Math.max(0, value)) / 100);
+                          return (
+                            <div className="relative inline-flex items-center justify-center drop-shadow-[0_2px_4px_rgba(0,0,0,0.06)]" style={{ width: RING_SIZE, height: RING_SIZE }}>
+                              <svg width={RING_SIZE} height={RING_SIZE} className="transform -rotate-90" viewBox={`0 0 ${RING_SIZE} ${RING_SIZE}`}>
+                                <circle cx={RING_SIZE/2} cy={RING_SIZE/2} r={radius} fill="none" strokeWidth={STROKE_WIDTH} strokeLinecap="round" className="transition-[stroke] duration-200" style={{ stroke: 'var(--ring-track, ' + trackColor + ')' }} />
+                                <circle cx={RING_SIZE/2} cy={RING_SIZE/2} r={radius} fill="none" strokeWidth={STROKE_WIDTH} strokeLinecap="round" strokeDasharray={c} strokeDashoffset={offset} className="transition-[stroke] duration-200" style={{ stroke: 'var(--ring-fill, ' + strokeColor + ')' }} />
+                              </svg>
+                              <span className="absolute text-xl font-bold text-gray-900 group-hover/box:!text-white tabular-nums transition-colors">{Math.round(value)}%</span>
+                            </div>
+                          );
+                        };
+                        const cardBase = 'group/box rounded-xl border border-gray-200 bg-white shadow-[0_2px_8px_rgba(0,0,0,0.06),0_1px_2px_rgba(0,0,0,0.04)] flex flex-col items-center justify-center p-4 max-[400px]:p-2.5 min-h-[120px] max-[400px]:min-h-[108px] transition-all duration-200 hover:shadow-md cursor-pointer';
+                        const keyInfoCardBase = 'group/box rounded-xl border border-gray-200 bg-white shadow-[0_2px_8px_rgba(0,0,0,0.06),0_1px_2px_rgba(0,0,0,0.04)] flex flex-col justify-center p-4 max-[400px]:p-2.5 min-h-[120px] max-[400px]:min-h-[108px] transition-all duration-200 hover:shadow-md cursor-pointer';
+                        const deadlineDate = project.deadline && !isNaN(new Date(project.deadline).getTime()) ? new Date(project.deadline) : null;
+                        const daysToGo = deadlineDate && project.status !== 'completed'
+                          ? Math.ceil((deadlineDate.getTime() - new Date().setHours(0, 0, 0, 0)) / (1000 * 60 * 60 * 24))
+                          : null;
+                        const deadlineLabel = deadlineDate ? deadlineDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : (project.deadline || '—');
+                        return (
+                          <div className="p-4 sm:p-5 max-[400px]:p-2.5 border-b border-gray-100 bg-[#f8f8fa] flex-1 flex flex-col min-h-0">
+                            <div className="grid grid-cols-2 gap-4 max-[400px]:gap-2.5 flex-1 min-h-0">
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={(e) => { e.stopPropagation(); if (equipmentLock?.isLocked) { setEquipmentLockModalOpen(true); return; } handleSelectProject(project.id, "equipment"); }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); if (equipmentLock?.isLocked) { setEquipmentLockModalOpen(true); return; } handleSelectProject(project.id, "equipment"); } }}
+                                className={`${cardBase} [--ring-fill:#f97316] [--ring-track:#fed7aa] hover:!border-orange-500 hover:!bg-orange-500 hover:[--ring-fill:white] hover:[--ring-track:rgba(255,255,255,0.4)]`}
+                              >
+                                <span className="text-sm max-[400px]:text-xs font-medium text-gray-800 group-hover/box:!text-white mb-2 max-[400px]:mb-1 text-center transition-colors">Manufacturing</span>
+                                <CircularBar value={mfgPct} strokeColor="#f97316" trackColor="#fed7aa" />
                               </div>
-                            );
-                          })()}
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={(e) => { e.stopPropagation(); handleSelectProject(project.id, "vdcr"); }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); handleSelectProject(project.id, "vdcr"); } }}
+                                className={`${cardBase} [--ring-fill:#22c55e] [--ring-track:#bbf7d0] hover:!border-green-600 hover:!bg-green-600 hover:[--ring-fill:white] hover:[--ring-track:rgba(255,255,255,0.4)]`}
+                              >
+                                <span className="text-sm max-[400px]:text-xs font-medium text-gray-800 group-hover/box:!text-white mb-2 max-[400px]:mb-1 text-center transition-colors">Documentation</span>
+                                <CircularBar value={docPct} strokeColor="#22c55e" trackColor="#bbf7d0" />
+                              </div>
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={(e) => { e.stopPropagation(); if (equipmentLock?.isLocked) { setEquipmentLockModalOpen(true); return; } handleSelectProject(project.id, "equipment"); }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); if (equipmentLock?.isLocked) { setEquipmentLockModalOpen(true); return; } handleSelectProject(project.id, "equipment"); } }}
+                                className={`${cardBase} [--ring-fill:#3b82f6] [--ring-track:#bfdbfe] hover:!border-blue-600 hover:!bg-blue-600 hover:[--ring-fill:white] hover:[--ring-track:rgba(255,255,255,0.4)]`}
+                              >
+                                <span className="text-sm max-[400px]:text-xs font-medium text-gray-800 group-hover/box:!text-white mb-2 max-[400px]:mb-1 text-center transition-colors">TPI & Inspections</span>
+                                <CircularBar value={inspPct} strokeColor="#3b82f6" trackColor="#bfdbfe" />
+                                <span className="text-xs max-[400px]:text-[10px] text-gray-600 group-hover/box:!text-white/90 mt-1 max-[400px]:mt-0.5 tabular-nums">{(metrics?.inspectionTpiDone ?? 0)} of {metrics?.inspectionTpiTotal ?? 0}</span>
+                              </div>
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={(e) => { e.stopPropagation(); handleSelectProject(project.id, "project-details"); }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); handleSelectProject(project.id, "project-details"); } }}
+                                className={`${keyInfoCardBase} hover:!border-gray-700 hover:!bg-gray-700`}
+                              >
+                                <span className="text-sm max-[400px]:text-xs font-medium text-gray-800 group-hover/box:!text-white mb-1.5 max-[400px]:mb-1 transition-colors leading-tight">Delivery Date – {deadlineLabel}</span>
+                                <div className="flex items-center gap-3 max-[400px]:gap-1.5 mt-1">
+                                  <div className="flex-shrink-0 w-10 h-10 max-[400px]:w-7 max-[400px]:h-7 rounded-lg bg-blue-100 group-hover/box:bg-white/20 flex items-center justify-center transition-colors">
+                                    <svg className="w-5 h-5 max-[400px]:w-3.5 max-[400px]:h-3.5 text-blue-600 group-hover/box:!text-white transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                                  </div>
+                                  <div className="flex items-baseline gap-1 max-[400px]:gap-0.5 min-w-0 overflow-hidden">
+                                    <span className="text-2xl max-[400px]:text-xl font-bold text-gray-900 group-hover/box:!text-white tabular-nums transition-colors leading-none">{daysToGo != null ? daysToGo : '—'}</span>
+                                    <span className="text-sm max-[400px]:text-[11px] font-medium text-gray-700 group-hover/box:!text-white/90 whitespace-nowrap truncate transition-colors">Days to Go</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      </div>
+                        );
+                      })()}
+
 
                       {/* Action Buttons */}
                       <div className="p-4 sm:p-6 border-t border-gray-100 bg-white mt-auto">
@@ -2843,21 +3082,39 @@ Note: Please download the Recommendation Letter template using the link above, f
                             <span className="sm:hidden">Equip</span>
                             <span className="hidden sm:inline">View Equipment</span>
                           </Button>
-                          <Button 
-                            variant="outline" 
-                            size="sm"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSelectProject(project.id, "vdcr");
-                            }}
-                            className="w-full sm:flex-1 h-8 sm:h-8 px-2 sm:px-3 text-[11px] sm:text-sm whitespace-nowrap justify-center bg-white hover:bg-green-50 border-gray-300 text-gray-700 hover:text-green-700 hover:border-green-300 font-medium transition-all duration-200"
-                          >
-                            <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-1.5 sm:mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                            </svg>
-                            <span className="sm:hidden">VDCR</span>
-                            <span className="hidden sm:inline">View VDCR</span>
-                          </Button>
+                          {(userRole === 'firm_admin' || userRole === 'project_manager' || userRole === 'vdcr_manager') ? (
+                            <Button 
+                              variant="outline" 
+                              size="sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openManageWeightage(project.id);
+                              }}
+                              className="w-full sm:flex-1 h-8 sm:h-8 px-2 sm:px-3 text-[11px] sm:text-sm whitespace-nowrap justify-center bg-white hover:bg-green-50 border-gray-300 text-gray-700 hover:text-green-700 hover:border-green-300 font-medium transition-all duration-200"
+                            >
+                              <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-1.5 sm:mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                              </svg>
+                              <span className="sm:hidden">Weight</span>
+                              <span className="hidden sm:inline">Manage Weightage</span>
+                            </Button>
+                          ) : (
+                            <Button 
+                              variant="outline" 
+                              size="sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleSelectProject(project.id, "vdcr");
+                              }}
+                              className="w-full sm:flex-1 h-8 sm:h-8 px-2 sm:px-3 text-[11px] sm:text-sm whitespace-nowrap justify-center bg-white hover:bg-green-50 border-gray-300 text-gray-700 hover:text-green-700 hover:border-green-300 font-medium transition-all duration-200"
+                            >
+                              <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-1.5 sm:mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                              </svg>
+                              <span className="sm:hidden">VDCR</span>
+                              <span className="hidden sm:inline">View VDCR</span>
+                            </Button>
+                          )}
                           {userRole !== 'vdcr_manager' && userRole !== 'editor' && (
                             <Button 
                               variant="outline" 
@@ -3006,6 +3263,334 @@ Note: Please download the Recommendation Letter template using the link above, f
       {/* Dossier Report wizard overlay (additive feature) */}
       {dossierParams && (
         <DossierReportWizard params={dossierParams} onClose={() => setDossierParams(null)} />
+      )}
+
+      {/* Manage Weightage Modal */}
+      {weightageModalProjectId && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/50" aria-modal="true" role="dialog">
+          <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full mx-4 max-h-[80vh] flex flex-col">
+            <div className="px-5 pt-4 pb-3 border-b border-gray-200 flex items-start justify-between gap-4">
+              <div className="space-y-1.5">
+                <h2 className="text-base sm:text-lg font-semibold text-gray-900">Manage project weightage</h2>
+                <p className="text-[11px] sm:text-xs text-gray-600">
+                  We understand not all documents and equipments are the same.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setWeightageModalProjectId(null)}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <span className="sr-only">Close</span>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="px-5 py-3 border-b border-gray-100">
+              <nav
+                className="relative flex w-full overflow-hidden rounded-full bg-gray-100/90 p-1"
+                aria-label="Project weightage mode"
+              >
+                <div
+                  className={`absolute top-0.5 bottom-0.5 rounded-full shadow-sm transition-[left,width,background-color] duration-300 ease-out ${
+                    weightageActiveTab === 'documentation' ? 'bg-[#2B62FF]' : 'bg-emerald-500'
+                  }`}
+                  style={{
+                    left: weightageActiveTab === 'documentation' ? '2px' : 'calc(50% + 2px)',
+                    width: 'calc(50% - 4px)',
+                  }}
+                  aria-hidden
+                />
+                <button
+                  type="button"
+                  onClick={() => setWeightageActiveTab('documentation')}
+                  className={`relative z-10 flex-1 px-4 py-1.5 text-[11px] sm:text-xs font-medium transition-colors whitespace-nowrap ${
+                    weightageActiveTab === 'documentation' ? 'text-white' : 'text-gray-600 hover:text-gray-900'
+                  }`}
+                >
+                  Documentation weightage
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWeightageActiveTab('manufacturing')}
+                  className={`relative z-10 flex-1 px-4 py-1.5 text-[11px] sm:text-xs font-medium transition-colors whitespace-nowrap ${
+                    weightageActiveTab === 'manufacturing' ? 'text-white' : 'text-gray-600 hover:text-gray-900'
+                  }`}
+                >
+                  Equipment weightage
+                </button>
+              </nav>
+            </div>
+            <div className="px-5 py-3 overflow-auto flex-1 space-y-4">
+              {weightageActiveTab === 'documentation' ? (
+                <>
+                  <div className="flex items-center justify-between text-[11px] sm:text-xs text-gray-700">
+                    <span>
+                      Total documentation weight:&nbsp;
+                      <span className="font-semibold">
+                        {weightageDocs.reduce((sum, d) => sum + (d.weight_pct || 0), 0).toFixed(1)}%
+                      </span>
+                    </span>
+                    {weightageLoading && (
+                      <span className="text-gray-500">Loading documents…</span>
+                    )}
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3 bg-gray-50">
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <p className="text-xs sm:text-sm font-medium text-gray-800">
+                          Code completion values (per project)
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleResetCodeCompletionFactors}
+                        className="ml-auto text-[10px] sm:text-[11px] leading-tight text-blue-600 hover:text-blue-700 text-right"
+                        disabled={weightageSaving}
+                      >
+                        <span className="block">Reset codes</span>
+                        <span className="block">to default</span>
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {codeCompletionFactors.map((entry) => (
+                        <div key={entry.code_status} className="flex flex-col gap-1">
+                          <span className="text-[11px] sm:text-xs font-medium text-gray-700">{entry.label}</span>
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              pattern="\d*"
+                              value={entry.percentage}
+                              onChange={(e) => handleCodeCompletionFactorChange(entry.code_status, e.target.value)}
+                              className="w-16 px-2 py-1 border border-gray-300 rounded text-[11px] sm:text-xs text-center focus:outline-none focus:ring-1 focus:ring-green-500 focus:border-green-500"
+                            />
+                            <span className="text-[11px] sm:text-xs text-gray-600">%</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {weightageDocs.length === 0 && !weightageLoading && (
+                    <div className="text-sm text-gray-600">No documentation rows found for this project.</div>
+                  )}
+                  {weightageDocs.length > 0 && (
+                    <table className="min-w-full text-xs sm:text-sm border-collapse">
+                      <thead>
+                        <tr className="border-b border-gray-200 bg-gray-50">
+                          <th className="px-2 py-2 text-left font-medium text-gray-700 w-16">SR</th>
+                          <th className="px-2 py-2 text-left font-medium text-gray-700">Document</th>
+                          <th className="px-2 py-2 text-left font-medium text-gray-700 w-24">Code</th>
+                          <th className="px-2 py-2 text-left font-medium text-gray-700 w-28">Weight %</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {weightageDocs.map((doc) => (
+                          <tr key={doc.id} className="border-b border-gray-100 hover:bg-gray-50/70">
+                            <td className="px-2 py-2 text-gray-800 whitespace-nowrap">{doc.sr_no}</td>
+                            <td className="px-2 py-2 text-gray-800">
+                              <div className="max-w-xs sm:max-w-md truncate" title={doc.document_name}>
+                                {doc.document_name}
+                              </div>
+                            </td>
+                            <td className="px-2 py-2 text-gray-700 whitespace-nowrap">{doc.code_status}</td>
+                            <td className="px-2 py-2">
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  className="w-6 h-6 flex items-center justify-center rounded border border-gray-300 text-gray-700 text-xs hover:bg-gray-100"
+                                  onClick={() => adjustWeightByStep(doc.id, -1)}
+                                >
+                                  –
+                                </button>
+                                <input
+                                  type="text"
+                                  inputMode="numeric"
+                                  pattern="\d*"
+                                  value={doc.input}
+                                  onChange={(e) => handleWeightChange(doc.id, e.target.value)}
+                                  className="w-16 px-2 py-1 border border-gray-300 rounded text-xs sm:text-sm text-center focus:outline-none focus:ring-1 focus:ring-green-500 focus:border-green-500"
+                                />
+                                <button
+                                  type="button"
+                                  className="w-6 h-6 flex items-center justify-center rounded border border-gray-300 text-gray-700 text-xs hover:bg-gray-100"
+                                  onClick={() => adjustWeightByStep(doc.id, 1)}
+                                >
+                                  +
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px] sm:text-xs text-gray-700">
+                      <span>
+                        Total manufacturing weight:&nbsp;
+                        <span className="font-semibold">
+                          {weightageManufacturingEquipments.reduce((sum, eq) => sum + (eq.weight_pct || 0), 0).toFixed(1)}%
+                        </span>
+                      </span>
+                      {weightageLoading && (
+                        <span className="text-gray-500">Loading equipments…</span>
+                      )}
+                    </div>
+                    {weightageManufacturingEquipments.length > 0 && (() => {
+                      const total = weightageManufacturingEquipments.reduce((sum, eq) => sum + (eq.weight_pct || 0), 0);
+                      const diff = 100 - total;
+                      const isOk = Math.abs(diff) < 0.1;
+                      return (
+                        <p className={`text-[11px] ${isOk ? 'text-green-600 font-medium' : diff > 0 ? 'text-amber-600' : 'text-red-600'}`}>
+                          {isOk ? 'Balance: 100% ✓' : diff > 0 ? `${diff.toFixed(1)}% remaining to reach 100%` : `${Math.abs(diff).toFixed(1)}% over 100%`}
+                        </p>
+                      );
+                    })()}
+                  </div>
+                  {weightageManufacturingEquipments.length === 0 && !weightageLoading && (
+                    <div className="text-sm text-gray-600">
+                      No equipments found for this project yet. Once equipments are added, you&apos;ll see how each one contributes to manufacturing progress here.
+                    </div>
+                  )}
+                  {weightageManufacturingEquipments.length > 0 && (
+                    <table className="min-w-full text-xs sm:text-sm border-collapse">
+                      <thead>
+                        <tr className="border-b border-gray-200 bg-gray-50">
+                          <th className="px-2 py-2 text-left font-medium text-gray-700">Equipment title</th>
+                          <th className="px-2 py-2 text-left font-medium text-gray-700 w-32">Tag no.</th>
+                          <th className="px-2 py-2 text-left font-medium text-gray-700 w-32">Weight %</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {weightageManufacturingEquipments.map((eq) => (
+                          <tr key={eq.id} className="border-b border-gray-100 hover:bg-gray-50/70">
+                            <td className="px-2 py-2 text-gray-800">
+                              <div className="max-w-xs sm:max-w-md truncate" title={eq.title}>
+                                {eq.title}
+                              </div>
+                            </td>
+                            <td className="px-2 py-2 text-gray-700 whitespace-nowrap">{eq.tag_number || '-'}</td>
+                            <td className="px-2 py-2">
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  className="w-6 h-6 flex items-center justify-center rounded border border-gray-300 text-gray-700 text-xs hover:bg-gray-100"
+                                  onClick={() => adjustManufacturingWeightByStep(eq.id, -1)}
+                                >
+                                  –
+                                </button>
+                                <input
+                                  type="text"
+                                  inputMode="numeric"
+                                  pattern="\d*"
+                                  value={eq.input}
+                                  onChange={(e) => handleManufacturingWeightChange(eq.id, e.target.value)}
+                                  className="w-16 px-2 py-1 border border-gray-300 rounded text-xs sm:text-sm text-center focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                />
+                                <span className="text-[11px] sm:text-xs text-gray-600">%</span>
+                                <button
+                                  type="button"
+                                  className="w-6 h-6 flex items-center justify-center rounded border border-gray-300 text-gray-700 text-xs hover:bg-gray-100"
+                                  onClick={() => adjustManufacturingWeightByStep(eq.id, 1)}
+                                >
+                                  +
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+              {weightageActiveTab === 'documentation' && (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleResetWeightage}
+                    disabled={weightageSaving || weightageLoading || weightageDocs.length === 0}
+                  >
+                    Reset to Default
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setWeightageModalProjectId(null)}
+                    disabled={weightageSaving}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={handleSaveWeightage}
+                    disabled={weightageSaving || weightageLoading || weightageDocs.length === 0}
+                  >
+                    {weightageSaving ? 'Saving…' : 'Save Weightage'}
+                  </Button>
+                </>
+              )}
+              {weightageActiveTab === 'manufacturing' && (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleResetManufacturingWeightage}
+                    disabled={weightageManufacturingEquipments.length === 0}
+                  >
+                    Reset to Default
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setWeightageModalProjectId(null)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={async () => {
+                      if (!weightageModalProjectId) return;
+                      try {
+                        const list = weightageManufacturingEquipments.map((eq) => ({
+                          equipment_id: eq.id,
+                          weight_pct: Math.max(0, eq.weight_pct || 0),
+                        }));
+                        const total = list.reduce((s, w) => s + w.weight_pct, 0);
+                        const scale = total > 0 ? 100 / total : 1;
+                        const payload = list.map((w) => ({ ...w, weight_pct: Math.round(w.weight_pct * scale * 100) / 100 }));
+                        await fastAPI.saveProjectEquipmentWeights(weightageModalProjectId, payload);
+                        toast({
+                          title: 'Weights Saved',
+                          description: 'Equipment weightage has been updated for this project.',
+                        });
+                        setWeightageModalProjectId(null);
+                      } catch (error: any) {
+                        console.error('❌ Error saving manufacturing weightage:', error);
+                        toast({
+                          title: 'Error',
+                          description: error?.response?.data?.message || error?.message || 'Failed to save manufacturing weightage.',
+                          variant: 'destructive',
+                        });
+                      }
+                    }}
+                    disabled={weightageManufacturingEquipments.length === 0}
+                  >
+                    Save Weightage
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
       )}
       </div>
       

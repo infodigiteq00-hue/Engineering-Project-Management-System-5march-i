@@ -1,6 +1,8 @@
 /**
  * Parse activities Excel: first row = commencement date, then Sr. No., Activity Name, Activity Type, Target Date.
- * Activity type: "process update" / "regular update" -> regular_update; "milestone" / "important milestone" -> milestone.
+ * Activity type:
+ * - "process update" / "regular update" / "minor" -> regular_update
+ * - "milestone" / "important milestone" / "major milestone" / "major" -> milestone
  * Target column: if it's a date (dd-mm-yyyy or Excel serial), use it as target_date; otherwise treat as relative ("1st week") and compute from commencement_date.
  * Dates are parsed as dd-mm-yyyy and stored as yyyy-mm-dd (ISO) without timezone shift. Uploaded target dates are kept as-is (no auto-generation from commencement).
  */
@@ -12,6 +14,10 @@ export interface ParsedActivityRow {
   target_relative: string;
   target_date: string | null; // YYYY-MM-DD
   sort_order: number;
+  /** True when step involves Inspection or Third Party Inspection (from "Inspection/TPI involved?" column: Yes/No). */
+  inspection_tpi_involved: boolean;
+  /** Optional 0–100: fixed % this step contributes to progress when completed. Null = manual % at mark-complete. */
+  progress_weight: number | null;
 }
 
 export interface ParsedActivitiesResult {
@@ -88,7 +94,23 @@ function parseDateCell(val: unknown): string | null {
 function normalizeActivityType(val: unknown): 'regular_update' | 'milestone' {
   if (val == null) return 'regular_update';
   const s = String(val).trim().toLowerCase();
-  if (s.includes('milestone') || s === 'important milestone' || s === 'major milestone') return 'milestone';
+  // Treat "major" as milestone (same bucket as "milestone" / "important milestone" / "major milestone")
+  if (
+    s.includes('milestone') ||
+    s === 'important milestone' ||
+    s === 'major milestone' ||
+    s === 'major'
+  ) {
+    return 'milestone';
+  }
+  // Treat "minor" / "process update" / "regular update" as regular_update
+  if (
+    s === 'minor' ||
+    s.includes('process update') ||
+    s.includes('regular update')
+  ) {
+    return 'regular_update';
+  }
   return 'regular_update';
 }
 
@@ -118,7 +140,7 @@ export function parseActivitiesExcel(rows: unknown[][]): ParsedActivitiesResult 
   // Find header row (contains "sr" or "activity" or "activity name")
   // Search from row 0 so we don't miss the header when it's on row 1 (commencement on row 0, headers on row 1, data from row 2)
   let headerRowIndex = dataStartRow;
-  let colSr = 0, colName = 1, colType = 2, colTarget = 3;
+  let colSr = 0, colName = 1, colType = 2, colTarget = 3, colInspectionTpi = -1, colProgressWeight = -1;
   for (let r = 0; r < Math.min(dataStartRow + 3, rows.length); r++) {
     const row = rows[r];
     if (!Array.isArray(row)) continue;
@@ -137,6 +159,18 @@ export function parseActivitiesExcel(rows: unknown[][]): ParsedActivitiesResult 
       if (colType < 0) colType = 2;
       colTarget = headerLower.findIndex((h: string) => h.includes('target'));
       if (colTarget < 0) colTarget = 3;
+      colInspectionTpi = headerLower.findIndex((h: string) =>
+        (h.includes('inspection') && h.includes('tpi')) ||
+        (h.includes('inspection') && h.includes('involved')) ||
+        h.includes('inspection/tpi') ||
+        (h.includes('third') && h.includes('party'))
+      );
+      colProgressWeight = headerLower.findIndex((h: string) =>
+        (h.includes('weight') && (h.includes('progress') || h.includes('%'))) ||
+        h.includes('progress weight') ||
+        h.includes('contribution') ||
+        h === 'weight %' || h === 'weight%'
+      );
       break;
     }
   }
@@ -164,6 +198,18 @@ export function parseActivitiesExcel(rows: unknown[][]): ParsedActivitiesResult 
           const days = parseTargetRelativeToDays(target_relative);
           return commencement_date && days !== null ? addDays(commencement_date, days) : null;
         })() : null);
+    const inspectionTpiRaw = colInspectionTpi >= 0 ? row[colInspectionTpi] : null;
+    const inspection_tpi_involved = (() => {
+      if (inspectionTpiRaw == null) return false;
+      const s = String(inspectionTpiRaw).trim().toLowerCase();
+      return s === 'yes' || s === 'y' || s === '1' || s === 'true';
+    })();
+    const weightRaw = colProgressWeight >= 0 ? row[colProgressWeight] : null;
+    let progress_weight: number | null = null;
+    if (weightRaw != null && weightRaw !== '') {
+      const n = typeof weightRaw === 'number' ? weightRaw : parseFloat(String(weightRaw).replace(/,/g, ''));
+      if (!isNaN(n) && n >= 0) progress_weight = Math.min(100, Math.max(0, n));
+    }
     activities.push({
       sr_no,
       activity_name: name,
@@ -171,6 +217,8 @@ export function parseActivitiesExcel(rows: unknown[][]): ParsedActivitiesResult 
       target_relative: target_relative || (target_date || ''),
       target_date,
       sort_order: i - dataStart,
+      inspection_tpi_involved,
+      progress_weight,
     });
   }
 

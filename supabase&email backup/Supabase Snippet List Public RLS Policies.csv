@@ -1,0 +1,551 @@
+tablename,rls_enabled,policyname,operation,using_expression,with_check
+client_reference_documents,true,rls_merged_authenticated_update,UPDATE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = client_reference_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))","(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = client_reference_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))"
+client_reference_documents,true,rls_merged_authenticated_delete,DELETE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = client_reference_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+client_reference_documents,true,rls_merged_authenticated_insert,INSERT,null,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = client_reference_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin() AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id) AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))))"
+client_reference_documents,true,rls_merged_authenticated_select,SELECT,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = client_reference_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+design_inputs_documents,true,rls_merged_authenticated_update,UPDATE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = design_inputs_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))","(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = design_inputs_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))"
+design_inputs_documents,true,rls_merged_authenticated_select,SELECT,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = design_inputs_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+design_inputs_documents,true,rls_merged_authenticated_insert,INSERT,null,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = design_inputs_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin() AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id) AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))))"
+design_inputs_documents,true,rls_merged_authenticated_delete,DELETE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = design_inputs_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+equipment,true,rls_merged_authenticated_delete,DELETE,"(((project_id IS NOT NULL) AND (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = equipment.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+equipment,true,rls_merged_authenticated_update,UPDATE,"(((project_id IS NOT NULL) AND (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = equipment.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))","(((project_id IS NOT NULL) AND (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = equipment.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))"
+equipment,true,rls_merged_authenticated_select,SELECT,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = equipment.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+equipment,true,rls_merged_authenticated_insert,INSERT,null,"(((project_id IS NOT NULL) AND (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = equipment.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))"
+equipment_activities,true,Anon can manage equipment_activities,ALL,(( SELECT auth.uid() AS uid) IS NULL),(( SELECT auth.uid() AS uid) IS NULL)
+equipment_activities,true,Authenticated can manage equipment_activities,ALL,(( SELECT auth.uid() AS uid) IS NOT NULL),(( SELECT auth.uid() AS uid) IS NOT NULL)
+equipment_activity_completion_images,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (((equipment_activity_completions c
+     JOIN equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN equipment e ON ((e.id = a.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_activity_completion_images.completion_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((c.department IS NULL) OR (tp.department = c.department))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((c.department IS NULL) OR (pm.department = c.department)))))))))","(EXISTS ( SELECT 1
+   FROM (((equipment_activity_completions c
+     JOIN equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN equipment e ON ((e.id = a.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_activity_completion_images.completion_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((c.department IS NULL) OR (tp.department = c.department))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((c.department IS NULL) OR (pm.department = c.department)))))))))"
+equipment_activity_completion_inspection_reports,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (((equipment_activity_completions c
+     JOIN equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN equipment e ON ((e.id = a.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_activity_completion_inspection_reports.completion_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((c.department IS NULL) OR (tp.department = c.department))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((c.department IS NULL) OR (pm.department = c.department)))))))))","(EXISTS ( SELECT 1
+   FROM (((equipment_activity_completions c
+     JOIN equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN equipment e ON ((e.id = a.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_activity_completion_inspection_reports.completion_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((c.department IS NULL) OR (tp.department = c.department))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((c.department IS NULL) OR (pm.department = c.department)))))))))"
+equipment_activity_completions,true,Authenticated can manage equipment_activity_completions,ALL,(( SELECT auth.uid() AS uid) IS NOT NULL),(( SELECT auth.uid() AS uid) IS NOT NULL)
+equipment_activity_completions,true,Anon can manage equipment_activity_completions,ALL,(( SELECT auth.uid() AS uid) IS NULL),(( SELECT auth.uid() AS uid) IS NULL)
+equipment_activity_logs,true,rls_merged_authenticated_delete,DELETE,"(is_super_admin() OR ((EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_activity_logs.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))) OR is_assigned_to_project(project_id)))",null
+equipment_activity_logs,true,Authenticated users can insert equipment activity logs,INSERT,null,(( SELECT auth.uid() AS uid) IS NOT NULL)
+equipment_activity_logs,true,Authenticated users can view equipment activity logs,SELECT,true,null
+equipment_documents,true,rls_merged_authenticated_update,UPDATE,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_documents.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_documents.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))","(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_documents.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_documents.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))"
+equipment_documents,true,rls_merged_authenticated_select,SELECT,"((EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_documents.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))) OR is_super_admin() OR is_firm_admin())",null
+equipment_documents,true,rls_merged_authenticated_delete,DELETE,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_documents.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_documents.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))",null
+equipment_documents,true,rls_merged_authenticated_insert,INSERT,null,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_documents.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin() AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))) OR is_super_admin() OR ((EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_documents.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))) AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))))"
+equipment_production_checklist_completion_images,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (((equipment_production_checklist_task_completions c
+     JOIN equipment_production_checklist_tasks t ON ((t.id = c.task_id)))
+     JOIN equipment e ON ((e.id = t.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_production_checklist_completion_images.completion_id) AND (p.firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (tp.department = COALESCE(c.department, t.department)))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (pm.department = COALESCE(c.department, t.department))))))))))","(EXISTS ( SELECT 1
+   FROM (((equipment_production_checklist_task_completions c
+     JOIN equipment_production_checklist_tasks t ON ((t.id = c.task_id)))
+     JOIN equipment e ON ((e.id = t.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_production_checklist_completion_images.completion_id) AND (p.firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (tp.department = COALESCE(c.department, t.department)))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (pm.department = COALESCE(c.department, t.department))))))))))"
+equipment_production_checklist_completion_reports,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (((equipment_production_checklist_task_completions c
+     JOIN equipment_production_checklist_tasks t ON ((t.id = c.task_id)))
+     JOIN equipment e ON ((e.id = t.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_production_checklist_completion_reports.completion_id) AND (p.firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (tp.department = COALESCE(c.department, t.department)))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (pm.department = COALESCE(c.department, t.department))))))))))","(EXISTS ( SELECT 1
+   FROM (((equipment_production_checklist_task_completions c
+     JOIN equipment_production_checklist_tasks t ON ((t.id = c.task_id)))
+     JOIN equipment e ON ((e.id = t.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((c.id = equipment_production_checklist_completion_reports.completion_id) AND (p.firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (tp.department = COALESCE(c.department, t.department)))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((COALESCE(c.department, t.department) IS NULL) OR (pm.department = COALESCE(c.department, t.department))))))))))"
+equipment_production_checklist_task_completions,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM ((equipment_production_checklist_tasks t
+     JOIN equipment e ON ((e.id = t.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((t.id = equipment_production_checklist_task_completions.task_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((COALESCE(equipment_production_checklist_task_completions.department, t.department) IS NULL) OR (tp.department = COALESCE(equipment_production_checklist_task_completions.department, t.department)))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((COALESCE(equipment_production_checklist_task_completions.department, t.department) IS NULL) OR (pm.department = COALESCE(equipment_production_checklist_task_completions.department, t.department))))))))))","(EXISTS ( SELECT 1
+   FROM ((equipment_production_checklist_tasks t
+     JOIN equipment e ON ((e.id = t.equipment_id)))
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((t.id = equipment_production_checklist_task_completions.task_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((COALESCE(equipment_production_checklist_task_completions.department, t.department) IS NULL) OR (tp.department = COALESCE(equipment_production_checklist_task_completions.department, t.department)))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((COALESCE(equipment_production_checklist_task_completions.department, t.department) IS NULL) OR (pm.department = COALESCE(equipment_production_checklist_task_completions.department, t.department))))))))))"
+equipment_production_checklist_tasks,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_production_checklist_tasks.equipment_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((equipment_production_checklist_tasks.department IS NULL) OR (tp.department = equipment_production_checklist_tasks.department))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((equipment_production_checklist_tasks.department IS NULL) OR (pm.department = equipment_production_checklist_tasks.department)))))))))","(EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_production_checklist_tasks.equipment_id) AND (p.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = e.id) AND ((equipment_production_checklist_tasks.department IS NULL) OR (tp.department = equipment_production_checklist_tasks.department))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN project_members pm ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (pm.project_id = p.id) AND ((equipment_production_checklist_tasks.department IS NULL) OR (pm.department = equipment_production_checklist_tasks.department)))))))))"
+equipment_progress_entries,true,Firm admin can update firm equipment progress entries,UPDATE,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())","((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())"
+equipment_progress_entries,true,Firm admin can create firm equipment progress entries,INSERT,null,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin() AND ((created_by = auth.uid()) OR (created_by IS NULL)))"
+equipment_progress_entries,true,Firm admin can delete firm equipment progress entries,DELETE,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())",null
+equipment_progress_entries,true,Firm admin can view firm equipment progress entries,SELECT,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())",null
+equipment_progress_entries,true,Super admin can create equipment progress entries,INSERT,null,is_super_admin()
+equipment_progress_entries,true,Super admin can delete equipment progress entries,DELETE,is_super_admin(),null
+equipment_progress_entries,true,Super admin can update all equipment progress entries,UPDATE,is_super_admin(),is_super_admin()
+equipment_progress_entries,true,Super admin can view all equipment progress entries,SELECT,is_super_admin(),null
+equipment_progress_entries,true,Users can create equipment progress entries,INSERT,null,"((EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))) AND ((created_by = auth.uid()) OR (created_by IS NULL)))"
+equipment_progress_entries,true,Users can delete own equipment progress entries,DELETE,"((created_by = auth.uid()) AND (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))",null
+equipment_progress_entries,true,Users can update own equipment progress entries,UPDATE,"((created_by = auth.uid()) AND (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))","((created_by = auth.uid()) AND (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))"
+equipment_progress_entries,true,Users can view assigned equipment progress entries,SELECT,"(EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_entries.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id))))",null
+equipment_progress_images,true,Super admin can view all equipment progress images,SELECT,is_super_admin(),null
+equipment_progress_images,true,Super admin can create equipment progress images,INSERT,null,is_super_admin()
+equipment_progress_images,true,Super admin can delete equipment progress images,DELETE,is_super_admin(),null
+equipment_progress_images,true,Super admin can update all equipment progress images,UPDATE,is_super_admin(),is_super_admin()
+equipment_progress_images,true,Users can create equipment progress images,INSERT,null,"(EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id))))"
+equipment_progress_images,true,Users can view assigned equipment progress images,SELECT,"(EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id))))",null
+equipment_progress_images,true,Users can update equipment progress images,UPDATE,"(EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id))))","(EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id))))"
+equipment_progress_images,true,Users can delete equipment progress images,DELETE,"(EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id))))",null
+equipment_progress_images,true,Firm admin can create firm equipment progress images,INSERT,null,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())"
+equipment_progress_images,true,Firm admin can delete firm equipment progress images,DELETE,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())",null
+equipment_progress_images,true,Firm admin can update firm equipment progress images,UPDATE,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())","((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())"
+equipment_progress_images,true,Firm admin can view firm equipment progress images,SELECT,"((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_progress_images.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin())",null
+equipment_team_positions,true,rls_merged_authenticated_insert,INSERT,null,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin() AND ((assigned_by = ( SELECT auth.uid() AS uid)) OR (assigned_by IS NULL))) OR is_super_admin() OR ((EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))) AND ((assigned_by = ( SELECT auth.uid() AS uid)) OR (assigned_by IS NULL))))"
+equipment_team_positions,true,rls_merged_authenticated_select,SELECT,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))",null
+equipment_team_positions,true,rls_merged_authenticated_update,UPDATE,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))","(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))"
+equipment_team_positions,true,rls_merged_authenticated_delete,DELETE,"(((EXISTS ( SELECT 1
+   FROM (equipment e
+     JOIN projects p ON ((p.id = e.project_id)))
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR (EXISTS ( SELECT 1
+   FROM equipment e
+  WHERE ((e.id = equipment_team_positions.equipment_id) AND (e.project_id IS NOT NULL) AND is_assigned_to_project(e.project_id)))))",null
+firms,true,Super admin can create firms,INSERT,null,is_super_admin()
+firms,true,rls_merged_authenticated_update,UPDATE,"(((id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users
+  WHERE ((users.id = ( SELECT auth.uid() AS uid)) AND ((users.role)::text = 'firm_admin'::text) AND (users.is_active = true))))) OR is_super_admin())","(((id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users
+  WHERE ((users.id = ( SELECT auth.uid() AS uid)) AND ((users.role)::text = 'firm_admin'::text) AND (users.is_active = true))))) OR is_super_admin())"
+firms,true,rls_merged_authenticated_select,SELECT,"(((id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users
+  WHERE ((users.id = ( SELECT auth.uid() AS uid)) AND ((users.role)::text = 'firm_admin'::text) AND (users.is_active = true))))) OR is_super_admin() OR (id = get_user_firm_id()))",null
+firms,true,Super admin can delete firms,DELETE,is_super_admin(),null
+invites,true,rls_merged_authenticated_update,UPDATE,"(((firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = 'project_manager'::text) AND (u.is_active = true)))))) OR ((firm_id = get_user_firm_id()) AND is_firm_admin()) OR (((project_id IS NULL) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = invites.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid))))))) AND (firm_id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (u.is_active = true))))) OR is_super_admin())","(((firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = 'project_manager'::text) AND (u.is_active = true)))))) OR ((firm_id = get_user_firm_id()) AND is_firm_admin()) OR (((project_id IS NULL) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = invites.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid))))))) AND (firm_id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (u.is_active = true))))) OR is_super_admin())"
+invites,true,rls_merged_anon_select,SELECT,((((status)::text = 'pending'::text) AND ((expires_at IS NULL) OR (expires_at > now()))) OR ((invitation_token IS NOT NULL) AND ((status)::text = 'pending'::text) AND ((expires_at IS NULL) OR (expires_at > now())))),null
+invites,true,rls_merged_authenticated_delete,DELETE,"(((firm_id = get_user_firm_id()) AND is_firm_admin()) OR (((project_id IS NULL) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = invites.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid))))))) AND (firm_id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (u.is_active = true))))) OR is_super_admin())",null
+invites,true,rls_merged_authenticated_insert,INSERT,null,"(((firm_id = get_user_firm_id()) AND (invited_by = ( SELECT auth.uid() AS uid)) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = 'project_manager'::text) AND (u.is_active = true)))))) OR ((firm_id = get_user_firm_id()) AND is_firm_admin()) OR (((project_id IS NULL) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = invites.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid))))))) AND (firm_id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (u.is_active = true))))) OR is_super_admin())"
+invites,true,rls_merged_authenticated_select,SELECT,"(((firm_id = get_user_firm_id()) AND (is_firm_admin() OR (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = 'project_manager'::text) AND (u.is_active = true)))))) OR ((firm_id = get_user_firm_id()) AND is_firm_admin()) OR ((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = invites.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid)))))) AND (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (u.is_active = true))))) OR (((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('accepted'::character varying)::text])) AND ((expires_at IS NULL) OR (expires_at > now()))) OR is_super_admin())",null
+invites,true,Super admin can manage invites,ALL,is_super_admin(),is_super_admin()
+invites,true,Public can update invite status by token,UPDATE,((invitation_token IS NOT NULL) AND ((status)::text = 'pending'::text) AND ((expires_at IS NULL) OR (expires_at > now()))),"((invitation_token IS NOT NULL) AND ((status)::text = ANY ((ARRAY['accepted'::character varying, 'expired'::character varying])::text[])))"
+other_documents,true,rls_merged_authenticated_insert,INSERT,null,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = other_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin() AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id) AND ((uploaded_by = ( SELECT auth.uid() AS uid)) OR (uploaded_by IS NULL))))"
+other_documents,true,rls_merged_authenticated_update,UPDATE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = other_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))","(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = other_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))"
+other_documents,true,rls_merged_authenticated_select,SELECT,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = other_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+other_documents,true,rls_merged_authenticated_delete,DELETE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = other_documents.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR is_super_admin() OR ((project_id IS NOT NULL) AND is_assigned_to_project(project_id)))",null
+project_client_views,true,project_client_views_delete,DELETE,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_client_views.project_id) AND ((p.firm_id IN ( SELECT users.firm_id
+           FROM users
+          WHERE (users.id = auth.uid()))) OR (EXISTS ( SELECT 1
+           FROM project_members pm
+          WHERE ((pm.project_id = p.id) AND (pm.user_id = auth.uid()))))))))",null
+project_client_views,true,project_client_views_select,SELECT,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_client_views.project_id) AND ((p.firm_id IN ( SELECT users.firm_id
+           FROM users
+          WHERE (users.id = auth.uid()))) OR (EXISTS ( SELECT 1
+           FROM project_members pm
+          WHERE ((pm.project_id = p.id) AND (pm.user_id = auth.uid()))))))))",null
+project_client_views,true,project_client_views_insert,INSERT,null,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_client_views.project_id) AND ((p.firm_id IN ( SELECT users.firm_id
+           FROM users
+          WHERE (users.id = auth.uid()))) OR (EXISTS ( SELECT 1
+           FROM project_members pm
+          WHERE ((pm.project_id = p.id) AND (pm.user_id = auth.uid()))))))))"
+project_client_views,true,project_client_views_update,UPDATE,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_client_views.project_id) AND ((p.firm_id IN ( SELECT users.firm_id
+           FROM users
+          WHERE (users.id = auth.uid()))) OR (EXISTS ( SELECT 1
+           FROM project_members pm
+          WHERE ((pm.project_id = p.id) AND (pm.user_id = auth.uid()))))))))",null
+project_equipment_weights,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_equipment_weights.project_id) AND (p.firm_id = get_user_firm_id()))))","(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_equipment_weights.project_id) AND (p.firm_id = get_user_firm_id()))))"
+project_members,true,rls_merged_authenticated_select,SELECT,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid)))))) OR is_super_admin() OR is_assigned_to_project(project_id) OR (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND (lower(TRIM(BOTH FROM u.email)) = lower(TRIM(BOTH FROM project_members.email)))))))",null
+project_members,true,rls_merged_authenticated_update,UPDATE,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid)))))) OR is_super_admin())","(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid)))))) OR is_super_admin())"
+project_members,true,rls_merged_authenticated_delete,DELETE,"((is_firm_admin() AND (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND (p.firm_id = get_user_firm_id()))))) OR (is_assigned_to_project(project_id) AND (EXISTS ( SELECT 1
+   FROM users u
+  WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = 'project_manager'::text) AND (u.is_active = true))))) OR is_super_admin())",null
+project_members,true,rls_merged_authenticated_insert,INSERT,null,"(((EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND (p.firm_id = get_user_firm_id())))) AND is_firm_admin()) OR (EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_members.project_id) AND ((p.project_manager_id = ( SELECT auth.uid() AS uid)) OR (p.vdcr_manager_id = ( SELECT auth.uid() AS uid)) OR (p.created_by = ( SELECT auth.uid() AS uid)) OR (EXISTS ( SELECT 1
+           FROM users u
+          WHERE ((u.id = ( SELECT auth.uid() AS uid)) AND ((u.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (u.is_active = true) AND (((u.firm_id IS NOT NULL) AND (u.firm_id = p.firm_id)) OR ((u.firm_id IS NULL) AND (p.firm_id IS NULL)))))))))) OR is_super_admin())"
+project_vdcr_code_completion_weights,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_vdcr_code_completion_weights.project_id) AND (p.firm_id = get_user_firm_id()))))","(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_vdcr_code_completion_weights.project_id) AND (p.firm_id = get_user_firm_id()))))"
+project_vdcr_weights,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_vdcr_weights.project_id) AND (p.firm_id = get_user_firm_id()))))","(EXISTS ( SELECT 1
+   FROM projects p
+  WHERE ((p.id = project_vdcr_weights.project_id) AND (p.firm_id = get_user_firm_id()))))"
+projects,true,rls_merged_authenticated_update,UPDATE,"(((firm_id = get_user_firm_id()) AND is_firm_admin()) OR (is_assigned_to_project(id) AND (EXISTS ( SELECT 1
+   FROM (project_members pm
+     JOIN users u ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+  WHERE ((pm.project_id = projects.id) AND (u.id = ( SELECT auth.uid() AS uid)) AND ((pm.role)::text = 'project_manager'::text) AND ((pm.status)::text = 'active'::text))))) OR is_super_admin() OR (is_assigned_to_project(id) AND (EXISTS ( SELECT 1
+   FROM (project_members pm
+     JOIN users u ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+  WHERE ((pm.project_id = projects.id) AND (u.id = ( SELECT auth.uid() AS uid)) AND ((pm.role)::text = 'vdcr_manager'::text) AND ((pm.status)::text = 'active'::text))))))","(((firm_id = get_user_firm_id()) AND is_firm_admin()) OR (is_assigned_to_project(id) AND (EXISTS ( SELECT 1
+   FROM (project_members pm
+     JOIN users u ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+  WHERE ((pm.project_id = projects.id) AND (u.id = ( SELECT auth.uid() AS uid)) AND ((pm.role)::text = 'project_manager'::text) AND ((pm.status)::text = 'active'::text))))) OR is_super_admin() OR (is_assigned_to_project(id) AND (EXISTS ( SELECT 1
+   FROM (project_members pm
+     JOIN users u ON ((lower(TRIM(BOTH FROM pm.email)) = lower(TRIM(BOTH FROM u.email)))))
+  WHERE ((pm.project_id = projects.id) AND (u.id = ( SELECT auth.uid() AS uid)) AND ((pm.role)::text = 'vdcr_manager'::text) AND ((pm.status)::text = 'active'::text))))))"
+projects,true,rls_merged_authenticated_select,SELECT,(((firm_id = get_user_firm_id()) AND is_firm_admin()) OR is_super_admin() OR is_assigned_to_project(id)),null
+projects,true,rls_merged_authenticated_insert,INSERT,null,"(((firm_id = get_user_firm_id()) AND is_firm_admin()) OR ((firm_id = get_user_firm_id()) AND (EXISTS ( SELECT 1
+   FROM users
+  WHERE ((users.id = ( SELECT auth.uid() AS uid)) AND ((users.role)::text = ANY (ARRAY[('project_manager'::character varying)::text, ('vdcr_manager'::character varying)::text])) AND (users.is_active = true))))) OR is_super_admin())"
+projects,true,rls_merged_authenticated_delete,DELETE,(((firm_id = get_user_firm_id()) AND is_firm_admin()) OR is_super_admin()),null
+standalone_equipment,true,rls_merged_authenticated_update,UPDATE,"((EXISTS ( SELECT 1
+   FROM users u1
+  WHERE ((u1.id = ( SELECT auth.uid() AS uid)) AND ((u1.role)::text = 'firm_admin'::text) AND (u1.is_active = true) AND (EXISTS ( SELECT 1
+           FROM users u2
+          WHERE ((u2.id = standalone_equipment.created_by) AND (u2.firm_id = u1.firm_id))))))) OR is_super_admin() OR is_user_assigned_to_standalone_equipment(id) OR (created_by = ( SELECT auth.uid() AS uid)))","((EXISTS ( SELECT 1
+   FROM users u1
+  WHERE ((u1.id = ( SELECT auth.uid() AS uid)) AND ((u1.role)::text = 'firm_admin'::text) AND (u1.is_active = true) AND (EXISTS ( SELECT 1
+           FROM users u2
+          WHERE ((u2.id = standalone_equipment.created_by) AND (u2.firm_id = u1.firm_id))))))) OR is_super_admin() OR is_user_assigned_to_standalone_equipment(id) OR (created_by = ( SELECT auth.uid() AS uid)))"
+standalone_equipment,true,rls_merged_authenticated_delete,DELETE,"((EXISTS ( SELECT 1
+   FROM users u1
+  WHERE ((u1.id = ( SELECT auth.uid() AS uid)) AND ((u1.role)::text = 'firm_admin'::text) AND (u1.is_active = true) AND (EXISTS ( SELECT 1
+           FROM users u2
+          WHERE ((u2.id = standalone_equipment.created_by) AND (u2.firm_id = u1.firm_id))))))) OR is_super_admin() OR (created_by = ( SELECT auth.uid() AS uid)))",null
+standalone_equipment,true,rls_merged_authenticated_insert,INSERT,null,(is_super_admin() OR (created_by = ( SELECT auth.uid() AS uid)))
+standalone_equipment,true,rls_merged_authenticated_select,SELECT,"((EXISTS ( SELECT 1
+   FROM users u1
+  WHERE ((u1.id = ( SELECT auth.uid() AS uid)) AND ((u1.role)::text = 'firm_admin'::text) AND (u1.is_active = true) AND (EXISTS ( SELECT 1
+           FROM users u2
+          WHERE ((u2.id = standalone_equipment.created_by) AND (u2.firm_id = u1.firm_id))))))) OR is_super_admin() OR (is_user_assigned_to_standalone_equipment(id) OR (created_by = ( SELECT auth.uid() AS uid))))",null
+standalone_equipment_activities,true,Anon can manage standalone_equipment_activities,ALL,(( SELECT auth.uid() AS uid) IS NULL),(( SELECT auth.uid() AS uid) IS NULL)
+standalone_equipment_activities,true,Authenticated can manage standalone_equipment_activities,ALL,(( SELECT auth.uid() AS uid) IS NOT NULL),(( SELECT auth.uid() AS uid) IS NOT NULL)
+standalone_equipment_activity_completion_images,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (((standalone_equipment_activity_completions c
+     JOIN standalone_equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN standalone_equipment se ON ((se.id = a.equipment_id)))
+     JOIN users su ON ((su.id = se.created_by)))
+  WHERE ((c.id = standalone_equipment_activity_completion_images.completion_id) AND (su.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN standalone_equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = se.id) AND ((c.department IS NULL) OR (tp.department = c.department)))))))))","(EXISTS ( SELECT 1
+   FROM (((standalone_equipment_activity_completions c
+     JOIN standalone_equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN standalone_equipment se ON ((se.id = a.equipment_id)))
+     JOIN users su ON ((su.id = se.created_by)))
+  WHERE ((c.id = standalone_equipment_activity_completion_images.completion_id) AND (su.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN standalone_equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = se.id) AND ((c.department IS NULL) OR (tp.department = c.department)))))))))"
+standalone_equipment_activity_completion_inspection_reports,true,rls_auth_all,ALL,"(EXISTS ( SELECT 1
+   FROM (((standalone_equipment_activity_completions c
+     JOIN standalone_equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN standalone_equipment se ON ((se.id = a.equipment_id)))
+     JOIN users su ON ((su.id = se.created_by)))
+  WHERE ((c.id = standalone_equipment_activity_completion_inspection_reports.completion_id) AND (su.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN standalone_equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = se.id) AND ((c.department IS NULL) OR (tp.department = c.department)))))))))","(EXISTS ( SELECT 1
+   FROM (((standalone_equipment_activity_completions c
+     JOIN standalone_equipment_activities a ON ((a.id = c.activity_id)))
+     JOIN standalone_equipment se ON ((se.id = a.equipment_id)))
+     JOIN users su ON ((su.id = se.created_by)))
+  WHERE ((c.id = standalone_equipment_activity_completion_inspection_reports.completion_id) AND (su.firm_id = get_user_firm_id()) AND ((EXISTS ( SELECT 1
+           FROM users urole
+          WHERE ((urole.id = auth.uid()) AND (urole.is_active = true) AND ((urole.role)::text = ANY ((ARRAY['firm_admin'::character varying, 'project_manager'::character varying, 'vdcr_manager'::character varying])::text[]))))) OR (EXISTS ( SELECT 1
+           FROM (users u
+             JOIN standalone_equipment_team_positions tp ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((u.id = auth.uid()) AND (tp.equipment_id = se.id) AND ((c.department IS NULL) OR (tp.department = c.department)))))))))"
+standalone_equipment_activity_completions,true,Authenticated can manage standalone_equipment_activity_completi,ALL,(( SELECT auth.uid() AS uid) IS NOT NULL),(( SELECT auth.uid() AS uid) IS NOT NULL)
+standalone_equipment_activity_completions,true,Anon can manage standalone_equipment_activity_completions,ALL,(( SELECT auth.uid() AS uid) IS NULL),(( SELECT auth.uid() AS uid) IS NULL)
+standalone_equipment_activity_logs,true,Authenticated users can view standalone equipment activity logs,SELECT,true,null
+standalone_equipment_activity_logs,true,rls_merged_authenticated_delete,DELETE,"(is_super_admin() OR (EXISTS ( SELECT 1
+   FROM standalone_equipment se
+  WHERE ((se.id = standalone_equipment_activity_logs.equipment_id) AND ((EXISTS ( SELECT 1
+           FROM (standalone_equipment_team_positions tp
+             JOIN users u ON ((lower(TRIM(BOTH FROM tp.email)) = lower(TRIM(BOTH FROM u.email)))))
+          WHERE ((tp.equipment_id = se.id) AND (u.id = ( SELECT auth.uid() AS uid))))) OR (se.created_by = ( SELECT auth.uid() AS uid)))))))",null
+standalone_equipment_activity_logs,true,Authenticated users can insert standalone equipment activity lo,INSERT,null,(( SELECT auth.uid() AS uid) IS NOT NULL)

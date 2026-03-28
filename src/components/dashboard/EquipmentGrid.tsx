@@ -9,23 +9,25 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Eye, Calendar, User, MapPin, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, FileText, Users, Settings, TrendingUp, AlertTriangle, ClipboardCheck, Shield, Plus, Edit, Check, X, Camera, Upload, Clock, Building, Trash2, Mic, MicOff, Play, Pause, Search, ArrowLeft, Target, Wrench, BarChart3, Download, ArrowRight, Image, UserPlus, FileCheck, History, Loader2, BookMarked, GripVertical } from "lucide-react";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
+import { Eye, Calendar, User, MapPin, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, FileText, Users, Settings, TrendingUp, AlertTriangle, ClipboardCheck, Shield, Plus, Edit, Check, X, Camera, Upload, Clock, Building, Trash2, Mic, MicOff, Play, Pause, Search, ArrowLeft, Target, Wrench, BarChart3, Download, ArrowRight, Image, UserPlus, FileCheck, History, Loader2, BookMarked, GripVertical, Circle, MoreVertical, FileStack, ClipboardList } from "lucide-react";
 import AddEquipmentForm from "@/components/forms/AddEquipmentForm";
 import AddStandaloneEquipmentFormNew from "@/components/forms/AddStandaloneEquipmentFormNew";
 import AddTechnicalSectionModal from "@/components/forms/AddTechnicalSectionModal";
-import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getEquipmentDocumentsMetadataBatch, getStandaloneEquipmentDocumentsMetadataBatch, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument } from "@/lib/api";
+import { ProductionChecklistModal } from "@/components/dashboard/ProductionChecklistModal";
+import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getEquipmentDocumentsMetadataBatch, getStandaloneEquipmentDocumentsMetadataBatch, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument, getEquipmentVdcrRecordIds } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { updateEquipment } from "@/lib/database";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/contexts/AuthContext";
 import { useNotificationReads, UnreadEntityDot, UnreadTabDot } from "@/contexts/NotificationReadsContext";
-import { logProgressEntryAdded, logProgressEntryUpdated, logProgressEntryDeleted, logDocumentUploaded, logDocumentDeleted, logProgressImageUploaded, logTeamMemberAdded } from "@/lib/activityLogger";
+import { logProgressEntryAdded, logProgressEntryUpdated, logProgressEntryDeleted, logDocumentUploaded, logDocumentDeleted, logProgressImageUploaded, logTeamMemberAdded, logActivityCompleted } from "@/lib/activityLogger";
 import { sendProjectTeamEmailNotification, getDashboardUrl } from "@/lib/notifications";
 import { Equipment, ProgressEntry, EquipmentActivity } from "@/types/equipment";
 import { parseActivitiesExcel, ParsedActivitiesResult } from "@/utils/parseActivitiesExcel";
 import { transformEquipmentData } from "@/utils/equipmentTransform";
 import { getCache, setCache, prefetchWithCache, CACHE_KEYS, getCacheEvenIfExpired } from "@/utils/cache";
-import { USE_ON_DEMAND_PROGRESS_IMAGES } from "@/config/featureFlags";
 import axios from "axios";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -42,6 +44,109 @@ const devError = (...args: any[]) => {
 const devWarn = (...args: any[]) => {
   if (isDev) console.warn(...args);
 };
+
+// Placeholder used when marking milestone complete with no image; treat as "no image" so we show previous latest or gray box instead of blank white
+const PROGRESS_IMAGE_PLACEHOLDER = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMSIgaGVpZ2h0PSIxIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjwvc3ZnPg==';
+
+function formatActivityTime(createdAt: string): string {
+  try {
+    const d = new Date(createdAt);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins} min ago`;
+    if (diffHours < 24) return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays < 7) return `${diffDays} days ago`;
+    return d.toLocaleDateString();
+  } catch {
+    return createdAt || '—';
+  }
+}
+
+function getActivityIconType(activityType: string): 'orange' | 'blue' | 'teal' {
+  if (!activityType) return 'blue';
+  if (activityType.startsWith('progress_') || activityType.includes('image')) return 'orange';
+  if (activityType.startsWith('team_member_')) return 'teal';
+  if (activityType === 'activity_completed') return 'teal';
+  if (activityType.startsWith('vdcr_')) return 'blue';
+  return 'blue';
+}
+
+/** Recent activity: doc updates, QAP, manual upload, inspection report, task completion. Exclude vdcr_created (no "new doc created"). */
+const RECENT_ACTIVITY_TYPES = [
+  'document_uploaded', 'document_updated', 'activity_completed',
+  'vdcr_status_changed', 'vdcr_field_updated', 'vdcr_document_uploaded', 'vdcr_document_updated', 'vdcr_updated'
+] as const;
+
+type UpdateTypeLabel = 'Documentation update' | 'QAP update' | 'Audit, TPI & other docs' | 'Inspection report update' | 'Task completion update';
+
+function getUpdateTypeLabel(log: any): UpdateTypeLabel {
+  const t = log.activity_type || '';
+  if (t.startsWith('vdcr_')) return 'Documentation update';
+  if (t === 'activity_completed') {
+    const count = log.metadata?.inspection_report_count;
+    if (typeof count === 'number' && count > 0) return 'Inspection report update';
+    return 'QAP update'; // Task completion from checklist; "Task completion update" can be used when we add pending-tasks source
+  }
+  if (t === 'document_uploaded' || t === 'document_updated') return 'Audit, TPI & other docs';
+  return 'QAP update';
+}
+
+/** Title of update for list row (e.g. "GA Drawing Rev 3 - send for comments") */
+function getRecentActivityRowTitle(log: any): string {
+  const t = log.activity_type || '';
+  const dateStr = log.created_at ? (() => {
+    try {
+      return new Date(log.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    } catch { return log.created_at; }
+  })() : '';
+  const docName = log.metadata?.documentName || log.vdcr_record?.document_name || 'Document';
+  if (t === 'activity_completed') {
+    const name = log.metadata?.activityName || 'Task';
+    return `${name} completed on ${dateStr}`;
+  }
+  if (t === 'document_uploaded' || t === 'document_updated') {
+    const fileName = log.metadata?.fileName || log.metadata?.documentName || 'Document';
+    const rawType = log.metadata?.documentType || 'Documents';
+    const docType = (rawType === 'Manual Upload' || rawType === 'Manual upload') ? 'TPI, Audits & other doc' : rawType;
+    const verb = t === 'document_uploaded' ? 'added to' : 'updated in';
+    return `${fileName} ${verb} ${docType} on ${dateStr}`;
+  }
+  if (t === 'vdcr_status_changed') {
+    const newStatus = (log.new_value || log.metadata?.newStatus || '').trim();
+    return newStatus ? `${docName} – ${newStatus} on ${dateStr}` : `${docName} – status changed on ${dateStr}`;
+  }
+  if (t === 'vdcr_field_updated') {
+    const field = log.field_name || log.metadata?.fieldName || 'Field';
+    const oldV = log.old_value ?? '';
+    const newV = log.new_value ?? '';
+    return newV || oldV ? `${docName} – ${field}: ${oldV} → ${newV} on ${dateStr}` : `${docName} – ${field} updated on ${dateStr}`;
+  }
+  if (t === 'vdcr_document_uploaded' || t === 'vdcr_document_updated' || t === 'vdcr_updated') {
+    const verb = t === 'vdcr_document_uploaded' ? 'document uploaded' : t === 'vdcr_document_updated' ? 'document updated' : 'updated';
+    return `${docName} – ${verb} on ${dateStr}`;
+  }
+  return log.action_description || 'Activity';
+}
+
+function getRecentActivityLabel(log: any): { title: string; subtitle?: string } {
+  const title = getRecentActivityRowTitle(log);
+  const t = log.activity_type || '';
+  if (t === 'activity_completed') {
+    return { title, subtitle: log.metadata?.completedByDisplayName ? `Completed by ${log.metadata.completedByDisplayName}` : undefined };
+  }
+  if (t === 'document_uploaded' || t === 'document_updated') {
+    return { title, subtitle: log.created_by_user?.full_name || log.created_by_user?.email ? `Uploaded by ${log.created_by_user.full_name || log.created_by_user.email}` : undefined };
+  }
+  if (t.startsWith('vdcr_')) {
+    return { title, subtitle: log.created_by_user?.full_name || log.created_by_user?.email ? `By ${log.created_by_user.full_name || log.created_by_user.email}` : undefined };
+  }
+  return { title, subtitle: undefined };
+}
 
 interface EquipmentGridProps {
   equipment: Equipment[];
@@ -62,13 +167,21 @@ interface EquipmentGridProps {
   }) => void;
   /** Open dossier report wizard for this equipment (additive feature – no change to existing flow) */
   onOpenDossierReport?: (params: { projectId: string; equipmentId: string; projectName: string; equipment: Equipment }) => void;
+  /** Open detailed QAP view for this equipment */
+  onViewDetailedQAP?: (params: { projectId: string; equipmentId: string; equipment: Equipment }) => void;
 }    
 
-const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetails, onViewVDCR, onUserAdded, onActivityUpdate, onViewingDetailsChange, onSummaryChange, onOpenDossierReport }: EquipmentGridProps) => {
+const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetails, onViewVDCR, onUserAdded, onActivityUpdate, onViewingDetailsChange, onSummaryChange, onOpenDossierReport, onViewDetailedQAP }: EquipmentGridProps) => {
   const { toast } = useToast();
   const { user } = useAuth();
   const { markAsSeen } = useNotificationReads();
   const currentUserRole = localStorage.getItem('userRole') || '';
+  const canViewAllDepartmentDocuments =
+    currentUserRole === 'firm_admin' ||
+    currentUserRole === 'project_manager' ||
+    currentUserRole === 'vdcr_manager' ||
+    currentUserRole === 'super_admin';
+  const [currentUserDepartment, setCurrentUserDepartment] = useState<string>('');
   const [imageIndices, setImageIndices] = useState<Record<string, number>>({});
   const [showAddEquipmentForm, setShowAddEquipmentForm] = useState(false);
   const [editingStandaloneEquipment, setEditingStandaloneEquipment] = useState<Equipment | null>(null);
@@ -138,28 +251,47 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     email: "",
     phone: "",
     position: "",
+    department: "",
     role: "",
     permissions: [] as string[],
     equipmentAssignments: [] as string[],
     dataAccess: [] as string[],
     accessLevel: "viewer"
   });
+  const [addMemberAvailableDepartments, setAddMemberAvailableDepartments] = useState<string[]>([]);
+  const [addMemberNewDepartmentInput, setAddMemberNewDepartmentInput] = useState('');
   const [existingFirmMembers, setExistingFirmMembers] = useState<any[]>([]);
   const [isLoadingExistingMembers, setIsLoadingExistingMembers] = useState(false);
   const [selectedExistingMemberEmail, setSelectedExistingMemberEmail] = useState<string>("");
   const [isExistingMemberMode, setIsExistingMemberMode] = useState(false);
 
-  // Equipment activities (from Excel): progress bar + mark complete
+  // Equipment activities (QAP only): progress bar + mark complete – not connected to Production & Pre-Dispatch Checklist
   const [equipmentActivities, setEquipmentActivities] = useState<Record<string, EquipmentActivity[]>>({});
   const [loadingActivities, setLoadingActivities] = useState<Record<string, boolean>>({});
+  // Production & Pre-Dispatch Checklist tasks (separate from QAP; own tables)
+  const [productionChecklistByEquipment, setProductionChecklistByEquipment] = useState<Record<string, any[]>>({});
   const [uploadingActivitiesForEquipment, setUploadingActivitiesForEquipment] = useState<string | null>(null);
   const [markCompleteModalOpen, setMarkCompleteModalOpen] = useState(false);
   const [markCompleteSubmitting, setMarkCompleteSubmitting] = useState(false);
   const [editActivitiesModalOpen, setEditActivitiesModalOpen] = useState(false);
   const [editActivitiesModalEquipmentId, setEditActivitiesModalEquipmentId] = useState<string | null>(null);
-  const [editActivitiesDraft, setEditActivitiesDraft] = useState<Array<{ id: string; sr_no: number; activity_name: string; activity_type: 'regular_update' | 'milestone'; target_relative: string; target_date: string; sort_order: number }>>([]);
+  const [editActivitiesDraft, setEditActivitiesDraft] = useState<Array<{ id: string; sr_no: number; activity_name: string; activity_type: 'regular_update' | 'milestone'; target_relative: string; target_date: string; sort_order: number; inspection_tpi_involved?: boolean }>>([]);
   const [activitiesHistoryOpen, setActivitiesHistoryOpen] = useState(false);
   const [activitiesHistoryEquipmentId, setActivitiesHistoryEquipmentId] = useState<string | null>(null);
+  const [qapExpandedEquipmentId, setQapExpandedEquipmentId] = useState<string | null>(null);
+  const [qapPopupEquipmentId, setQapPopupEquipmentId] = useState<string | null>(null);
+  const qapPopupScrollRef = useRef<HTMLDivElement>(null);
+  const [qapStepDetails, setQapStepDetails] = useState<{ equipmentId: string; activityId: string } | null>(null);
+  const [qapShowVarianceDays, setQapShowVarianceDays] = useState(false);
+  // View step image: which completion is showing viewer, current index, and session cache (completionId_index -> url)
+  const [stepImageViewer, setStepImageViewer] = useState<{ completionId: string; currentIndex: number } | null>(null);
+  const [stepImageCache, setStepImageCache] = useState<Record<string, string>>({});
+  const [stepImageLoading, setStepImageLoading] = useState<Record<string, boolean>>({});
+  const [stepImagePreview, setStepImagePreview] = useState<{ completionId: string; currentIndex: number; imageCount: number } | null>(null);
+  /** Progress section (card): current image index per equipment when showing QAP latest-step images; session cache reused via stepImageCache. */
+  const [progressSectionImageIndex, setProgressSectionImageIndex] = useState<Record<string, number>>({});
+  /** Fallback image count per completion id when API image_count is 0 or 1 but completion_images has more (so nav arrows show). */
+  const [completionImageCountFallback, setCompletionImageCountFallback] = useState<Record<string, number>>({});
   const [markCompleteModalData, setMarkCompleteModalData] = useState<{
     activityId: string;
     activityName: string;
@@ -169,9 +301,112 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     completedByUserId: string;
     completedByDisplayName: string;
     completedBySelectValue: string; // for Select value (member.id || member.email)
+    department: string; // for docs dashboard / inspection reports by department
     notes: string;
-    imageFile: File | null;
-  }>({ activityId: '', activityName: '', activityType: 'regular_update', equipmentId: '', completedOn: '', completedByUserId: '', completedByDisplayName: '', completedBySelectValue: '', notes: '', imageFile: null });
+    imageFiles: File[];
+    reportFiles: File[]; // inspection reports (PDFs, if applicable)
+    percentageCompleted: number; // progress % when marking step complete (must be >= currentProgress)
+    currentProgress: number; // equipment progress at open (min allowed for percentageCompleted)
+    progressWeight: number | null; // when set, this step adds this fixed % (no manual slider)
+  }>({ activityId: '', activityName: '', activityType: 'regular_update', equipmentId: '', completedOn: '', completedByUserId: '', completedByDisplayName: '', completedBySelectValue: '', department: '', notes: '', imageFiles: [], reportFiles: [], percentageCompleted: 0, currentProgress: 0, progressWeight: null });
+  const [markCompleteAvailableDepartments, setMarkCompleteAvailableDepartments] = useState<string[]>([]);
+  const [markCompleteNewDepartmentInput, setMarkCompleteNewDepartmentInput] = useState('');
+  const [inspectionReportListModal, setInspectionReportListModal] = useState<{ completionId: string; reports: Array<{ id: string; report_url: string | null; file_name: string | null; sort_order: number }> } | null>(null);
+  const [inspectionReportListLoading, setInspectionReportListLoading] = useState(false);
+  const [inspectionReportPreview, setInspectionReportPreview] = useState<{ reportUrl: string; fileName: string } | null>(null);
+  /** Clients Documentations: pick which activity's inspection reports to open (when equipment has multiple completions with reports) */
+  const [inspectionReportPickerModal, setInspectionReportPickerModal] = useState<{ equipmentId: string; activities: Array<{ activityId: string; activityName: string; completionId: string; reportCount: number; department?: string | null }> } | null>(null);
+  /** Clients Documentations: "Other reference / internal drawings & documents" list modal */
+  const [clientsDocsOtherRefsModal, setClientsDocsOtherRefsModal] = useState<{ equipmentId: string; departmentFilter?: string } | null>(null);
+  /** Clients Documentations: "Production & pre-dispatch checklist" placeholder modal */
+  const [clientsDocsChecklistModal, setClientsDocsChecklistModal] = useState<{ equipmentId: string } | null>(null);
+  /** Clients Documentations: Code 1 / Code 2 / Code 3 / Code 4 docs list modal */
+  const [clientsDocsCodeModal, setClientsDocsCodeModal] = useState<{ equipmentId: string; code: string; departmentFilter?: string } | null>(null);
+  /** QA Document Dashboard: department subtabs – departments from project VDCR (Documentation tab); map vdcr_record_id → department */
+  const [qaDashboardDepartments, setQaDashboardDepartments] = useState<string[]>([]);
+  const [vdcrRecordIdToDepartment, setVdcrRecordIdToDepartment] = useState<Record<string, string>>({});
+  /** QA Document Dashboard: selected department subtab per equipment ('All' | department name | 'Other') */
+  const [qaDashboardDepartmentByEquipment, setQaDashboardDepartmentByEquipment] = useState<Record<string, string>>({});
+  /** QA Document Dashboard: sliding window start index for department tabs (max 5 visible at a time) */
+  const [qaDashboardDeptWindowStart, setQaDashboardDeptWindowStart] = useState<Record<string, number>>({});
+  /** QA Document Dashboard: expanded state per equipment (collapsed by default) */
+  const [qaDashboardExpandedByEquipment, setQADashboardExpandedByEquipment] = useState<Record<string, boolean>>({});
+  /** Recent Activity: logs per equipment (fetched when QA dashboard is expanded or when opening updates modal) */
+  const [recentActivityLogsByEquipment, setRecentActivityLogsByEquipment] = useState<Record<string, any[]>>({});
+  const [recentActivityLoadingByEquipment, setRecentActivityLoadingByEquipment] = useState<Record<string, boolean>>({});
+  /** Recent Activity: detail modal (log + equipment tag for display) */
+  const [recentActivityDetailModal, setRecentActivityDetailModal] = useState<{ log: any; equipmentId?: string; equipmentTag?: string; equipmentName?: string } | null>(null);
+  /** Recent Activity updates list modal (carousel) – which equipment is open */
+  const [recentActivityUpdatesModalEquipment, setRecentActivityUpdatesModalEquipment] = useState<{ equipmentId: string; equipmentName?: string; tagNumber?: string } | null>(null);
+  /** Current page (0-based) for recent activity updates modal carousel */
+  const [recentActivityUpdatesModalPage, setRecentActivityUpdatesModalPage] = useState(0);
+  /** Expanded row in recent activity list (log.id) – expand inline instead of opening detail modal */
+  const [recentActivityExpandedLogId, setRecentActivityExpandedLogId] = useState<string | null>(null);
+  /** Recent Activity updates modal: search text (matches title, department, remarks, etc.) */
+  const [recentActivitySearch, setRecentActivitySearch] = useState('');
+  /** Recent Activity updates modal: department filter ('All' or specific department) */
+  const [recentActivityDeptFilter, setRecentActivityDeptFilter] = useState('All');
+
+  const requestedRecentActivityRef = useRef<Set<string>>(new Set());
+  /** Call this when user opens the recent activity modal so we refetch and show latest QAP/Documentation updates. */
+  const invalidateRecentActivityCache = useCallback((equipmentId: string) => {
+    requestedRecentActivityRef.current.delete(equipmentId);
+  }, []);
+  const loadRecentActivityForEquipment = useCallback(async (equipmentId: string, forceRefetch = false) => {
+    if (!forceRefetch && requestedRecentActivityRef.current.has(equipmentId)) return;
+    if (!forceRefetch) requestedRecentActivityRef.current.add(equipmentId);
+    setRecentActivityLoadingByEquipment(prev => ({ ...prev, [equipmentId]: true }));
+    try {
+      const { activityApi } = await import('@/lib/activityApi');
+      const equipmentLogs = projectId === 'standalone'
+        ? await activityApi.getStandaloneEquipmentActivityLogsByEquipment(equipmentId, { limit: 50 })
+        : await activityApi.getEquipmentActivityLogs(projectId, { equipmentId, limit: 50 });
+      let list: any[] = Array.isArray(equipmentLogs) ? equipmentLogs : [];
+      if (projectId !== 'standalone') {
+        const vdcrIds = await getEquipmentVdcrRecordIds(equipmentId);
+        if (vdcrIds.length > 0) {
+          const vdcrLogs = await activityApi.getVDCRActivityLogs(projectId, { vdcrIds, limit: 30 });
+          const normalized = (Array.isArray(vdcrLogs) ? vdcrLogs : []).map((log: any) => ({
+            ...log,
+            _source: 'vdcr' as const,
+            id: log.id,
+            created_at: log.created_at,
+            action_description: log.action_description,
+            activity_type: log.activity_type,
+            created_by_user: log.created_by_user,
+            vdcr_record: log.vdcr_record,
+            vdcr_id: log.vdcr_id,
+            metadata: { ...(log.metadata || {}), documentName: log.vdcr_record?.document_name || log.metadata?.documentName, department: log.vdcr_record?.department ?? log.metadata?.department }
+          }));
+          list = [...list, ...normalized].sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+        }
+      }
+      setRecentActivityLogsByEquipment(prev => ({ ...prev, [equipmentId]: list }));
+    } catch (e) {
+      devError('Error loading recent activity for equipment:', e);
+      setRecentActivityLogsByEquipment(prev => ({ ...prev, [equipmentId]: [] }));
+    } finally {
+      setRecentActivityLoadingByEquipment(prev => ({ ...prev, [equipmentId]: false }));
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    Object.entries(qaDashboardExpandedByEquipment).forEach(([eid, expanded]) => {
+      if (expanded) loadRecentActivityForEquipment(eid);
+    });
+  }, [qaDashboardExpandedByEquipment, loadRecentActivityForEquipment]);
+
+  // When QAP popup opens, scroll to the current (ongoing) step
+  useEffect(() => {
+    if (!qapPopupEquipmentId) return;
+    const t = setTimeout(() => {
+      const scrollEl = qapPopupScrollRef.current;
+      if (!scrollEl) return;
+      const currentRow = scrollEl.querySelector('[data-qap-current="true"]');
+      if (currentRow) currentRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 150);
+    return () => clearTimeout(t);
+  }, [qapPopupEquipmentId]);
 
   // Load equipment activity logs for the viewing equipment
   const loadEquipmentActivityLogs = useCallback(async () => {
@@ -261,6 +496,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         email: member.email || '',
         phone: member.phone || '',
         position: member.position_name || '',
+        department: member.department || '',
         role: member.role || 'viewer',
         permissions: getPermissionsByRole(member.role || 'viewer'),
         status: 'active',
@@ -433,6 +669,48 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       fetchExistingFirmMembers();
     }
   }, [showAddMember, markCompleteModalOpen, fetchExistingFirmMembers]);
+
+  // For non-admin/non-project-manager users, restrict document visibility to their own department.
+  useEffect(() => {
+    let cancelled = false;
+    const loadCurrentUserDepartment = async () => {
+      if (canViewAllDepartmentDocuments) {
+        setCurrentUserDepartment('');
+        return;
+      }
+      if (!projectId || projectId === 'standalone') {
+        setCurrentUserDepartment('');
+        return;
+      }
+      try {
+        const userDataRaw = localStorage.getItem('userData');
+        const userData = userDataRaw ? JSON.parse(userDataRaw) : {};
+        const currentEmail = String(user?.email || userData?.email || '').trim().toLowerCase();
+        const members = await fastAPI.getProjectMembers(projectId);
+        const rows = Array.isArray(members) ? members : [];
+        const mine = rows.find((m: any) => {
+          const memberEmail = String(m?.email || '').trim().toLowerCase();
+          return !!currentEmail && memberEmail === currentEmail;
+        });
+        if (!cancelled) setCurrentUserDepartment(String(mine?.department || '').trim());
+      } catch {
+        if (!cancelled) setCurrentUserDepartment('');
+      }
+    };
+    loadCurrentUserDepartment();
+    return () => { cancelled = true; };
+  }, [projectId, user?.email, canViewAllDepartmentDocuments]);
+
+  // Load department choices for Add Member modal from project VDCR (same source as Mark Complete)
+  useEffect(() => {
+    if (!showAddMember) return;
+    setAddMemberNewDepartmentInput('');
+    if (projectId && projectId !== 'standalone') {
+      fastAPI.getProjectDepartments(projectId).then(setAddMemberAvailableDepartments);
+    } else {
+      setAddMemberAvailableDepartments([]);
+    }
+  }, [showAddMember, projectId]);
 
   const [roles] = useState([
     {
@@ -698,17 +976,18 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // Ref to read current localEquipment length inside refreshEquipmentData without adding it to deps (avoids overwriting good data with lightweight cache)
   const localEquipmentLengthRef = useRef(0);
   localEquipmentLengthRef.current = localEquipment.length;
+  // Avoid duplicate progress-image batch requests when effect re-runs (e.g. re-renders)
+  const progressImageBatchIdsRef = useRef<string[] | null>(null);
 
-  // On-demand progress images: option passed to API when USE_ON_DEMAND_PROGRESS_IMAGES is true (reversible via feature flag)
-  const progressImagesApiOptions = USE_ON_DEMAND_PROGRESS_IMAGES ? { progressImagesLatestOnly: true as const } : undefined;
+  // Main progress image: always load only latest (one image per equipment) to avoid slow load when many uploads
+  const progressImagesApiOptions = { progressImagesLatestOnly: true as const };
 
-  // Expand progressImages to metadata length (sparse array) when using on-demand loading so "X of Y" and prev/next work
+  // One slot only for the latest progress image (no multi-image navigation)
   const expandProgressImagesForOnDemand = useCallback((list: Equipment[]): Equipment[] => {
-    if (!USE_ON_DEMAND_PROGRESS_IMAGES) return list;
     return list.map(eq => {
       const meta = eq.progressImagesMetadata;
       if (meta?.length && (!eq.progressImages || eq.progressImages.length === 0)) {
-        return { ...eq, progressImages: Array.from({ length: meta.length }) as string[] };
+        return { ...eq, progressImages: Array.from({ length: 1 }) as string[] };
       }
       return eq;
     });
@@ -748,13 +1027,25 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       });
   }, []);
 
+  // Keep one deterministic fallback order so grid and arrange modal never diverge.
+  const getCreatedOrderIds = useCallback((list: Equipment[]): string[] => {
+    return [...list]
+      .sort((a, b) => {
+        const createdA = (a as { created_at?: string }).created_at ? new Date((a as { created_at?: string }).created_at).getTime() : 0;
+        const createdB = (b as { created_at?: string }).created_at ? new Date((b as { created_at?: string }).created_at).getTime() : 0;
+        if (createdA !== createdB) return createdA - createdB;
+        return a.id.localeCompare(b.id);
+      })
+      .map((eq) => eq.id);
+  }, []);
+
   // Fill latest progress image (index 0) for the given equipment (batched: one API call for all visible cards)
   const fillLatestProgressImagesForPage = useCallback(async (
     list: Equipment[],
     equipmentToFill: Equipment[],
     isStandalone: boolean
   ): Promise<Equipment[]> => {
-    if (!USE_ON_DEMAND_PROGRESS_IMAGES || list.length === 0 || equipmentToFill.length === 0) return list;
+    if (list.length === 0 || equipmentToFill.length === 0) return list;
     const ids = equipmentToFill.map((eq) => eq.id);
     const urlMap = await fastAPI.getLatestProgressImageUrlsBatch(ids, isStandalone);
     return list.map(eq => {
@@ -766,9 +1057,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     });
   }, []);
 
-  // On-demand: fetch one progress image by index when user clicks prev/next (only when flag on; no-op if already loaded)
+  // Fetch one progress image by index (kept for any future use; main grid now shows only latest)
   const fetchProgressImageForIndex = useCallback((equipmentId: string, index: number) => {
-    if (!USE_ON_DEMAND_PROGRESS_IMAGES) return;
     fastAPI.getProgressImageByEquipmentAndIndex(equipmentId, index, projectId === 'standalone').then(url => {
       if (!url) return;
       setLocalEquipment(prev => prev.map(eq => {
@@ -838,6 +1128,29 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     };
     fetchAll();
   }, [localEquipment, projectId, equipmentActivities]);
+
+  // Load Production & Pre-Dispatch Checklist tasks for all grid equipment (separate from QAP)
+  useEffect(() => {
+    if (!localEquipment?.length || !projectId) return;
+    const missingIds = localEquipment
+      .map((eq: Equipment) => eq.id)
+      .filter((id: string) => productionChecklistByEquipment[id] === undefined);
+    if (missingIds.length === 0) return;
+
+    const fetchChecklist = async () => {
+      try {
+        const batchMap = await fastAPI.getEquipmentProductionChecklistTasksBatch(missingIds, projectId === 'standalone');
+        setProductionChecklistByEquipment(prev => ({ ...prev, ...batchMap }));
+      } catch {
+        setProductionChecklistByEquipment(prev => {
+          const next = { ...prev };
+          missingIds.forEach((id: string) => { next[id] = []; });
+          return next;
+        });
+      }
+    };
+    fetchChecklist();
+  }, [localEquipment, projectId, productionChecklistByEquipment]);
 
   // Initialize date fields and notes when entering edit mode or when equipment data is refreshed
   useEffect(() => {
@@ -969,11 +1282,33 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         return;
       }
       const equipmentIds = equipmentList.map((eq) => eq.id);
-      const batchMap = projectId === 'standalone'
-        ? await getStandaloneEquipmentDocumentsMetadataBatch(equipmentIds)
-        : await getEquipmentDocumentsMetadataBatch(equipmentIds);
+      // Batch: fetch docs and (for project) VDCR records in parallel to get departments – no extra round-trip
+      const isProject = projectId && projectId !== 'standalone';
+      const [batchMap, vdcrRecords] = await Promise.all([
+        projectId === 'standalone'
+          ? getStandaloneEquipmentDocumentsMetadataBatch(equipmentIds)
+          : getEquipmentDocumentsMetadataBatch(equipmentIds),
+        isProject ? fastAPI.getVDCRRecordsByProject(projectId) : Promise.resolve(null)
+      ]);
 
-      const transformDoc = (doc: any) => ({
+      let vdcrMap: Record<string, string> = {};
+      let departmentsList: string[] = [];
+      if (vdcrRecords && Array.isArray(vdcrRecords)) {
+        const deptSet = new Set<string>();
+        vdcrRecords.forEach((r: any) => {
+          if (r.id && r.department != null && String(r.department).trim()) {
+            vdcrMap[r.id] = String(r.department).trim();
+            deptSet.add(String(r.department).trim());
+          }
+        });
+        departmentsList = Array.from(deptSet).sort();
+        setVdcrRecordIdToDepartment(vdcrMap);
+        setQaDashboardDepartments(departmentsList);
+      }
+
+      const transformDoc = (doc: any) => {
+        const department = doc.vdcr_record_id ? (vdcrMap[doc.vdcr_record_id] ?? null) : null;
+        return {
         id: doc.id,
         name: doc.document_name || doc.name,
         document_name: doc.document_name || doc.name,
@@ -982,8 +1317,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         uploadDate: doc.upload_date || doc.created_at,
         document_type: doc.document_type || 'Equipment Document',
         vdcr_code_status: doc.vdcr_code_status,
-        vdcr_document_status: doc.vdcr_document_status
-      });
+          vdcr_document_status: doc.vdcr_document_status,
+          department: department ?? undefined
+        };
+      };
 
       const documentsMap: Record<string, any[]> = {};
       for (const eq of equipmentList) {
@@ -1031,6 +1368,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       
       // Apply saved equipment display order (frontend-only, from Arrange Order) when available
       if (projectId && projectId !== 'standalone') {
+        const createdOrderIds = getCreatedOrderIds(transformedEquipment);
         try {
           const saved = localStorage.getItem(`equipment_order_${projectId}`);
           const order: string[] = saved ? JSON.parse(saved) : [];
@@ -1050,9 +1388,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             transformedEquipment.length = 0;
             transformedEquipment.push(...sorted);
             setEquipmentOrderIds(sorted.map((e: Equipment) => e.id));
+          } else {
+            setEquipmentOrderIds(createdOrderIds);
           }
         } catch (_) {
-          setEquipmentOrderIds(null);
+          setEquipmentOrderIds(createdOrderIds);
         }
       } else {
         setEquipmentOrderIds(null);
@@ -1146,7 +1486,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         setLocalEquipment([]);
       }
     }
-  }, [equipment, projectId]);
+  }, [equipment, projectId, getCreatedOrderIds]);
 
   // Keep optional summary (total/active/dispatched/completed) in sync for standalone equipment
   useEffect(() => {
@@ -1600,11 +1940,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             
             const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
             let toSet = transformEquipmentDataCallback(equipmentArray);
-            if (USE_ON_DEMAND_PROGRESS_IMAGES) {
-              toSet = expandProgressImagesForOnDemand(toSet);
-              const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
-              toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
-            }
+            toSet = expandProgressImagesForOnDemand(toSet);
+            const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+            toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
             
             // Cache lightweight version
             const lightweight = createLightweightEquipment(equipmentArray);
@@ -1616,6 +1954,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             // Update with fresh data when response is still for the current project (fix: data returned but not shown when request was aborted)
             if (currentProjectIdRef.current === projectId) {
               setLocalEquipment(toSet);
+              await loadDocumentsForEquipment(toSet);
             }
             setIsLoadingProgressImages(false);
           } catch (error) {
@@ -1643,11 +1982,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
             if (equipmentArray.length > 0) {
               let toSet = transformEquipmentDataCallback(equipmentArray);
-              if (USE_ON_DEMAND_PROGRESS_IMAGES) {
-                toSet = expandProgressImagesForOnDemand(toSet);
-                const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
-                toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
-              }
+              toSet = expandProgressImagesForOnDemand(toSet);
+              const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+              toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
               const lightweight = createLightweightEquipment(equipmentArray);
               setCache(cacheKey, lightweight, { 
                 ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
@@ -1655,6 +1992,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               });
               if (currentProjectIdRef.current === projectId) {
                 setLocalEquipment(toSet);
+                await loadDocumentsForEquipment(toSet);
               }
             }
             // FIX: Don't clear state if fetch fails - preserve existing data
@@ -1685,11 +2023,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
             if (equipmentArray.length > 0) {
               let toSet = transformEquipmentDataCallback(equipmentArray);
-              if (USE_ON_DEMAND_PROGRESS_IMAGES) {
-                toSet = expandProgressImagesForOnDemand(toSet);
-                const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
-                toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
-              }
+              toSet = expandProgressImagesForOnDemand(toSet);
+              const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+              toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
               const lightweight = createLightweightEquipment(equipmentArray);
               setCache(cacheKey, lightweight, { 
                 ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
@@ -1697,6 +2033,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               });
               if (currentProjectIdRef.current === projectId) {
                 setLocalEquipment(toSet);
+                await loadDocumentsForEquipment(toSet);
               }
             }
             // FIX: Don't clear state if fetch fails - preserve existing expired cache
@@ -1728,11 +2065,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           });
           
           let toSet = transformEquipmentDataCallback(equipmentArray);
-          if (USE_ON_DEMAND_PROGRESS_IMAGES) {
-            toSet = expandProgressImagesForOnDemand(toSet);
-            const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
-            toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
-          }
+          toSet = expandProgressImagesForOnDemand(toSet);
+          const visiblePage = getFilteredAndSortedEquipment(toSet, selectedPhase, searchQuery).slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+          toSet = await fillLatestProgressImagesForPage(toSet, visiblePage, projectId === 'standalone');
           const transformedEquipment = toSet;
           devLog('🔄 refreshEquipmentData: Transformed equipment count:', transformedEquipment.length);
       
@@ -1756,6 +2091,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           }
 
           setLocalEquipment(transformedEquipment);
+          await loadDocumentsForEquipment(transformedEquipment);
           devLog('✅ refreshEquipmentData: localEquipment state updated');
 
           // Update custom fields state with fresh data
@@ -1883,9 +2219,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     setCurrentPage(1);
   }, [selectedPhase, searchQuery, projectId]);
 
-  // When on-demand is on: fill latest progress image for the *visible* page (batched: one API call for all needLatest)
+  // Fill latest progress image for the *visible* page (batched: one API call for all needLatest)
   useEffect(() => {
-    if (!USE_ON_DEMAND_PROGRESS_IMAGES || !localEquipment.length) return;
+    if (!localEquipment.length) return;
     const visibleList = getFilteredAndSortedEquipment(localEquipment, selectedPhase, searchQuery);
     const start = (currentPage - 1) * itemsPerPage;
     const visiblePage = visibleList.slice(start, start + itemsPerPage);
@@ -1893,7 +2229,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     if (needLatest.length === 0) return;
     const isStandalone = projectId === 'standalone';
     const ids = needLatest.map((eq) => eq.id);
+    const idsKey = ids.slice().sort().join(',');
+    if (progressImageBatchIdsRef.current && progressImageBatchIdsRef.current.join(',') === idsKey) return;
+    progressImageBatchIdsRef.current = ids;
     fastAPI.getLatestProgressImageUrlsBatch(ids, isStandalone).then((urlMap) => {
+      progressImageBatchIdsRef.current = null;
       const updates = new Map<string, string>();
       for (const id of ids) {
         const url = urlMap[id];
@@ -1907,6 +2247,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         if (next.length > 0) next[0] = url;
         return { ...e, progressImages: next };
       }));
+    }).catch(() => {
+      progressImageBatchIdsRef.current = null;
     });
   }, [currentPage, localEquipment.length, projectId, itemsPerPage, selectedPhase, searchQuery, getFilteredAndSortedEquipment]);
 
@@ -2010,7 +2352,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         : await getEquipmentDocumentsMetadata(equipmentId);
 
       if (equipmentDocs && Array.isArray(equipmentDocs) && equipmentDocs.length > 0) {
-        const transformedDocs = equipmentDocs.map((doc: any) => ({
+        const map = vdcrRecordIdToDepartment;
+        const transformedDocs = equipmentDocs.map((doc: any) => {
+          const department = doc.vdcr_record_id ? (map[doc.vdcr_record_id] ?? undefined) : undefined;
+          return {
           id: doc.id,
           name: doc.document_name,
           document_name: doc.document_name,
@@ -2019,8 +2364,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           uploadDate: doc.upload_date || doc.created_at,
           document_type: doc.document_type || 'Equipment Document',
           vdcr_code_status: doc.vdcr_code_status,
-          vdcr_document_status: doc.vdcr_document_status
-        }));
+            vdcr_document_status: doc.vdcr_document_status,
+            department
+          };
+        });
 
         setDocuments(prev => ({ ...prev, [equipmentId]: transformedDocs }));
       } else {
@@ -2049,20 +2396,29 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   }, []);
 
   // Open document preview: if URL already loaded use it; else fetch document URL on-demand and show loader. Use blob URL for iframe so preview works.
-  const handleDocumentPreviewClick = useCallback((doc: { id: string; document_name?: string; name?: string; document_url?: string; uploadedBy?: string; uploadDate?: string }, equipmentId: string) => {
+  // Resolves doc id from the same document list (by name) so preview always fetches the same doc as the document name column.
+  const handleDocumentPreviewClick = useCallback((doc: { id?: string; document_name?: string; name?: string; document_url?: string; uploadedBy?: string; uploadDate?: string }, equipmentId: string) => {
     const name = doc.document_name || doc.name || 'Document';
     if (doc.document_url) {
       setDocumentUrlModal({ url: doc.document_url, name, uploadedBy: doc.uploadedBy, uploadDate: doc.uploadDate, previewLoading: true });
       fetchAndSetBlobUrl(doc.document_url);
       return;
     }
-    setDocumentUrlModal({ name, uploadedBy: doc.uploadedBy, uploadDate: doc.uploadDate, loading: true, documentId: doc.id });
-    getDocumentUrlById(doc.id, projectId === 'standalone').then((data) => {
-      if (!data?.document_url) {
-        setDocumentUrlModal(null);
-        toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
-        return;
-      }
+    // Use doc.id; if missing, resolve same document from list by name (same doc as document name column)
+    let documentId = doc.id;
+    if (!documentId && equipmentId) {
+      const list = documents[equipmentId] || [];
+      const sameDoc = list.find((d: any) => (d.document_name || d.name || '') === (doc.document_name || doc.name || ''));
+      if (sameDoc?.id) documentId = sameDoc.id;
+    }
+    if (!documentId) {
+      toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
+      return;
+    }
+    setDocumentUrlModal({ name, uploadedBy: doc.uploadedBy, uploadDate: doc.uploadDate, loading: true, documentId });
+
+    const applyDocUrl = (data: { document_url: string; document_name?: string; upload_date?: string; uploaded_by?: string; uploaded_by_user?: { full_name?: string } }) => {
+      if (!data?.document_url) return;
       setDocumentUrlModal({
         url: data.document_url,
         name: data.document_name || name,
@@ -2073,13 +2429,43 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       fetchAndSetBlobUrl(data.document_url);
       setDocuments(prev => ({
         ...prev,
-        [equipmentId]: (prev[equipmentId] || []).map((d: any) => d.id === doc.id ? { ...d, document_url: data.document_url } : d)
+        [equipmentId]: (prev[equipmentId] || []).map((d: any) => d.id === documentId ? { ...d, document_url: data.document_url } : d)
       }));
+    };
+
+    const tryFallback = () => {
+      const fetchFull = projectId === 'standalone' ? getStandaloneEquipmentDocuments(equipmentId) : getEquipmentDocuments(equipmentId);
+      fetchFull.then((list) => {
+        const full = Array.isArray(list) ? list : [];
+        const match = full.find((d: any) => d.id === documentId);
+        if (match?.document_url) {
+          applyDocUrl({
+            document_url: match.document_url,
+            document_name: match.document_name,
+            upload_date: match.upload_date,
+            uploaded_by: match.uploaded_by,
+            uploaded_by_user: match.uploaded_by_user
+          });
+        } else {
+          setDocumentUrlModal(null);
+          toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
+        }
+      }).catch(() => {
+        setDocumentUrlModal(null);
+        toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
+      });
+    };
+
+    getDocumentUrlById(documentId, projectId === 'standalone').then((data) => {
+      if (data?.document_url) {
+        applyDocUrl(data);
+        return;
+      }
+      tryFallback();
     }).catch(() => {
-      setDocumentUrlModal(null);
-      toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
+      tryFallback();
     });
-  }, [projectId, toast, fetchAndSetBlobUrl]);
+  }, [projectId, toast, fetchAndSetBlobUrl, documents]);
 
   // Initial document load for all equipment is done in the main equipment useEffect via loadDocumentsForEquipment(transformedEquipment).
   // Do NOT add a second effect that loops equipment and calls fetchEquipmentDocuments(item.id) — that caused 2N duplicate API calls.
@@ -2143,7 +2529,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         const timeDiff = poCddDate.getTime() - today.getTime();
         const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
-        if (daysDiff <= 21 && daysDiff > 0) {
+        // If equipment is 4+ days past PO-CDD, always show as delayed
+        if (daysDiff <= -4) {
+          return 'delayed';
+        }
+
+        // If within 21 days of upcoming PO-CDD (including today), show as nearing completion
+        if (daysDiff <= 21 && daysDiff >= 0) {
           return 'nearing-completion';
         }
       } catch (error) {
@@ -2628,8 +3020,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   : eq
               ));
             }
-            // Get equipment info for logging
+            // Get equipment info for logging (include progress_image_id so activity detail can open this image)
             const currentEquipment = localEquipment.find(eq => eq.id === editingEquipmentId);
+            const progressImageId = newRow?.id;
             if (currentEquipment) {
               try {
                 await logProgressImageUploaded(
@@ -2637,7 +3030,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   editingEquipmentId,
                   currentEquipment.type || 'Equipment',
                   currentEquipment.tagNumber || 'Unknown',
-                  finalDescription || undefined
+                  finalDescription || undefined,
+                  progressImageId
                 );
                 if (onActivityUpdate) {
                   onActivityUpdate();
@@ -2914,6 +3308,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           target_relative: a.target_relative,
           target_date: a.target_date || undefined,
           sort_order: a.sort_order,
+          inspection_tpi_involved: a.inspection_tpi_involved ?? false,
+          progress_weight: a.progress_weight ?? undefined,
         })),
       };
       if (isStandalone) {
@@ -2955,11 +3351,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       const todayDDMMYYYY = `${day}-${month}-${year}`;
       const rows = [
         ['Commencement Date', todayDDMMYYYY],
-        ['Sr. No.', 'Activity Name', 'Activity Type', 'Target'],
-        [1, 'Shell welding', 'Process Update', '1st week'],
-        [2, 'Nozzle marking', 'Process Update', '2nd week'],
-        [3, 'Shell fabrication complete', 'Milestone', '3rd week'],
-        [4, 'Radiography tests', 'Milestone', '1st month'],
+        ['Sr. No.', 'Activity Name', 'Activity Type', 'Target', 'Inspection/TPI involved?', 'Weightage (%)'],
+        [1, 'Shell welding', 'Minor', '1st week', 'No', 25],
+        [2, 'Nozzle marking', 'Minor', '2nd week', 'No', 25],
+        [3, 'Shell fabrication complete', 'Major', '3rd week', 'Yes', 25],
+        [4, 'Radiography tests', 'Major', '1st month', 'Yes', 25],
       ];
       const ws = XLSX.utils.aoa_to_sheet(rows);
       const wb = XLSX.utils.book_new();
@@ -3039,6 +3435,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       target_relative: a.target_relative || a.target_date || '',
       target_date: a.target_date || '',
       sort_order: a.sort_order ?? i,
+      inspection_tpi_involved: a.inspection_tpi_involved ?? false,
     })));
     setEditActivitiesModalEquipmentId(equipmentId);
     setEditActivitiesModalOpen(true);
@@ -3064,6 +3461,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             target_relative: a.target_relative || undefined,
             target_date: targetDate,
             sort_order: i,
+            inspection_tpi_involved: a.inspection_tpi_involved ?? false,
           };
         }),
       };
@@ -3115,7 +3513,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           const daysDiff = Math.round((completed - target) / (1000 * 60 * 60 * 24));
           variance = daysDiff > 0 ? `${daysDiff} days late` : daysDiff < 0 ? `${Math.abs(daysDiff)} days early` : 'On time';
         }
-        return [act.sr_no, act.activity_name || '', act.activity_type === 'milestone' ? 'Milestone' : 'Process Update', targetDate, completedOn, completedBy, notes, updatedOn, updatedBy, variance];
+        // For user-facing export: show "Major" for milestones and "Minor" for regular updates
+        const activityTypeLabel = act.activity_type === 'milestone' ? 'Major' : 'Minor';
+        return [act.sr_no, act.activity_name || '', activityTypeLabel, targetDate, completedOn, completedBy, notes, updatedOn, updatedBy, variance];
       });
       const commencementRow = ['Commencement Date', commencementDateDisplay];
       const ws = XLSX.utils.aoa_to_sheet([commencementRow, headers, ...rows]);
@@ -3134,8 +3534,16 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
   }, [projectId, localEquipment, toast]);
 
-  // Open Mark complete modal
+  // Open Mark complete modal (pass current equipment progress so percentage can only increase)
   const openMarkCompleteModal = useCallback((activity: any, equipmentId: string) => {
+    const eq = localEquipment.find((e: Equipment) => e.id === equipmentId);
+    const currentProgress = typeof eq?.progress === 'number' ? Math.min(100, Math.max(0, eq.progress)) : 0;
+    const progressWeight = activity.progress_weight != null ? Math.min(100, Math.max(0, Number(activity.progress_weight))) : null;
+    const list = equipmentActivities[equipmentId] || [];
+    const completedWeightSoFar = list
+      .filter((a: any) => a.completion && a.progress_weight != null)
+      .reduce((sum: number, a: any) => sum + (Number(a.progress_weight) || 0), 0);
+    const newTotalIfWeighted = progressWeight != null ? Math.min(100, completedWeightSoFar + progressWeight) : currentProgress;
     setMarkCompleteModalData({
       activityId: activity.id,
       activityName: activity.activity_name || '',
@@ -3145,51 +3553,402 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       completedByUserId: '',
       completedByDisplayName: '',
       completedBySelectValue: '',
+      department: '',
       notes: '',
-      imageFile: null,
+      imageFiles: [],
+      reportFiles: [],
+      percentageCompleted: progressWeight != null ? newTotalIfWeighted : currentProgress,
+      currentProgress,
+      progressWeight: progressWeight ?? null,
     });
+    setMarkCompleteNewDepartmentInput('');
+    if (projectId && projectId !== 'standalone') {
+      fastAPI.getProjectDepartments(projectId).then(setMarkCompleteAvailableDepartments);
+    } else {
+      setMarkCompleteAvailableDepartments([]);
+    }
     setMarkCompleteModalOpen(true);
-  }, []);
+  }, [localEquipment, projectId, equipmentActivities]);
+
+  // Render the "remaining" segment of the percentage slider (currentProgress to 100) so we avoid IIFE in JSX
+  const renderPercentageRemainingSlider = useCallback(() => {
+    const current = markCompleteModalData.currentProgress;
+    const pctCompleted = markCompleteModalData.percentageCompleted;
+    const remaining = 100 - current;
+    if (remaining <= 0) return null;
+    const sliderPct = Math.round(((pctCompleted - current) / remaining) * 100);
+    return (
+      <div className="flex-1 min-w-0 flex items-center" style={{ width: `${remaining}%` }}>
+        <Slider
+          min={0}
+          max={100}
+          step={1}
+          value={[sliderPct]}
+          onValueChange={([v]) => {
+            const pct = v ?? 0;
+            const newTotal = current + Math.round((pct / 100) * remaining);
+            setMarkCompleteModalData(prev => ({ ...prev, percentageCompleted: Math.min(100, newTotal) }));
+          }}
+          className="w-full [&>.relative]:!bg-emerald-200 [&>.relative]:!rounded-l-none [&>.relative]:!rounded-r-full [&>.relative>.absolute]:!bg-emerald-500 [&>button]:!border-emerald-500 [&>button]:!bg-white"
+        />
+      </div>
+    );
+  }, [markCompleteModalData.currentProgress, markCompleteModalData.percentageCompleted]);
+
+  /** Clients Documentations row 2: same card style as Code 1–4 (title, number, docs, icon) */
+  const renderClientsDocsRow2 = useCallback((equipmentItem: { id: string }) => {
+    const activities = equipmentActivities[equipmentItem.id] || [];
+    const inspectionTotal = activities.reduce((sum: number, a: any) => sum + (a.completion?.inspection_report_count ?? 0), 0);
+    const completionsWithReports = activities.filter((a: any) => (a.completion?.inspection_report_count ?? 0) > 0);
+    const otherRefsCount = (documents[equipmentItem.id] || []).filter((d: any) => {
+      const code = d.vdcr_code_status || '';
+      return !['Code 1', 'Code 2', 'Code 3', 'Code 4'].includes(code);
+    }).length;
+    const cardClass = 'rounded-xl border border-gray-200 bg-white shadow-sm hover:shadow-md hover:border-gray-300 transition-shadow p-4 min-h-[100px] flex flex-col text-left w-full';
+    const labelClass = 'text-blue-600 text-xs font-medium mb-0.5 leading-tight';
+    const numberClass = 'text-blue-700 text-2xl sm:text-3xl font-bold tabular-nums';
+    const docsClass = 'text-gray-500 text-xs mt-0.5';
+    const iconWrap = 'w-9 h-9 sm:w-10 sm:h-10 bg-blue-100 rounded-full flex items-center justify-center flex-shrink-0';
+    const iconInner = 'w-5 h-5 sm:w-6 sm:h-6 bg-blue-200 rounded-full flex items-center justify-center';
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            if (inspectionTotal === 0) {
+              setInspectionReportListModal({ completionId: '', reports: [] });
+              return;
+            }
+            if (completionsWithReports.length === 1) {
+              setInspectionReportListLoading(true);
+              fastAPI.getEquipmentActivityCompletionInspectionReports(completionsWithReports[0].completion.id, projectId === 'standalone')
+                .then((reports) => setInspectionReportListModal({ completionId: completionsWithReports[0].completion.id, reports }))
+                .finally(() => setInspectionReportListLoading(false));
+            } else {
+              setInspectionReportPickerModal({
+                equipmentId: equipmentItem.id,
+                activities: completionsWithReports.map((a: any) => ({
+                  activityId: a.id,
+                  activityName: a.activity_name || 'Activity',
+                  completionId: a.completion.id,
+                  reportCount: a.completion?.inspection_report_count ?? 0,
+                  department: (a.completion?.department ?? '').trim() || null
+                }))
+              });
+            }
+          }}
+          className={cardClass}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className={labelClass}>Inspection Reports</p>
+              <p className={numberClass}>{inspectionTotal}</p>
+              <p className={docsClass}>docs</p>
+            </div>
+            <div className={iconWrap} aria-hidden>
+              <div className={iconInner}>
+                <FileText className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-blue-600" />
+              </div>
+            </div>
+          </div>
+        </button>
+        <button
+          type="button"
+          onClick={() => setClientsDocsOtherRefsModal({ equipmentId: equipmentItem.id })}
+          className={cardClass}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className={labelClass}>Audit, Internal Reviews & Others Docs</p>
+              <p className={numberClass}>{otherRefsCount}</p>
+              <p className={docsClass}>docs</p>
+            </div>
+            <div className={iconWrap} aria-hidden>
+              <div className={iconInner}>
+                <FileText className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-blue-600" />
+              </div>
+            </div>
+          </div>
+        </button>
+        <button
+          type="button"
+          onClick={() => setClientsDocsChecklistModal({ equipmentId: equipmentItem.id })}
+          className={cardClass}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className={labelClass}>Production & Pre-Dispatch Checklist</p>
+              <p className={numberClass}>{(() => {
+                const list = productionChecklistByEquipment[equipmentItem.id] ?? [];
+                const pending = list.filter((t: any) => !t.completion).length;
+                return pending;
+              })()}</p>
+              <p className={docsClass}>pending tasks</p>
+            </div>
+            <div className={iconWrap} aria-hidden>
+              <div className={iconInner}>
+                <ClipboardCheck className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-blue-600" />
+              </div>
+            </div>
+          </div>
+        </button>
+      </>
+    );
+  }, [equipmentActivities, documents, projectId]);
+
+  /** Document visibility rules:
+   * - firm_admin/project_manager/vdcr_manager/super_admin: all docs
+   * - others: own department docs + docs without department
+   */
+  const filterDocsByUserDepartmentAccess = useCallback((docs: any[]) => {
+    if (canViewAllDepartmentDocuments) return docs;
+    const userDept = (currentUserDepartment || '').trim().toLowerCase();
+    return docs.filter((d: any) => {
+      const docDept = (d?.department || '').trim().toLowerCase();
+      if (!docDept) return true; // unassigned docs are visible to all users
+      if (!userDept) return false;
+      return docDept === userDept;
+    });
+  }, [canViewAllDepartmentDocuments, currentUserDepartment]);
+
+  /** Filter docs by department (All = no filter, Other = no department) */
+  const filterDocsByDepartment = useCallback((docs: any[], departmentFilter: string | undefined) => {
+    const roleFilteredDocs = filterDocsByUserDepartmentAccess(docs);
+    if (!departmentFilter || departmentFilter === 'All') return roleFilteredDocs;
+    if (departmentFilter === 'Other') return roleFilteredDocs.filter((d: any) => !d.department);
+    return roleFilteredDocs.filter((d: any) => d.department === departmentFilter);
+  }, [filterDocsByUserDepartmentAccess]);
+
+  /** Clients Documentations: "Other refs" modal content (avoids IIFE in JSX) */
+  const renderClientsDocsOtherRefsContent = useCallback((equipmentId: string, departmentFilter?: string) => {
+    let docs = (documents[equipmentId] || []).filter((d: any) => {
+      const code = d.vdcr_code_status || '';
+      return !['Code 1', 'Code 2', 'Code 3', 'Code 4'].includes(code);
+    });
+    docs = filterDocsByDepartment(docs, departmentFilter);
+    if (docs.length === 0) return <p className="text-sm text-gray-500">No documents in this category.</p>;
+    return (
+      <ul className="space-y-2">
+        {docs.map((doc: any) => (
+          <li key={doc.id}>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-start text-left h-auto py-2 min-w-0"
+              onClick={() => { setClientsDocsOtherRefsModal(null); handleOpenDocument(doc, equipmentId); }}
+            >
+              <FileText className="w-4 h-4 mr-2 flex-shrink-0" />
+              <span className="block min-w-0 truncate">
+                {doc.document_name || doc.name || 'Document'}
+              </span>
+            </Button>
+          </li>
+        ))}
+      </ul>
+    );
+  }, [documents, filterDocsByDepartment]);
+
+  /** Clients Documentations: Code 1–4 modal content — list docs for this equipment + code */
+  const renderClientsDocsCodeContent = useCallback((equipmentId: string, code: string, departmentFilter?: string) => {
+    let docs = (documents[equipmentId] || []).filter((d: any) => (d.vdcr_code_status || '') === code);
+    docs = filterDocsByDepartment(docs, departmentFilter);
+    if (docs.length === 0) return <p className="text-sm text-gray-500">No documents in this category.</p>;
+    return (
+      <ul className="space-y-2">
+        {docs.map((doc: any) => (
+          <li key={doc.id}>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-start text-left h-auto py-2"
+              onClick={() => { setClientsDocsCodeModal(null); handleOpenDocument(doc, equipmentId); }}
+            >
+              <FileText className="w-4 h-4 mr-2 flex-shrink-0" />
+              {doc.document_name || doc.name || 'Document'}
+            </Button>
+          </li>
+        ))}
+      </ul>
+    );
+  }, [documents, filterDocsByDepartment]);
+
+  // Load step image into session cache when viewer is open or index changes (on-demand fetch)
+  useEffect(() => {
+    const source = stepImageViewer ?? stepImagePreview;
+    if (!source) return;
+    const { completionId, currentIndex } = source;
+    const cacheKey = `${completionId}_${currentIndex}`;
+    if (stepImageCache[cacheKey] != null) return;
+    let cancelled = false;
+    setStepImageLoading(prev => ({ ...prev, [cacheKey]: true }));
+    fastAPI.getEquipmentActivityCompletionImageUrl(completionId, currentIndex, projectId === 'standalone')
+      .then((url) => {
+        if (!cancelled && url) setStepImageCache(prev => ({ ...prev, [cacheKey]: url }));
+      })
+      .finally(() => {
+        if (!cancelled) setStepImageLoading(prev => ({ ...prev, [cacheKey]: false }));
+      });
+    return () => { cancelled = true; };
+  }, [stepImageViewer?.completionId, stepImageViewer?.currentIndex, stepImagePreview?.completionId, stepImagePreview?.currentIndex, projectId, stepImageCache]);
+
+  // Load progress-section image (last completed milestone that has images) into session cache
+  useEffect(() => {
+    const isStandalone = projectId === 'standalone';
+    const toLoad: { cacheKey: string; completionId: string; currentIndex: number }[] = [];
+    for (const eq of localEquipment) {
+      const list = equipmentActivities[eq.id] || [];
+      const sorted = [...list].sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+      const completedMilestones = sorted.filter((a: any) => a.completion && a.activity_type === 'milestone');
+      let displayComp: { id: string } | undefined;
+      let displayCount = 0;
+      for (let i = completedMilestones.length - 1; i >= 0; i--) {
+        const comp = completedMilestones[i]?.completion;
+        const fromApi = comp ? (Number(comp.image_count) ?? 0) : 0;
+        const fallbackCount = comp?.id ? (completionImageCountFallback[comp.id] ?? 0) : 0;
+        const imageCount = Math.max(fromApi, fallbackCount);
+        if (imageCount >= 1) {
+          displayComp = comp;
+          displayCount = imageCount;
+          break;
+        }
+      }
+      if (!displayComp?.id || displayCount < 1) continue;
+      const currentIndex = Math.min(Math.max(0, progressSectionImageIndex[eq.id] ?? 0), displayCount - 1);
+      const cacheKey = `${displayComp.id}_${currentIndex}`;
+      if (stepImageCache[cacheKey] != null || stepImageLoading[cacheKey]) continue;
+      toLoad.push({ cacheKey, completionId: displayComp.id, currentIndex });
+    }
+    for (const { cacheKey, completionId, currentIndex } of toLoad) {
+      setStepImageLoading(prev => ({ ...prev, [cacheKey]: true }));
+      fastAPI.getEquipmentActivityCompletionImageUrl(completionId, currentIndex, isStandalone)
+        .then((url) => {
+          if (url) setStepImageCache(prev => ({ ...prev, [cacheKey]: url }));
+        })
+        .finally(() => {
+          setStepImageLoading(prev => ({ ...prev, [cacheKey]: false }));
+        });
+    }
+  }, [localEquipment, equipmentActivities, progressSectionImageIndex, projectId, stepImageCache, stepImageLoading, completionImageCountFallback, getActivitiesProgressSegments]);
+
+  // Fetch real image count for every completed milestone completion so we can pick "last milestone with images" and show arrows
+  useEffect(() => {
+    const isStandalone = projectId === 'standalone';
+    const toFetch: { completionId: string }[] = [];
+    const seen = new Set<string>();
+    for (const eq of localEquipment) {
+      const list = equipmentActivities[eq.id] || [];
+      const sorted = [...list].sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+      const completedMilestones = sorted.filter((a: any) => a.completion && a.activity_type === 'milestone');
+      for (const act of completedMilestones) {
+        const comp = act?.completion;
+        if (!comp?.id || seen.has(comp.id) || completionImageCountFallback[comp.id] != null) continue;
+        seen.add(comp.id);
+        toFetch.push({ completionId: comp.id });
+      }
+    }
+    for (const { completionId } of toFetch) {
+      fastAPI.getEquipmentActivityCompletionImageCount(completionId, isStandalone).then((count) => {
+        setCompletionImageCountFallback((prev) => ({ ...prev, [completionId]: count }));
+      });
+    }
+  }, [localEquipment, equipmentActivities, projectId, completionImageCountFallback]);
 
   // Submit Mark complete (create completion, auto-feed Updates tab or Progress Image, refresh activities)
   const handleMarkActivityComplete = useCallback(async () => {
-    const { activityId, equipmentId, activityName, activityType, completedOn, completedByUserId, completedByDisplayName, notes, imageFile } = markCompleteModalData;
+    const { activityId, equipmentId, activityName, activityType, completedOn, completedByUserId, completedByDisplayName, department: departmentRaw, notes, imageFiles, reportFiles, percentageCompleted, currentProgress } = markCompleteModalData;
+    const department = (departmentRaw && departmentRaw !== '__add_new__' ? departmentRaw.trim() : null) || null;
     if (!completedOn?.trim()) {
       toast({ title: 'Required', description: 'Please enter when it was completed.', variant: 'destructive' });
       return;
     }
+    const pct = typeof percentageCompleted === 'number' ? Math.min(100, Math.max(0, percentageCompleted)) : currentProgress;
+    if (pct < currentProgress) {
+      toast({ title: 'Invalid percentage', description: `Percentage completed must be at least ${currentProgress}% (current progress). It can only move forward.`, variant: 'destructive' });
+      return;
+    }
     setMarkCompleteSubmitting(true);
     try {
-      let imageUrl: string | null = null;
-      if (imageFile) {
-        const reader = new FileReader();
-        imageUrl = await new Promise<string>((res, rej) => {
+      const imageUrls: string[] = [];
+      for (const file of imageFiles || []) {
+        const url = await new Promise<string>((res, rej) => {
+          const reader = new FileReader();
           reader.onload = () => res(String(reader.result));
           reader.onerror = rej;
-          reader.readAsDataURL(imageFile);
+          reader.readAsDataURL(file);
         });
+        imageUrls.push(url);
       }
+      const reportUrls: string[] = [];
+      const reportNames: (string | null)[] = [];
+      for (const file of reportFiles || []) {
+        const url = await new Promise<string>((res, rej) => {
+          const reader = new FileReader();
+          reader.onload = () => res(String(reader.result));
+          reader.onerror = rej;
+          reader.readAsDataURL(file);
+        });
+        reportUrls.push(url);
+        reportNames.push(file.name || null);
+      }
+      const firstImageUrl = imageUrls.length > 0 ? imageUrls[0] : null;
       const isStandalone = projectId === 'standalone';
       const currentUserId = user?.id || localStorage.getItem('userId') || null;
       const currentUserFullName = localStorage.getItem('userName') || (user as any)?.full_name || user?.email || null;
+      let completionId: string | undefined;
       if (isStandalone) {
-        await fastAPI.createStandaloneEquipmentActivityCompletion(activityId, {
+        const completionResponse = await fastAPI.createStandaloneEquipmentActivityCompletion(activityId, {
           completed_on: completedOn,
           completed_by_user_id: completedByUserId || null,
           completed_by_display_name: completedByDisplayName || null,
           notes: notes || null,
-          image_url: imageUrl,
+          department,
+          image_url: firstImageUrl,
+          image_urls: imageUrls.length > 0 ? imageUrls : undefined,
+          inspection_report_urls: reportUrls.length > 0 ? reportUrls : undefined,
+          inspection_report_names: reportNames.length > 0 ? reportNames : undefined,
           updated_by: currentUserId,
         });
+        const created = Array.isArray(completionResponse) ? completionResponse[0] : completionResponse;
+        completionId = created?.id;
       } else {
-        await fastAPI.createEquipmentActivityCompletion(activityId, {
+        const completionResponse = await fastAPI.createEquipmentActivityCompletion(activityId, {
           completed_on: completedOn,
           completed_by_user_id: completedByUserId || null,
           completed_by_display_name: completedByDisplayName || null,
           notes: notes || null,
-          image_url: imageUrl,
+          department,
+          image_url: firstImageUrl,
+          image_urls: imageUrls.length > 0 ? imageUrls : undefined,
+          inspection_report_urls: reportUrls.length > 0 ? reportUrls : undefined,
+          inspection_report_names: reportNames.length > 0 ? reportNames : undefined,
           updated_by: currentUserId,
         });
+        const created = Array.isArray(completionResponse) ? completionResponse[0] : completionResponse;
+        completionId = created?.id;
+      }
+      // Log for Recent activity (QAP / Inspection report / Task completion)
+      const currentEquipment = localEquipment.find((eq: Equipment) => eq.id === equipmentId);
+      if (currentEquipment) {
+        try {
+          await logActivityCompleted(
+            projectId,
+            equipmentId,
+            currentEquipment.type || 'Equipment',
+            currentEquipment.tagNumber || 'Unknown',
+            activityName,
+            completedOn,
+            completedByDisplayName || null,
+            department,
+            currentUserFullName || null,
+            completionId,
+            notes || null,
+            reportUrls.length,
+            imageUrls.length
+          );
+          if (onActivityUpdate) onActivityUpdate();
+        } catch (logErr) {
+          console.warn('Activity completed log (non-fatal):', logErr);
+        }
       }
       // Step 4: Auto-feed Updates tab (regular_update) or Progress Image section (milestone)
       // Date in dd mm yyyy; "by X" on a new line
@@ -3214,7 +3973,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             equipment_id: equipmentId,
             entry_text: descText,
             entry_type: 'general',
-            image_url: imageUrl || undefined,
+            image_url: firstImageUrl || undefined,
             image_description: notes || undefined,
             created_by: currentUserId || undefined,
           };
@@ -3224,9 +3983,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             await fastAPI.createProgressEntry(entryData);
           }
         } else {
+          // Only add a progress image row when user actually uploaded an image; otherwise keep showing the previous latest image (no blank white)
+          if (firstImageUrl && imageUrls.length > 0) {
           const imageData = {
             equipment_id: equipmentId,
-            image_url: imageUrl || 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMSIgaGVpZ2h0PSIxIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjwvc3ZnPg==',
+              image_url: firstImageUrl,
             description: descText,
             uploaded_by: currentUserFullName || completedByDisplayName || currentUserId || undefined,
           };
@@ -3234,6 +3995,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             await fastAPI.createStandaloneProgressImage(imageData);
           } else {
             await fastAPI.createProgressImage(imageData);
+            }
           }
         }
       } catch (feedErr: any) {
@@ -3244,8 +4006,26 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         ? await fastAPI.getStandaloneEquipmentActivities(equipmentId)
         : await fastAPI.getEquipmentActivities(equipmentId);
       setEquipmentActivities(prev => ({ ...prev, [equipmentId]: refreshed }));
+      // Update equipment progress: fixed weight (if step has progress_weight) or manual %
+      const progressWeight = markCompleteModalData.progressWeight;
+      const newProgress = progressWeight != null
+        ? Math.min(100, (refreshed as any[]).filter((a: any) => a.completion && a.progress_weight != null).reduce((sum: number, a: any) => sum + (Number(a.progress_weight) || 0), 0))
+        : pct;
+      if (newProgress !== currentProgress) {
+        try {
+          if (isStandalone) {
+            await fastAPI.updateStandaloneEquipment(equipmentId, { progress: newProgress }, currentUserId);
+          } else {
+            await fastAPI.updateEquipment(equipmentId, { progress: newProgress }, currentUserId);
+          }
+          setLocalEquipment(prev => prev.map(eq => eq.id === equipmentId ? { ...eq, progress: newProgress } : eq));
+        } catch (progressErr: any) {
+          console.warn('Progress percentage update (non-fatal):', progressErr);
+          toast({ title: 'Note', description: 'Activity marked complete, but progress percentage could not be updated.', variant: 'destructive' });
+        }
+      }
       setMarkCompleteModalOpen(false);
-      setMarkCompleteModalData({ activityId: '', activityName: '', activityType: 'regular_update', equipmentId: '', completedOn: '', completedByUserId: '', completedByDisplayName: '', completedBySelectValue: '', notes: '', imageFile: null });
+      setMarkCompleteModalData({ activityId: '', activityName: '', activityType: 'regular_update', equipmentId: '', completedOn: '', completedByUserId: '', completedByDisplayName: '', completedBySelectValue: '', department: '', notes: '', imageFiles: [], reportFiles: [], percentageCompleted: 0, currentProgress: 0, progressWeight: null });
       // Immediate refresh so new progress image / progress entry shows in UI right away
       await refreshEquipmentData(true);
       toast({ title: 'Success', description: 'Activity marked complete.' });
@@ -4329,8 +5109,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
           // Get equipment info for logging
           const currentEquipment = localEquipment.find(eq => eq.id === equipmentId);
+          const docId = (uploadedDoc as any)?.id ?? (uploadedDoc as any)?.[0]?.id;
           if (currentEquipment) {
-            // Log document upload activity
+            // Log document upload activity (include document_id so activity detail can open this doc)
             try {
               await logDocumentUploaded(
                 projectId,
@@ -4338,7 +5119,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 currentEquipment.type || 'Equipment',
                 currentEquipment.tagNumber || 'Unknown',
                 documentData.equipmentType || 'Manual Upload',
-                documentData.name
+                documentData.name,
+                docId
               );
               // // console.log('✅ Activity logged: Document uploaded');
               
@@ -4514,8 +5296,15 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       });
       return;
     }
-    if (document.id && equipmentId) {
-      handleDocumentPreviewClick(document, equipmentId);
+    // Use same doc as document name column: if this doc has no id, resolve from list by name
+    let docToOpen = document;
+    if ((!document.id || !equipmentId) && equipmentId) {
+      const list = documents[equipmentId] || [];
+      const sameDoc = list.find((d: any) => (d.document_name || d.name || '') === (document.document_name || document.name || ''));
+      if (sameDoc) docToOpen = sameDoc;
+    }
+    if (docToOpen.id && equipmentId) {
+      handleDocumentPreviewClick(docToOpen, equipmentId);
       return;
     }
     toast({ title: 'Error', description: 'Document URL not found. Please contact support.', variant: 'destructive' });
@@ -5524,12 +6313,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // Team member management functions
   const handleCloseAddMember = () => {
     setShowAddMember(false);
-    setNewMember({ name: "", email: "", phone: "", position: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
+    setNewMember({ name: "", email: "", phone: "", position: "", department: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
     setSelectedExistingMemberEmail("");
     setIsExistingMemberMode(false);
+    setAddMemberNewDepartmentInput('');
   };
 
-  const handleExistingMemberSelect = (email: string) => {
+  const handleExistingMemberSelect = async (email: string) => {
     if (email === "" || email === "new") {
       setIsExistingMemberMode(false);
       setSelectedExistingMemberEmail("");
@@ -5538,6 +6328,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         email: "",
         phone: "",
         position: "",
+        department: "",
         role: "",
         permissions: [],
         equipmentAssignments: [],
@@ -5550,11 +6341,27 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         setIsExistingMemberMode(true);
         setSelectedExistingMemberEmail(email);
         const roleObj = roles.find(r => r.name === (member.role || member.access_level || 'viewer'));
+
+        // Try to prefill department from firm member, then project member record.
+        let prefillDepartment = (member.department || '').trim();
+        if (!prefillDepartment && projectId && projectId !== 'standalone') {
+          try {
+            const projectMembers = await fastAPI.getProjectMembers(projectId);
+            const projectMember = (Array.isArray(projectMembers) ? projectMembers : []).find(
+              (m: any) => (m.email || '').toLowerCase() === email.toLowerCase()
+            );
+            prefillDepartment = (projectMember?.department || '').trim();
+          } catch {
+            // Keep fallback empty if lookup fails.
+          }
+        }
+
         setNewMember({
           name: member.name || "",
           email: member.email || "",
           phone: member.phone || "",
           position: "",
+          department: prefillDepartment,
           role: mapRoleToDisplay(member.role || member.access_level || 'viewer'),
           permissions: roleObj ? roleObj.permissions : getPermissionsByRole(member.role || 'viewer'),
           equipmentAssignments: [viewingEquipmentId || ""].filter(Boolean),
@@ -5629,6 +6436,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           email: newMember.email,
           phone: newMember.phone || "",
           position: newMember.position,
+          department: (newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : null,
           role: actualUserRole, // Use actual role from user record
           status: "active",
           permissions: getPermissionsByRole(actualUserRole), // Get permissions based on actual role
@@ -5655,6 +6463,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           person_name: newMember.name,
           email: (newMember.email || '').trim().toLowerCase(), // 🔧 FIX: Normalize email when storing
           phone: newMember.phone || "",
+          department: (newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : null,
             role: dbStoredRole, // Store as editor/viewer for DB, but actual role is in user record
           assigned_by: user?.id || null // 🔧 FIX: Add assigned_by for RLS policy compliance
         };
@@ -5762,7 +6571,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           onActivityUpdate();
         }
         
-        setNewMember({ name: "", email: "", phone: "", position: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
+        setNewMember({ name: "", email: "", phone: "", position: "", department: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
         setShowAddMember(false);
         setSelectedExistingMemberEmail("");
         setIsExistingMemberMode(false);
@@ -5802,6 +6611,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       email: member.email || "",
       phone: member.phone || "",
       position: member.position || "",
+      department: member.department || "",
       role: displayRole,
       permissions: member.permissions || [],
       equipmentAssignments: member.equipmentAssignments || member.equipment_assignments || [viewingEquipmentId || ""].filter(Boolean),
@@ -5859,6 +6669,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           person_name: newMember.name,
           email: newMember.email,
           phone: newMember.phone || "",
+          department: (newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : null,
           role: equipmentRole,
           updated_at: new Date().toISOString()
         };
@@ -5875,6 +6686,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           email: newMember.email,
           phone: newMember.phone || "",
           position: newMember.position || "",
+          department: (newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : null,
           role: dbRole,
           permissions: role ? role.permissions : selectedMember.permissions,
           equipment_assignments: newMember.equipmentAssignments || [viewingEquipmentId].filter(Boolean),
@@ -5895,7 +6707,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // console.log('🔄 Closing edit modal and resetting form...');
         setShowEditMember(false);
         setSelectedMember(null);
-        setNewMember({ name: "", email: "", phone: "", position: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
+        setNewMember({ name: "", email: "", phone: "", position: "", department: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
         
       // console.log('✅ Showing success toast');
         toast({ title: 'Success', description: 'Team member updated successfully!' });
@@ -6474,9 +7286,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                           {/* Unpriced PO File - list each doc separately */}
                           <div className="p-3 sm:p-4 rounded-lg border border-emerald-200 bg-emerald-25">
                             <h5 className="font-medium text-gray-800 text-sm sm:text-base mb-2">Unpriced PO File</h5>
-                            {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Unpriced PO File') || []).length > 0 ? (
+                            {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Unpriced PO File') || []).length > 0 ? (
                               <div className="space-y-2">
-                                {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Unpriced PO File') || []).map((doc: any, index: number) => (
+                                {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Unpriced PO File') || []).map((doc: any, index: number) => (
                                   <div key={doc.id || `unpriced-${index}`} className="flex items-center justify-between p-2 bg-white rounded border border-emerald-100 gap-2">
                                     <span className="text-emerald-700 truncate flex-1 min-w-0 text-xs sm:text-sm">{doc.document_name || doc.name}</span>
                                     <div className="flex items-center gap-1 flex-shrink-0">
@@ -6507,9 +7319,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                           {/* Design Inputs PID - list each doc separately */}
                           <div className="p-3 sm:p-4 rounded-lg border border-emerald-200 bg-emerald-25">
                             <h5 className="font-medium text-gray-800 text-sm sm:text-base mb-2">Design Inputs PID</h5>
-                            {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Design Inputs PID') || []).length > 0 ? (
+                            {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Design Inputs PID') || []).length > 0 ? (
                               <div className="space-y-2">
-                                {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Design Inputs PID') || []).map((doc: any, index: number) => (
+                                {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Design Inputs PID') || []).map((doc: any, index: number) => (
                                   <div key={doc.id || `design-${index}`} className="flex items-center justify-between p-2 bg-white rounded border border-emerald-100 gap-2">
                                     <span className="text-emerald-700 truncate flex-1 min-w-0 text-xs sm:text-sm">{doc.document_name || doc.name}</span>
                                     <div className="flex items-center gap-1 flex-shrink-0">
@@ -6545,9 +7357,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                           {/* Client Reference Doc - list each doc separately */}
                           <div className="p-3 sm:p-4 rounded-lg border border-emerald-200 bg-emerald-25">
                             <h5 className="font-medium text-gray-800 text-sm sm:text-base mb-2">Client Reference Doc</h5>
-                            {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Client Reference Doc') || []).length > 0 ? (
+                            {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Client Reference Doc') || []).length > 0 ? (
                               <div className="space-y-2">
-                                {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Client Reference Doc') || []).map((doc: any, index: number) => (
+                                {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Client Reference Doc') || []).map((doc: any, index: number) => (
                                   <div key={doc.id || `client-${index}`} className="flex items-center justify-between p-2 bg-white rounded border border-emerald-100 gap-2">
                                     <span className="text-emerald-700 truncate flex-1 min-w-0 text-xs sm:text-sm">{doc.document_name || doc.name}</span>
                                     <div className="flex items-center gap-1 flex-shrink-0">
@@ -6578,9 +7390,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                           {/* Other Documents - list each doc separately */}
                           <div className="p-3 sm:p-4 rounded-lg border border-emerald-200 bg-emerald-25">
                             <h5 className="font-medium text-gray-800 text-sm sm:text-base mb-2">Other Documents</h5>
-                            {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Other Documents') || []).length > 0 ? (
+                            {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Other Documents') || []).length > 0 ? (
                               <div className="space-y-2">
-                                {(documents[viewingEquipmentId]?.filter((doc: any) => doc.document_type === 'Other Documents') || []).map((doc: any, index: number) => (
+                                {(filterDocsByUserDepartmentAccess(documents[viewingEquipmentId] || []).filter((doc: any) => doc.document_type === 'Other Documents') || []).map((doc: any, index: number) => (
                                   <div key={doc.id || `other-${index}`} className="flex items-center justify-between p-2 bg-white rounded border border-emerald-100 gap-2">
                                     <span className="text-emerald-700 truncate flex-1 min-w-0 text-xs sm:text-sm">{doc.document_name || doc.name}</span>
                                     <div className="flex items-center gap-1 flex-shrink-0">
@@ -7449,6 +8261,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                               </span>
                             </div>
 
+                            {/* Department Badge */}
+                            <div className="mt-3 pt-3 border-t border-gray-200">
+                              <h5 className="text-sm font-medium text-gray-700 mb-2">Department:</h5>
+                              <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800 border border-purple-200">
+                                {member.department || 'No Department'}
+                              </span>
+                            </div>
+
                             {/* Permissions Display */}
                             <div className="mt-4 pt-4 border-t border-gray-200">
                               <h5 className="text-sm font-medium text-gray-700 mb-2">Permissions:</h5>
@@ -7643,6 +8463,73 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         />
                       </div>
                     </div>
+                    <div>
+                      <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Department (optional)</label>
+                      <p className="text-[10px] sm:text-xs text-gray-500 mt-0.5 mb-2">From Documentation tab or add new.</p>
+                      <Select
+                        value={newMember.department || '__none__'}
+                        onValueChange={(value) => {
+                          if (value === '__add_new__') {
+                            setNewMember(prev => ({ ...prev, department: '__add_new__' }));
+                            return;
+                          }
+                          setNewMember(prev => ({ ...prev, department: value === '__none__' ? '' : value }));
+                        }}
+                        disabled={isExistingMemberMode}
+                      >
+                        <SelectTrigger className={`w-full h-auto px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 ${
+                          isExistingMemberMode
+                            ? 'bg-gray-100 cursor-not-allowed text-gray-600'
+                            : 'bg-gray-50 hover:bg-white'
+                        }`}>
+                          <SelectValue placeholder="Select department..." />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">No department</SelectItem>
+                          {addMemberAvailableDepartments.map((d) => (
+                            <SelectItem key={d} value={d}>{d}</SelectItem>
+                          ))}
+                          <SelectItem value="__add_new__">+ Add new department...</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {(newMember.department === '__add_new__' || (newMember.department && !addMemberAvailableDepartments.includes(newMember.department))) && !isExistingMemberMode && (
+                        <div className="mt-2 flex gap-2">
+                          <Input
+                            value={addMemberNewDepartmentInput}
+                            onChange={e => setAddMemberNewDepartmentInput(e.target.value)}
+                            placeholder="New department name"
+                            className="h-9"
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                const v = addMemberNewDepartmentInput.trim();
+                                if (v) {
+                                  setAddMemberAvailableDepartments(prev => [...prev, v].sort());
+                                  setNewMember(prev => ({ ...prev, department: v }));
+                                  setAddMemberNewDepartmentInput('');
+                                }
+                              }
+                            }}
+                          />
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-9"
+                            onClick={() => {
+                              const v = addMemberNewDepartmentInput.trim();
+                              if (v) {
+                                setAddMemberAvailableDepartments(prev => [...prev, v].sort());
+                                setNewMember(prev => ({ ...prev, department: v }));
+                                setAddMemberNewDepartmentInput('');
+                              }
+                            }}
+                          >
+                            Add
+                          </Button>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {/* Role & Access Section */}
@@ -7773,7 +8660,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       onClick={() => {
                         setShowEditMember(false);
                         setSelectedMember(null);
-                        setNewMember({ name: "", email: "", phone: "", position: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
+                        setNewMember({ name: "", email: "", phone: "", position: "", department: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
                       }}
                       className="text-gray-400 hover:text-gray-600 transition-colors p-1 rounded-full hover:bg-gray-100 flex-shrink-0"
                     >
@@ -7846,6 +8733,30 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         />
                       </div>
                     </div>
+
+                    <div>
+                      <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Department (optional)</label>
+                      <p className="text-[10px] sm:text-xs text-gray-500 mt-0.5 mb-2">From Documentation tab or add new.</p>
+                      <Select
+                        value={newMember.department || '__none__'}
+                        onValueChange={() => {}}
+                        disabled
+                      >
+                        <SelectTrigger className="w-full h-auto px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm border border-gray-200 rounded-lg bg-gray-100 text-gray-600 cursor-not-allowed">
+                          <SelectValue placeholder="Select department..." />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">No department</SelectItem>
+                          {newMember.department &&
+                            !addMemberAvailableDepartments.includes(newMember.department) && (
+                              <SelectItem value={newMember.department}>{newMember.department}</SelectItem>
+                            )}
+                          {addMemberAvailableDepartments.map((d) => (
+                            <SelectItem key={d} value={d}>{d}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
                   </div>
 
                   {/* Role & Access Section - DISABLED */}
@@ -7887,7 +8798,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       onClick={() => {
                         setShowEditMember(false);
                         setSelectedMember(null);
-                        setNewMember({ name: "", email: "", phone: "", position: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
+                        setNewMember({ name: "", email: "", phone: "", position: "", department: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
                       }}
                       className="flex-1 px-4 sm:px-6 py-2.5 sm:py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 hover:border-gray-400 transition-all duration-200 text-sm sm:text-base font-medium"
                     >
@@ -8096,7 +9007,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
       {/* Mark activity complete modal - details view */}
       {markCompleteModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100] p-4" onClick={() => setMarkCompleteModalOpen(false)}>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[110] p-4" onClick={() => setMarkCompleteModalOpen(false)}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto p-4" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold text-gray-900">Mark activity complete</h3>
@@ -8119,6 +9030,56 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   onChange={e => setMarkCompleteModalData(prev => ({ ...prev, completedOn: e.target.value }))}
                   className="mt-1 text-sm h-9"
                 />
+              </div>
+              {/* Percentage completed: fixed weight (from QAP) or manual slider */}
+              <div className="rounded-lg border border-emerald-200 bg-gradient-to-br from-emerald-50/80 to-teal-50/60 p-3 space-y-2">
+                {markCompleteModalData.progressWeight != null ? (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <Label className="text-xs font-medium text-gray-800 flex items-center gap-1.5">
+                        <TrendingUp className="w-4 h-4 text-emerald-600" />
+                        Progress (fixed from QAP)
+                      </Label>
+                      <span className="text-sm font-bold text-emerald-700 tabular-nums">{markCompleteModalData.percentageCompleted}%</span>
+                    </div>
+                    <p className="text-[11px] text-gray-500">This step adds {markCompleteModalData.progressWeight}% (defined in QAP). Total progress will be {markCompleteModalData.percentageCompleted}%.</p>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <Label className="text-xs font-medium text-gray-800 flex items-center gap-1.5">
+                        <TrendingUp className="w-4 h-4 text-emerald-600" />
+                        Percentage completed
+                      </Label>
+                      <span className="text-sm font-bold text-emerald-700 tabular-nums">{markCompleteModalData.percentageCompleted}%</span>
+                    </div>
+                    <p className="text-[11px] text-gray-500">Progress can only move forward (min {markCompleteModalData.currentProgress}%)</p>
+                    <div className="flex w-full items-center py-2" style={{ minHeight: 28 }}>
+                      {markCompleteModalData.currentProgress > 0 && (
+                        <div
+                          className={`h-2 flex-shrink-0 bg-emerald-500 transition-[width] duration-200 ${markCompleteModalData.currentProgress >= 100 ? 'rounded-full' : 'rounded-l-full rounded-r-none'}`}
+                          style={{ width: `${markCompleteModalData.currentProgress}%` }}
+                        />
+                      )}
+                      {markCompleteModalData.currentProgress < 100 && renderPercentageRemainingSlider()}
+                      {markCompleteModalData.currentProgress === 100 && (
+                        <div className="h-2 flex-1 rounded-r-full bg-emerald-500" />
+                      )}
+                    </div>
+                    <div className="grid grid-cols-10 gap-1 pt-0.5 min-w-0">
+                      {[10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map((n) => (
+                        <button
+                          key={n}
+                          type="button"
+                          onClick={() => setMarkCompleteModalData(prev => ({ ...prev, percentageCompleted: Math.max(n, prev.currentProgress) }))}
+                          className={`min-w-0 px-1 py-0.5 rounded text-[10px] font-medium transition-all ${markCompleteModalData.percentageCompleted >= n ? 'bg-emerald-600 text-white shadow-sm' : 'bg-white border border-emerald-200 text-emerald-700 hover:bg-emerald-100'}`}
+                        >
+                          {n}%
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
               </div>
               <div>
                 <Label className="text-xs text-gray-700">Completed by (team)</Label>
@@ -8147,6 +9108,43 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 </Select>
               </div>
               <div>
+                <Label className="text-xs text-gray-700">Department (optional)</Label>
+                <p className="text-[11px] text-gray-500 mt-0.5 mb-1">From Documentation tab or add new. Used for inspection reports by department.</p>
+                <Select
+                  value={markCompleteModalData.department || '__none__'}
+                  onValueChange={value => {
+                    if (value === '__add_new__') {
+                      setMarkCompleteModalData(prev => ({ ...prev, department: '__add_new__' }));
+                      return;
+                    }
+                    setMarkCompleteModalData(prev => ({ ...prev, department: value === '__none__' ? '' : value }));
+                  }}
+                >
+                  <SelectTrigger className="mt-1 text-sm h-9">
+                    <SelectValue placeholder="Select department..." />
+                  </SelectTrigger>
+                  <SelectContent className="z-[200]">
+                    <SelectItem value="__none__">— None —</SelectItem>
+                    {markCompleteAvailableDepartments.map((d) => (
+                      <SelectItem key={d} value={d}>{d}</SelectItem>
+                    ))}
+                    <SelectItem value="__add_new__">+ Add new department...</SelectItem>
+                  </SelectContent>
+                </Select>
+                {(markCompleteModalData.department === '__add_new__' || (markCompleteModalData.department && !markCompleteAvailableDepartments.includes(markCompleteModalData.department))) && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <Input
+                      value={markCompleteNewDepartmentInput}
+                      onChange={e => setMarkCompleteNewDepartmentInput(e.target.value)}
+                      placeholder="New department name"
+                      className="text-sm h-9"
+                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); const v = markCompleteNewDepartmentInput.trim(); if (v) { setMarkCompleteAvailableDepartments(prev => [...prev, v].sort()); setMarkCompleteModalData(prev => ({ ...prev, department: v })); setMarkCompleteNewDepartmentInput(''); } } }}
+                    />
+                    <Button type="button" size="sm" variant="outline" className="h-9" onClick={() => { const v = markCompleteNewDepartmentInput.trim(); if (v) { setMarkCompleteAvailableDepartments(prev => [...prev, v].sort()); setMarkCompleteModalData(prev => ({ ...prev, department: v })); setMarkCompleteNewDepartmentInput(''); } }}>Add</Button>
+                  </div>
+                )}
+              </div>
+              <div>
                 <Label className="text-xs text-gray-700">Notes (optional)</Label>
                 <Textarea
                   value={markCompleteModalData.notes}
@@ -8156,7 +9154,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 />
               </div>
               <div>
-                <Label className="text-xs text-gray-700">Upload image (optional)</Label>
+                <Label className="text-xs text-gray-700">Upload image(s) (optional)</Label>
                 <div className="flex flex-row items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
                   <input
                     ref={markCompleteCameraInputRef}
@@ -8164,7 +9162,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     accept="image/*"
                     capture="environment"
                     onChange={e => {
-                      setMarkCompleteModalData(prev => ({ ...prev, imageFile: e.target.files?.[0] || null }));
+                      const f = e.target.files?.[0];
+                      if (f) setMarkCompleteModalData(prev => ({ ...prev, imageFiles: [...prev.imageFiles, f] }));
                       e.target.value = '';
                     }}
                     className="hidden"
@@ -8174,8 +9173,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     ref={markCompleteGalleryInputRef}
                     type="file"
                     accept="image/*"
+                    multiple
                     onChange={e => {
-                      setMarkCompleteModalData(prev => ({ ...prev, imageFile: e.target.files?.[0] || null }));
+                      const files = e.target.files ? Array.from(e.target.files) : [];
+                      if (files.length) setMarkCompleteModalData(prev => ({ ...prev, imageFiles: [...prev.imageFiles, ...files] }));
                       e.target.value = '';
                     }}
                     className="hidden"
@@ -8195,10 +9196,38 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     onClick={e => e.stopPropagation()}
                   >
                     <Upload className="w-4 h-4" />
-                    Choose file
+                    Choose file(s)
                   </label>
                   <span className="text-sm text-gray-500">
-                    {markCompleteModalData.imageFile ? markCompleteModalData.imageFile.name : 'No file chosen'}
+                    {markCompleteModalData.imageFiles?.length ? `${markCompleteModalData.imageFiles.length} file(s) chosen` : 'No file chosen'}
+                  </span>
+                </div>
+              </div>
+              <div>
+                <Label className="text-xs text-gray-700">Upload inspection reports (if applicable)</Label>
+                <div className="flex flex-row items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+                  <input
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    multiple
+                    onChange={e => {
+                      const files = e.target.files ? Array.from(e.target.files) : [];
+                      if (files.length) setMarkCompleteModalData(prev => ({ ...prev, reportFiles: [...(prev.reportFiles ?? []), ...files] }));
+                      e.target.value = '';
+                    }}
+                    className="hidden"
+                    id="mark-complete-reports-details"
+                  />
+                  <label
+                    htmlFor="mark-complete-reports-details"
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <FileText className="w-4 h-4" />
+                    Choose PDF(s)
+                  </label>
+                  <span className="text-sm text-gray-500">
+                    {markCompleteModalData.reportFiles?.length ? `${markCompleteModalData.reportFiles.length} report(s)` : ''}
                   </span>
                 </div>
               </div>
@@ -8226,14 +9255,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         const startDate = (editModalEquipment as any)?.commencementDate ?? (editModalEquipment as any)?.commencement_date;
         const startDateLabel = startDate ? new Date(startDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null;
         return (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100] p-4" onClick={() => setEditActivitiesModalOpen(false)}>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[110] p-4" onClick={() => setEditActivitiesModalOpen(false)}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="p-4 border-b space-y-1">
               <div className="flex items-center justify-between">
                 <h3 className="text-lg font-semibold text-gray-900">Edit activity list</h3>
                 <button type="button" onClick={() => setEditActivitiesModalOpen(false)} className="text-gray-400 hover:text-gray-600 p-1 rounded-full hover:bg-gray-100"><X className="w-5 h-5" /></button>
               </div>
-              <p className="text-sm text-gray-500">Marked start date: {startDateLabel ?? 'Not set'}</p>
+              <p className="text-sm text-gray-500">Marked start date: {startDateLabel ?? 'Not set'}. Tick &quot;Inspection/TPI&quot; if this step involves inspection or third party.</p>
             </div>
             <div className="p-4 overflow-y-auto flex-1 space-y-2">
               {editActivitiesDraft.map((row, idx) => (
@@ -8243,11 +9272,15 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   <Select value={row.activity_type} onValueChange={v => setEditActivitiesDraft(prev => prev.map((r, i) => i === idx ? { ...r, activity_type: v as 'regular_update' | 'milestone' } : r))}>
                     <SelectTrigger className="w-[120px] h-8 text-xs"><SelectValue /></SelectTrigger>
                     <SelectContent className="z-[200]">
-                      <SelectItem value="regular_update">Process Update</SelectItem>
-                      <SelectItem value="milestone">Milestone</SelectItem>
+                      <SelectItem value="regular_update">Minor</SelectItem>
+                      <SelectItem value="milestone">Major</SelectItem>
                     </SelectContent>
                   </Select>
                   <Input className="w-24 h-8 text-xs" placeholder="e.g. 1st week" value={row.target_relative} onChange={e => setEditActivitiesDraft(prev => prev.map((r, i) => i === idx ? { ...r, target_relative: e.target.value } : r))} />
+                  <label className="flex items-center gap-1.5 shrink-0 text-xs text-gray-600 whitespace-nowrap">
+                    <input type="checkbox" checked={row.inspection_tpi_involved ?? false} onChange={e => setEditActivitiesDraft(prev => prev.map((r, i) => i === idx ? { ...r, inspection_tpi_involved: e.target.checked } : r))} className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 h-3.5 w-3.5" />
+                    Inspection/TPI
+                  </label>
                   <div className="flex items-center gap-0.5">
                     <Button type="button" size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={idx === 0} onClick={() => setEditActivitiesDraft(prev => { const a = [...prev]; [a[idx - 1], a[idx]] = [a[idx], a[idx - 1]]; return a.map((r, i) => ({ ...r, sort_order: i })); })}><ChevronUp className="w-4 h-4" /></Button>
                     <Button type="button" size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={idx === editActivitiesDraft.length - 1} onClick={() => setEditActivitiesDraft(prev => { const a = [...prev]; [a[idx], a[idx + 1]] = [a[idx + 1], a[idx]]; return a.map((r, i) => ({ ...r, sort_order: i })); })}><ChevronDown className="w-4 h-4" /></Button>
@@ -8257,7 +9290,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ))}
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 p-4 border-t">
-              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length }])}>
+              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length, inspection_tpi_involved: false }])}>
                 <Plus size={14} className="mr-1" />
                 Add activity
               </Button>
@@ -8299,7 +9332,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           return { text: `${v} days delay`, className: 'text-amber-600' };
         };
         return (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4" onClick={() => { setActivitiesHistoryOpen(false); setActivitiesHistoryEquipmentId(null); }}>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[110] p-4" onClick={() => { setActivitiesHistoryOpen(false); setActivitiesHistoryEquipmentId(null); }}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b">
               <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
@@ -8637,7 +9670,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 onClick={() => {
                   const displayOrder = (equipmentOrderIds && equipmentOrderIds.length > 0)
                     ? equipmentOrderIds.filter(id => localEquipment.some(e => e.id === id))
-                    : localEquipment.map(e => e.id);
+                    : getCreatedOrderIds(localEquipment);
                   const allIds = localEquipment.map(e => e.id);
                   const inDisplay = new Set(displayOrder);
                   const appended = allIds.filter(id => !inDisplay.has(id));
@@ -8725,9 +9758,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         </div>
       ) : (
         <>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="px-2 sm:px-4 lg:px-6 max-w-[1600px] mx-auto">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-10 text-[0.97rem]">
             {(() => {
               // Filter and sort equipment (same logic as before)
+              const fallbackOrderIds = getCreatedOrderIds(localEquipment);
               const filteredAndSorted = localEquipment
             .filter(eq => {
               // Phase filter
@@ -8762,10 +9797,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 if (orderA !== orderB) return orderA - orderB;
                 return a.id.localeCompare(b.id);
               }
-              const createdA = (a as { created_at?: string }).created_at ? new Date((a as { created_at?: string }).created_at).getTime() : 0;
-              const createdB = (b as { created_at?: string }).created_at ? new Date((b as { created_at?: string }).created_at).getTime() : 0;
-              if (createdA !== createdB) return createdA - createdB;
-              return a.id.localeCompare(b.id);
+              return fallbackOrderIds.indexOf(a.id) - fallbackOrderIds.indexOf(b.id);
                 });
               
               // Pagination: Calculate total pages and slice data
@@ -8782,412 +9814,142 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               return paginatedEquipment.map((item) => (
               <Card key={item.id} id={`equipment-card-${item.id}`} className="overflow-hidden hover:shadow-lg transition-shadow relative bg-gray-50 border border-gray-200 h-auto sm:min-h-[420px] flex flex-col">
                 <div className="p-3 sm:p-4 flex-1 flex flex-col">
-                  {/* PO-CDD Timer Section */}
-                  <div className="mb-3 sm:mb-4 p-2 sm:p-2.5 bg-gray-50 border border-gray-200 rounded-md">
-                    {editingEquipmentId === item.id ? (
-                      // Edit Mode
-                      <div className="space-y-3">
-                        <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 bg-gray-400 rounded-full"></div>
-                          <span className="text-xs font-medium text-gray-600">PO-CDD</span>
-                        </div>
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <Label className="text-xs text-gray-600">PO-CDD Date</Label>
-                            <Input
-                              type="date"
-                              value={editFormData.poCdd || item.poCdd}
-                              onChange={(e) => setEditFormData({ ...editFormData, poCdd: e.target.value })}
-                              className="text-xs h-8"
-                            />
-                          </div>
-                          <div>
-                            <Label className="text-xs text-gray-600">Any Personal Title</Label>
-                            {!showNewCertificationInput[item.id] ? (
-                              <Select
-                                value={editFormData.certificationTitle || undefined}
-                                onValueChange={(value) => {
-                                  if (value === '+new') {
-                                    setShowNewCertificationInput(prev => ({ ...prev, [item.id]: true }));
-                                    setNewCertificationTitle('');
-                                  } else {
-                                    setEditFormData({ ...editFormData, certificationTitle: value || undefined });
-                                  }
-                                }}
-                              >
-                                <SelectTrigger className="text-xs h-8">
-                                  <SelectValue placeholder="Select Any Personal Title" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  {allCertificationTitles.length > 0 && (
-                                    allCertificationTitles.map((title) => (
-                                      <SelectItem key={title} value={title}>
-                                        {title}
-                                      </SelectItem>
-                                    ))
-                                  )}
-                                  <SelectItem value="+new" className="text-blue-600 font-medium">
-                                    <Plus className="w-3 h-3 inline mr-1" />
-                                    New
-                                  </SelectItem>
-                                  {editFormData.certificationTitle && !allCertificationTitles.includes(editFormData.certificationTitle) && (
-                                    <SelectItem value={editFormData.certificationTitle}>
-                                      {editFormData.certificationTitle}
-                                    </SelectItem>
-                                  )}
-                                </SelectContent>
-                              </Select>
-                            ) : (
-                              <div className="flex gap-1">
-                                <Input
-                                  placeholder="Enter Any Personal Title"
-                                  value={newCertificationTitle}
-                                  onChange={(e) => setNewCertificationTitle(e.target.value)}
-                                  className="text-xs h-8 flex-1"
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter' && newCertificationTitle.trim()) {
-                                      const title = newCertificationTitle.trim();
-                                      setEditFormData({ ...editFormData, certificationTitle: title });
-                                      if (!allCertificationTitles.includes(title)) {
-                                        setAllCertificationTitles(prev => [...prev, title].sort());
-                                      }
-                                      setShowNewCertificationInput(prev => ({ ...prev, [item.id]: false }));
-                                      setNewCertificationTitle('');
-                                    } else if (e.key === 'Escape') {
-                                      setShowNewCertificationInput(prev => ({ ...prev, [item.id]: false }));
-                                      setNewCertificationTitle('');
-                                    }
-                                  }}
-                                  autoFocus
-                                />
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  className="h-8 px-2"
-                                  onClick={() => {
-                                    if (newCertificationTitle.trim()) {
-                                      const title = newCertificationTitle.trim();
-                                      setEditFormData({ ...editFormData, certificationTitle: title });
-                                      if (!allCertificationTitles.includes(title)) {
-                                        setAllCertificationTitles(prev => [...prev, title].sort());
-                                      }
-                                    }
-                                    setShowNewCertificationInput(prev => ({ ...prev, [item.id]: false }));
-                                    setNewCertificationTitle('');
-                                  }}
-                                >
-                                  <Check className="w-3 h-3" />
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  className="h-8 px-2"
-                                  onClick={() => {
-                                    setShowNewCertificationInput(prev => ({ ...prev, [item.id]: false }));
-                                    setNewCertificationTitle('');
-                                  }}
-                                >
-                                  <X className="w-3 h-3" />
-                                </Button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      // View Mode
-                      <div className="space-y-1.5 min-w-0">
-                        {/* PO Number and Days Counter - Same Row */}
-                        <div className="flex items-center justify-between gap-2 flex-nowrap min-w-0">
-                          {/* PO Number */}
-                          {(() => {
-                            // For project equipment, use project's PO Number instead of equipment's PO-CDD
-                            let poNumber = item.poNumber || (item as any).po_number || (item.custom_fields?.find((f: any) => f.name === 'PO Number')?.value);
-                            
-                            // If no PO Number found and this is project equipment (not standalone), use project's PO Number
-                            if (!poNumber && projectId !== 'standalone' && currentProject?.po_number) {
-                              poNumber = currentProject.po_number;
-                            }
-                            
-                            // Only fall back to PO-CDD if still no PO Number found
-                            if (!poNumber) {
-                              poNumber = item.poCdd;
-                            }
-                            
-                            return poNumber ? (
-                          <div className="flex items-center gap-2 min-w-0 flex-shrink">
-                                <div className="w-2 h-2 bg-blue-500 rounded-full flex-shrink-0"></div>
-                                <span className="text-[11px] sm:text-xs font-medium text-gray-600 whitespace-nowrap">PO Number:</span>
-                            <div className="text-[11px] sm:text-xs font-medium text-gray-800 truncate min-w-0 md:overflow-visible md:whitespace-normal">
-                                  {poNumber}
-                            </div>
-                          </div>
-                            ) : null;
-                          })()}
-                          {/* Days Counter / Dispatched Date - Aligned with PO Number */}
-                          <div className="flex items-center flex-shrink-0">
-                          {(() => {
-                            if (item.progressPhase === 'dispatched') {
-                              return (
-                                <div className="text-left whitespace-nowrap">
-                                  <div className="text-[11px] sm:text-xs text-gray-500 font-medium">Dispatched on</div>
-                                    <div className="text-xs sm:text-sm font-bold text-green-700 truncate">
+                  {/* Progress Image Section (hidden in edit mode; view-only here) */}
+                  <div className="mb-4">
+                    {editingEquipmentId !== item.id && (
+                      // View Mode - Status card + progress image in one continuous container
+                      <div className="rounded-lg overflow-hidden">
+                        {/* Current manufacturing stage – from activities (current & date) */}
+                        {(() => {
+                          const list = equipmentActivities[item.id] || [];
+                          const { completed: completedSeg, current } = getActivitiesProgressSegments(list);
+                          const lastCompleted = completedSeg[0];
+                          const sortedByOrder = list.length ? [...list].sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0)) : [];
+                          const lastActivity = sortedByOrder.length ? sortedByOrder[sortedByOrder.length - 1] : null;
+                          const qapDeadlineRaw = lastActivity?.target_date || null;
+                          const qapDeadlineDate = qapDeadlineRaw ? (() => { try { const d = new Date(qapDeadlineRaw); return isNaN(d.getTime()) ? null : d; } catch { return null; } })() : null;
+                          const stageLabel = current
+                            ? current.activity_name
+                            : (lastCompleted ? lastCompleted.activity_name : null);
+                          const stageDate = current
+                            ? (current.target_date ? formatDateOnly(current.target_date) : (current.target_relative || null))
+                            : (lastCompleted?.completion?.completed_on ? formatDateOnly(lastCompleted.completion.completed_on) : null);
+                          const isComplete = !!lastCompleted;
+                          const daysVariance = lastCompleted?.completion?.completed_on && lastCompleted?.target_date
+                            ? (() => {
+                                try {
+                                  const completed = new Date(lastCompleted.completion.completed_on).getTime();
+                                  const target = new Date(lastCompleted.target_date).getTime();
+                                  if (isNaN(completed) || isNaN(target)) return null;
+                                  return Math.round((completed - target) / (24 * 60 * 60 * 1000));
+                                } catch { return null; }
+                              })()
+                            : null;
+                          const hasNoActivities = !stageLabel && !list.length;
+                          // Only show progress % when user has at least one QAP completion; otherwise DB/seed values (e.g. 22%) show as "random"
+                          const hasAnyCompletion = list.some((a: any) => a.completion);
+                          const displayProgress = hasAnyCompletion
+                            ? (typeof item.progress === 'number' ? Math.min(100, Math.max(0, item.progress)) : 0)
+                            : 0;
+                            return (
+                            <div className="rounded-t-lg bg-indigo-50 border border-indigo-100 border-b-0 px-3 py-2 sm:px-4 sm:py-2.5">
+                              <div className="group flex flex-col gap-0.5 -mx-1 px-2 py-1 rounded mb-2 sm:-mx-2 sm:px-3 bg-blue-600 min-w-0">
+                                {/* Row 1: title | days to go */}
+                                <div className="flex items-center justify-between gap-2 min-w-0">
+                                  <div className="text-xs sm:text-sm font-semibold text-white truncate min-w-0">{item.manufacturingSerial || item.name || (item.type === 'Distillation Column' ? 'Column' : item.type)}</div>
+                                  {item.progressPhase === 'dispatched' ? (
+                                    <div className="text-xs sm:text-sm font-bold text-white truncate flex-shrink-0">
                                       {(() => {
-                                        // Priority: completionDate (dispatch date) > updated_at > today's date
                                         let dispatchDate: Date | null = null;
-                                        
-                                        // First, try completionDate (set when dispatched)
                                         if (item.completionDate && item.completionDate !== 'No deadline set' && item.completionDate !== 'Not specified') {
-                                          try {
-                                            const date = new Date(item.completionDate);
-                                            if (!isNaN(date.getTime())) {
-                                              dispatchDate = date;
-                                            }
-                                          } catch (e) {
-                                            // Continue to next option
-                                          }
+                                          try { const d = new Date(item.completionDate); if (!isNaN(d.getTime())) dispatchDate = d; } catch { }
                                         }
-                                        
-                                        // Fallback to updated_at if completionDate not available
                                         if (!dispatchDate && item.updated_at) {
-                                          try {
-                                            const date = new Date(item.updated_at);
-                                            if (!isNaN(date.getTime())) {
-                                              dispatchDate = date;
-                                            }
-                                          } catch (e) {
-                                            // Continue to next option
-                                          }
+                                          try { const d = new Date(item.updated_at); if (!isNaN(d.getTime())) dispatchDate = d; } catch { }
                                         }
-                                        
-                                        // If still no date, use today (shouldn't happen, but safety fallback)
-                                        if (!dispatchDate) {
-                                          dispatchDate = new Date();
+                                        if (!dispatchDate) dispatchDate = new Date();
+                                        return dispatchDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                                      })()}
+                                      </div>
+                                  ) : qapDeadlineDate ? (
+                                    (() => {
+                                      try {
+                                        const daysDiff = Math.ceil((qapDeadlineDate.getTime() - new Date().getTime()) / (1000 * 3600 * 24));
+                                        if (daysDiff < 0) return <div className="text-xs sm:text-sm font-bold text-white flex-shrink-0">{Math.abs(daysDiff)} days overdue</div>;
+                                        return <div className="text-xs sm:text-sm font-bold text-white flex-shrink-0">{daysDiff} days to go</div>;
+                                      } catch { return <div className="text-xs sm:text-sm font-bold text-white/90 flex-shrink-0">No deadline set</div>; }
+                                    })()
+                                  ) : (
+                                    <div className="text-xs sm:text-sm font-bold text-white/90 flex-shrink-0">No deadline set</div>
+                                              )}
+                                            </div>
+                                {/* Row 2: On track / Tag·Job (hover) | date — aligned */}
+                                <div className="flex items-baseline justify-between gap-2 min-w-0">
+                                  <div className="relative min-h-[14px] flex items-baseline min-w-0">
+                                    <div className="text-[9px] sm:text-[10px] text-white/90 truncate transition-opacity duration-150 group-hover:opacity-0">
+                                      {(() => {
+                                        if (hasNoActivities) return 'Yet to begin';
+                                        if (item.progressPhase === 'dispatched') return 'On track';
+
+                                        // Interpret status ONLY from the latest completed QAP step:
+                                        // variance = completed_on - target_date (in days).
+                                        // If > 4 days late, show as delayed; otherwise on track.
+                                        if (isComplete && daysVariance !== null) {
+                                          if (daysVariance > 4) return `Late by ${daysVariance} days`;
+                                          return 'On track';
                                         }
-                                        
-                                        return dispatchDate.toLocaleDateString('en-US', { 
-                                          month: 'short', 
-                                          day: 'numeric', 
-                                          year: 'numeric' 
-                                        });
+
+                                        // If no completed steps with valid dates yet, just treat as On track.
+                                        return 'On track';
                                       })()}
                                     </div>
-                                </div>
-                              );
-                              } else if ((item.completionDate && item.completionDate !== 'No deadline set' && item.completionDate !== 'Not specified') || (item.poCdd && item.poCdd !== 'To be scheduled')) {
-                              try {
-                                  const deadlineDate = item.completionDate && item.completionDate !== 'No deadline set' && item.completionDate !== 'Not specified'
-                                  ? new Date(item.completionDate) 
-                                  : new Date(item.poCdd);
-                                const today = new Date();
-                                const timeDiff = deadlineDate.getTime() - today.getTime();
-                                const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
-
-                                if (daysDiff < 0) {
-                                return (
-                                  <div className="text-left whitespace-nowrap">
-                                    <div className="text-[11px] sm:text-xs text-gray-500 font-medium">Days to Completion</div>
-                                    <div className="text-xs sm:text-sm font-bold text-red-700">{Math.abs(daysDiff)} days overdue</div>
-                                  </div>
-                                );
-                                } else {
-                                  return (
-                                    <div className="text-left whitespace-nowrap">
-                                      <div className="text-[11px] sm:text-xs text-gray-500 font-medium">Days to Completion</div>
-                                      <div className="text-xs sm:text-sm font-bold text-blue-700">{daysDiff} days to go</div>
+                                    <div className="text-[9px] sm:text-[10px] text-white/90 truncate absolute left-0 top-0 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                                      Tag: {item.tagNumber || '—'} · Job: {item.jobNumber || '—'}
                                     </div>
-                                  );
-                                }
-                              } catch (error) {
-                                return (
-                                  <div className="text-left whitespace-nowrap">
-                                    <div className="text-[11px] sm:text-xs text-gray-500 font-medium">Days to Completion</div>
-                                    <div className="text-xs sm:text-sm font-bold text-gray-600">No deadline set</div>
                                   </div>
-                                );
-                              }
-                            } else {
-                              return (
-                                <div className="text-left whitespace-nowrap">
-                                  <div className="text-[11px] sm:text-xs text-gray-500 font-medium">Days to Completion</div>
-                                  <div className="text-xs sm:text-sm font-bold text-gray-600">No deadline set</div>
+                                  {(() => {
+                                    if (hasNoActivities) return null;
+                                    const raw = qapDeadlineRaw;
+                                    if (!raw) return null;
+                                    try {
+                                      const d = new Date(raw);
+                                      if (isNaN(d.getTime())) return null;
+                                      const day = d.getDate();
+                                      const ord =
+                                        day % 10 === 1 && day % 100 !== 11 ? 'st' :
+                                        day % 10 === 2 && day % 100 !== 12 ? 'nd' :
+                                        day % 10 === 3 && day % 100 !== 13 ? 'rd' : 'th';
+                                      return (
+                                        <div className="text-[9px] sm:text-[10px] text-white/80 whitespace-nowrap flex-shrink-0">
+                                          {day}{ord} {d.toLocaleDateString('en-GB', { month: 'long' })} {d.getFullYear()}
+                                        </div>
+                                      );
+                                    } catch {
+                                      return null;
+                                    }
+                                  })()}
                                 </div>
-                              );
-                            }
-                          })()}
-                          </div>
+                                              </div>
+                        {/* Current step & date with percentage – above image */}
+                        <div className="text-[9px] sm:text-[10px] text-gray-500 font-medium mb-1">Ongoing activity</div>
+                        <div className="flex items-start justify-between gap-3 mt-0.5">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs sm:text-sm font-semibold text-gray-900 truncate">{stageLabel || '—'}</div>
+                            {stageDate && (
+                              <div className="text-[9px] sm:text-[10px] text-gray-600 mt-0.5">
+                                {isComplete ? `Completed ${stageDate}` : `Target ${stageDate}`}
+                                    </div>
+                                  )}
+                                </div>
+                          <div className="flex-shrink-0 text-right flex flex-col items-end gap-0 leading-none">
+                            <span className="text-lg sm:text-xl font-bold text-emerald-600 tabular-nums">{displayProgress}%</span>
+                            <span className="text-[9px] text-gray-500 -mt-0.5">completed</span>
+                              </div>
                         </div>
-                        {/* PO-CDD / Completion Date */}
-                        <div className="flex items-center gap-2 min-w-0">
-                          <div className="w-2 h-2 bg-gray-400 rounded-full flex-shrink-0"></div>
-                          <span className="text-[11px] sm:text-xs font-medium text-gray-600 whitespace-nowrap">PO-CDD:</span>
-                          <div className="text-[11px] sm:text-xs font-medium text-gray-800 truncate min-w-0 md:overflow-visible md:whitespace-normal">
-                            {(() => {
-                              // Use completion date if available, otherwise use poCdd
-                              if (item.completionDate && item.completionDate !== 'No deadline set' && item.completionDate !== 'Not specified') {
-                                try {
-                                  const completionDate = new Date(item.completionDate);
-                                  if (!isNaN(completionDate.getTime())) {
-                                    return completionDate.toLocaleDateString('en-US', { 
-                                      month: 'short', 
-                                      day: 'numeric', 
-                                      year: 'numeric' 
-                                    });
-                                  }
-                                } catch (e) {
-                                  // Fall through to poCdd
-                                }
-                              }
-                              return item.poCdd && item.poCdd !== 'To be scheduled' ? item.poCdd : 'To be scheduled';
-                            })()}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Dossier Report – prominent per-equipment action (additive feature) */}
-                  {onOpenDossierReport && (
-                    <div className="mb-3 sm:mb-4">
-                      <Button
-                        type="button"
-                        variant="default"
-                        size="sm"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onOpenDossierReport({ projectId, equipmentId: item.id, projectName, equipment: item });
-                        }}
-                        className="w-full font-semibold bg-indigo-600 hover:bg-indigo-700 text-white shadow-md hover:shadow-lg transition-all py-2 text-xs sm:text-sm"
-                      >
-                        <BookMarked className="w-4 h-4 mr-2 flex-shrink-0" />
-                        Dossier Report
-                      </Button>
-                    </div>
-                  )}
-
-                  {/* Progress Image Section */}
-                  <div className="mb-4">
-                    {editingEquipmentId === item.id ? (
-                      // Edit Mode - Upload new progress image
-                      <div className="space-y-3">
-                        <div className="text-sm font-medium text-gray-700">Progress Image</div>
-                        <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center space-y-3" onClick={e => e.stopPropagation()}>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            capture="environment"
-                            onChange={(e) => {
-                              const file = e.target.files?.[0];
-                              if (file) handleImageUpload(file);
-                              e.target.value = '';
-                            }}
-                            className="hidden"
-                            id={`progress-img-camera-${item.id}`}
-                          />
-                          <input
-                            type="file"
-                            accept="image/*"
-                            onChange={(e) => {
-                              const file = e.target.files?.[0];
-                              if (file) handleImageUpload(file);
-                              e.target.value = '';
-                            }}
-                            className="hidden"
-                            id={`progress-img-gallery-${item.id}`}
-                          />
-                          <div className="flex flex-wrap items-center justify-center gap-3 py-4">
-                            <label
-                              htmlFor={`progress-img-camera-${item.id}`}
-                              className="cursor-pointer inline-flex flex-col items-center gap-2 rounded-lg border border-gray-300 bg-gray-50 px-4 py-3 text-gray-600 hover:bg-gray-100 hover:text-gray-800 min-w-[120px]"
-                              onClick={e => e.stopPropagation()}
-                            >
-                              <Camera className="w-10 h-10 text-gray-500" />
-                              <span className="text-sm font-medium">Camera</span>
-                            </label>
-                            <label
-                              htmlFor={`progress-img-gallery-${item.id}`}
-                              className="cursor-pointer inline-flex flex-col items-center gap-2 rounded-lg border border-gray-300 bg-gray-50 px-4 py-3 text-gray-600 hover:bg-gray-100 hover:text-gray-800 min-w-[120px]"
-                              onClick={e => e.stopPropagation()}
-                            >
-                              <Upload className="w-10 h-10 text-gray-500" />
-                              <span className="text-sm font-medium">Choose file</span>
-                            </label>
-                          </div>
-                        </div>
-                        <div className="relative mt-3">
-                          <Input
-                            placeholder="Describe what this image shows (required)..."
-                            value={imageDescription}
-                            onChange={(e) => setImageDescription(e.target.value)}
-                            className="text-sm pr-10"
-                            required
-                          />
-                          {newProgressImage && !imageDescription?.trim() && (
-                            <p className="text-xs text-red-500 mt-1">Description is required to upload the image</p>
-                          )}
-                          <button
-                            type="button"
-                            onClick={isImageRecording ? stopImageAudioRecording : startImageAudioRecording}
-                            className={`absolute right-2 top-1/2 transform -translate-y-1/2 p-1 rounded transition-colors ${isImageRecording
-                                ? 'text-red-600 hover:text-red-700 hover:bg-red-50'
-                                : 'text-blue-600 hover:text-blue-700 hover:bg-blue-50'
-                              }`}
-                            title={isImageRecording ? "Stop recording" : "Add audio description"}
-                          >
-                            {isImageRecording ? (
-                              <MicOff className="w-4 h-4" />
-                            ) : (
-                              <Mic className="w-4 h-4" />
-                            )}
-                          </button>
-                        </div>
-
-                        {/* Recording Status */}
-                        {isImageRecording && (
-                          <div className="flex items-center gap-2 mt-2 px-2 py-1 bg-red-50 rounded-md border border-red-200">
-                            <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
-                            <span className="text-xs text-red-600 font-medium">
-                              Recording... {formatDuration(imageRecordingDuration)}
-                            </span>
-                          </div>
-                        )}
-
-                        {imageAudioChunks.length > 0 && !isImageRecording && (
-                          <div className="flex items-center gap-2 mt-2 px-3 py-2 bg-green-50 rounded-md border border-green-200">
-                            <button
-                              onClick={() => {
-                                const reader = new FileReader();
-                                reader.onload = () => {
-                                  playImageAudio(reader.result as string);
-                                };
-                                reader.readAsDataURL(imageAudioChunks[0]);
-                              }}
-                              className="flex items-center justify-center w-6 h-6 bg-green-500 hover:bg-green-600 rounded-full text-white transition-colors"
-                              title="Play audio"
-                            >
-                              <Play className="w-3 h-3 ml-0.5" />
-                            </button>
-                            <div className="flex-1">
-                              <span className="text-xs text-green-600 font-medium">
-                                Audio recorded ({formatDuration(imageRecordingDuration)})
-                              </span>
-                            </div>
-                            <button
-                              onClick={removeImageAudio}
-                              className="p-1 text-red-500 hover:text-red-700 hover:bg-red-50 rounded transition-colors"
-                              title="Remove audio"
-                            >
-                              <X className="w-3 h-3" />
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      // View Mode - Show progress image
-                      <div className="space-y-2">
-                        <div className="text-xs font-medium text-gray-700">Progress Image</div>
-                        {isLoadingProgressImages ? (
-                          <div className="w-full h-40 sm:h-52 md:h-64 bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-dashed border-blue-200 rounded-lg flex items-center justify-center min-h-0">
+                        {/* Progress image: QAP latest completed step images (navigable) or fallback to single progress image */}
+                        <div className="relative mt-4">
+                          {isLoadingProgressImages ? (
+                          <div className="w-full h-40 sm:h-52 md:h-64 bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-dashed border-blue-200 rounded-md border border-indigo-100 flex items-center justify-center min-h-0">
                             <div className="text-center">
                               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-3"></div>
                               <p className="text-sm font-medium text-gray-700 mb-1">
@@ -9198,1991 +9960,226 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                               </p>
                             </div>
                           </div>
-                        ) : item.progressImages && item.progressImages.length > 0 ? (
-                          <div className="space-y-2">
-                            {/* Progress Image Display with Navigation */}
-                            <div className="relative">
-                              {(() => {
-                                const currentIndex = currentProgressImageIndex[item.id] || 0;
-                                const currentImage = item.progressImages[currentIndex];
-
-
-                                if (!currentImage) {
-                                  const isOnDemandLoading = USE_ON_DEMAND_PROGRESS_IMAGES && item.progressImagesMetadata?.length && currentIndex < (item.progressImagesMetadata?.length ?? 0);
-                                  if (isOnDemandLoading) {
-                                    return (
-                                      <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-lg flex items-center justify-center min-h-0">
-                                        <div className="text-center text-gray-500">
-                                          <div className="animate-spin rounded-full h-8 w-8 border-2 border-gray-400 border-t-transparent mx-auto mb-2" />
-                                          <div className="text-sm">Loading image...</div>
-                                        </div>
-                                      </div>
-                                    );
-                                  }
-                                  return (
-                                    <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-lg flex items-center justify-center min-h-0">
-                                      <div className="text-center text-gray-500">
-                                        <Camera size={24} className="mx-auto mb-2" />
-                                        <div className="text-sm">Image not found</div>
-                                      </div>
-                                    </div>
-                                  );
-                                }
-
-                                return (
-                                  <div 
-                                    className="relative cursor-pointer group"
-                                    onClick={() => {
-                                      setShowImagePreview({ url: currentImage, equipmentId: item.id, currentIndex: currentIndex });
-                                    }}
-                                  >
-                                    <img
-                                      src={currentImage}
-                                      alt="Progress"
-                                      className="w-full max-w-full h-40 sm:h-52 md:h-64 object-cover rounded-lg border border-gray-200 pointer-events-none"
-                                    />
-
-                                    {/* Eye Button */}
-                                    <button
-                                      className="absolute top-2 right-2 bg-white text-gray-800 p-1 rounded text-xs z-20 border border-gray-300 shadow-sm hover:bg-gray-50"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setShowImagePreview({ url: currentImage, equipmentId: item.id, currentIndex: currentIndex });
+                        ) : (() => {
+                          const sortedByOrder = [...list].sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+                          const completedMilestones = sortedByOrder.filter((a: any) => a.completion && a.activity_type === 'milestone');
+                          let lastMilestoneWithImages: { comp: any; imageCount: number } | null = null;
+                          for (let i = completedMilestones.length - 1; i >= 0; i--) {
+                            const act = completedMilestones[i];
+                            const comp = act?.completion;
+                            const fromApi = comp ? (Number(comp.image_count) ?? 0) : 0;
+                            const fallbackCount = comp?.id ? (completionImageCountFallback[comp.id] ?? 0) : 0;
+                            const imageCount = Math.max(fromApi, fallbackCount);
+                            if (imageCount >= 1) {
+                              lastMilestoneWithImages = { comp, imageCount };
+                              break;
+                            }
+                          }
+                          const latestQapWithImages = lastMilestoneWithImages?.comp?.id
+                            ? { completionId: lastMilestoneWithImages.comp.id, imageCount: lastMilestoneWithImages.imageCount }
+                            : null;
+                          if (latestQapWithImages) {
+                            const { completionId, imageCount } = latestQapWithImages;
+                            const currentIndex = Math.min(Math.max(0, progressSectionImageIndex[item.id] ?? 0), imageCount - 1);
+                            const cacheKey = `${completionId}_${currentIndex}`;
+                            const imageUrl = stepImageCache[cacheKey];
+                            const loading = stepImageLoading[cacheKey];
+                            return (
+                              <div className="space-y-2 rounded-md border border-indigo-100 border-t bg-white">
+                                <div className="relative">
+                                  {imageUrl ? (
+                                    <div
+                                      className="relative cursor-pointer group"
+                                      onClick={() => {
+                                        setStepImagePreview({ completionId, currentIndex, imageCount });
                                       }}
-                                      title="View larger image"
                                     >
-                                      <Eye className="w-4 h-4" />
-                                    </button>
-
-                                    {/* Navigation arrows for multiple images */}
-                                    {item.progressImages.length > 1 && (
-                                      <>
-                                        <button
-                                          className="absolute left-2 top-1/2 transform -translate-y-1/2 bg-black bg-opacity-50 text-white p-2 rounded-full hover:bg-opacity-70 transition-all z-10"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            const prevIndex = currentIndex > 0 ? currentIndex - 1 : item.progressImages.length - 1;
-                                            setCurrentProgressImageIndex(prev => ({
-                                              ...prev,
-                                              [item.id]: prevIndex
-                                            }));
-                                            fetchProgressImageForIndex(item.id, prevIndex);
-                                          }}
-                                        >
-                                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                                          </svg>
-                                        </button>
-                                        <button
-                                          className="absolute right-2 top-1/2 transform -translate-y-1/2 bg-black bg-opacity-50 text-white p-2 rounded-full hover:bg-opacity-70 transition-all z-10"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            const nextIndex = currentIndex < item.progressImages.length - 1 ? currentIndex + 1 : 0;
-                                            setCurrentProgressImageIndex(prev => ({
-                                              ...prev,
-                                              [item.id]: nextIndex
-                                            }));
-                                            fetchProgressImageForIndex(item.id, nextIndex);
-                                          }}
-                                        >
-                                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                                          </svg>
-                                        </button>
-                                      </>
-                                    )}
-
-                                    {/* Image counter */}
-                                    <div className="absolute top-2 right-2 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded z-10 pointer-events-none">
-                                      {currentIndex + 1} of {item.progressImages.length}
-                                    </div>
-
-                                    {/* Hover overlay */}
-                                    <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-20 transition-all rounded-lg flex items-center justify-center pointer-events-none">
-                                      <Eye size={24} className="text-white opacity-0 group-hover:opacity-100 transition-opacity" />
-                                    </div>
-                                  </div>
-                                );
-                              })()}
-                            </div>
-
-
-                          </div>
-                        ) : (
-                          <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-lg flex items-center justify-center min-h-0">
-                            <div className="text-center text-gray-500">
-                              <Camera size={24} className="mx-auto mb-2" />
-                              <div className="text-sm">No progress image</div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="flex items-start justify-between mb-3 sm:mb-4">
-                    <div className="flex-1 min-w-0 pr-2">
-                      <h3 className="font-semibold text-foreground truncate text-xs sm:text-sm md:overflow-visible md:whitespace-normal min-w-0">
-                        {item.manufacturingSerial || item.name || (item.type === 'Distillation Column' ? 'Column' : item.type)}
-                      </h3>
-                      <p className="text-[11px] sm:text-xs text-muted-foreground min-w-0 truncate md:overflow-visible md:whitespace-normal">Tag: {item.tagNumber || '—'}</p>
-                      <div className="flex flex-col gap-1 mt-1 text-[11px] sm:text-xs text-gray-500 min-w-0">
-                        <span className="truncate md:overflow-visible md:whitespace-normal">Job: {item.jobNumber || '—'}</span>
-                        <span className="truncate md:overflow-visible md:whitespace-normal">Type: {item.type === 'Distillation Column' ? 'Column' : (item.type || '—')}</span>
-                      </div>
-                    </div>
-
-                    {/* Phase Status Dropdown */}
-                    <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                      <Select
-                        value={item.progressPhase}
-                        onValueChange={(value) => handleProgressPhaseChange(item.id, value as 'documentation' | 'manufacturing' | 'testing' | 'dispatched')}
-                        disabled={loadingStates[`phase-${item.id}`] || currentUserRole === 'vdcr_manager' || currentUserRole === 'viewer' || currentUserRole === 'editor'}
-                      >
-                        <SelectTrigger className="w-28 sm:w-32 md:w-36 h-7 text-xs">
-                          <SelectValue />
-                          {loadingStates[`phase-${item.id}`] && (
-                            <div className="w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></div>
-                          )}
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="documentation">Documentation</SelectItem>
-                          <SelectItem value="manufacturing">Manufacturing</SelectItem>
-                          <SelectItem value="testing">Testing</SelectItem>
-                          <SelectItem value="dispatched">Dispatched</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      {/* Any Personal Title - Capsule UI below status dropdown */}
-                      {item.certificationTitle && (
-                        <span className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded-full">
-                          {item.certificationTitle}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-
-
-
-
-
-                  <Tabs
-                    defaultValue="overview"
-                    className="w-full flex-1 flex flex-col"
-                    onValueChange={(value) => markAsSeen(`equipment_${item.id}_${value}`)}
-                  >
-                    <div className="overflow-x-auto overflow-y-hidden scroll-smooth -mx-1 px-1 md:mx-0 md:px-0 scrollbar-hide md:overflow-visible">
-                      <TabsList className="flex md:grid md:w-full md:grid-cols-5 h-8 sm:h-9 min-w-max md:min-w-0 gap-1 md:gap-0 flex-nowrap md:flex-none justify-start md:justify-stretch">
-                        <TabsTrigger value="overview" className="text-xs px-2 sm:px-3 whitespace-nowrap flex-shrink-0 flex items-center justify-center gap-0.5">
-                          Overview
-                          <UnreadTabDot entityKey={`equipment_${item.id}_overview`} updatedAt={item.updated_at ?? (item as any).last_update} />
-                        </TabsTrigger>
-                        <TabsTrigger value="technical" className="text-xs px-2 sm:px-3 whitespace-nowrap flex-shrink-0 flex items-center justify-center gap-0.5">
-                          Technical
-                          <UnreadTabDot entityKey={`equipment_${item.id}_technical`} updatedAt={item.updated_at ?? (item as any).last_update} />
-                        </TabsTrigger>
-                        <TabsTrigger value="team" className="text-xs px-2 sm:px-3 whitespace-nowrap flex-shrink-0 flex items-center justify-center gap-0.5">
-                          Team
-                          <UnreadTabDot entityKey={`equipment_${item.id}_team`} updatedAt={item.updated_at ?? (item as any).last_update} />
-                        </TabsTrigger>
-                        <TabsTrigger value="progress" className="text-xs px-2 sm:px-3 whitespace-nowrap flex-shrink-0 flex items-center justify-center gap-0.5">
-                          Updates
-                          <UnreadTabDot
-                            entityKey={`equipment_${item.id}_progress`}
-                            updatedAt={
-                              (item.progressEntries?.length
-                                ? (() => {
-                                    const times = (item.progressEntries as any[]).map((e: any) => (e.date ? new Date(e.date).getTime() : 0)).filter(Boolean);
-                                    return times.length ? new Date(Math.max(...times)).toISOString() : undefined;
-                                  })()
-                                : undefined) ?? item.updated_at ?? (item as any).last_update
-                            }
-                          />
-                        </TabsTrigger>
-                        <TabsTrigger
-                          value="documents"
-                          className="text-xs px-2 sm:px-3 whitespace-nowrap flex-shrink-0 flex items-center justify-center gap-0.5"
-                          onClick={() => handleDocsTabClick(item.id)}
-                        >
-                          Docs
-                          <UnreadTabDot
-                            entityKey={`equipment_${item.id}_documents`}
-                            updatedAt={
-                              (documents[item.id]?.length
-                                ? (() => {
-                                    const dates = (documents[item.id] || []).map((d: any) => d.uploadDate || d.updated_at || d.created_at).filter(Boolean);
-                                    const times = dates.map((d: string) => new Date(d).getTime()).filter((t) => !isNaN(t));
-                                    return times.length ? new Date(Math.max(...times)).toISOString() : undefined;
-                                  })()
-                                : undefined) ?? item.updated_at ?? (item as any).last_update
-                            }
-                          />
-                        </TabsTrigger>
-                      </TabsList>
-                    </div>
-
-                    <TabsContent value="overview" className="mt-3 sm:mt-4 space-y-3">
-                      {editingEquipmentId === item.id && currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && currentUserRole !== 'editor' ? (
-                        <div className="space-y-4">
-                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                            <div>
-                              <Label className="text-xs text-gray-600">Size</Label>
-                              <Input
-                                placeholder="e.g., 4.2m x 1.6m"
-                                value={editFormData.size ?? ''}
-                                onChange={(e) => setEditFormData({...editFormData, size: e.target.value})}
-                                className="text-xs h-8"
-                              />
-                              <p className="text-[11px] text-gray-400 mt-1">Dimensions (length × width × height)</p>
-                            </div>
-                            <div>
-                              <Label className="text-xs text-gray-600">Material</Label>
-                              <Input
-                                placeholder="e.g., SS 304, Carbon Steel"
-                                value={editFormData.material ?? ''}
-                                onChange={(e) => setEditFormData({...editFormData, material: e.target.value})}
-                                className="text-xs h-8"
-                              />
-                              <p className="text-[11px] text-gray-400 mt-1">Primary material specification</p>
-                            </div>
-                            <div>
-                              <Label className="text-xs text-gray-600">Design Code</Label>
-                              <Input
-                                placeholder="e.g., ASME VIII Div 1, TEMA Class R"
-                                value={editFormData.designCode ?? ''}
-                                onChange={(e) => setEditFormData({...editFormData, designCode: e.target.value})}
-                                className="text-xs h-8"
-                              />
-                              <p className="text-[11px] text-gray-400 mt-1">Applicable design standard</p>
-                            </div>
-                          </div>
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                            <div>
-                              <Label className="text-xs text-gray-600">Last Updated On</Label>
-                              <Input
-                                type="date"
-                                value={(() => {
-                                  // Priority 1: Use overviewLastUpdateRaw if available (user input or initialized)
-                                  if (overviewLastUpdateRaw[item.id]) {
-                                    const rawValue = overviewLastUpdateRaw[item.id];
-                                    const dateValue = rawValue.split('T')[0].split(' ')[0]; // Handle both datetime and date strings
-                                    if (dateValue && dateValue.match(/^\d{4}-\d{2}-\d{2}$/)) {
-                                      return dateValue;
-                                    }
-                                  }
-                                  // Priority 2: Fall back to equipment's last_update field from database
-                                  // This ensures the date shows even if overviewLastUpdateRaw isn't set yet
-                                  const equipment = localEquipment.find(eq => eq.id === item.id);
-                                  if (equipment && (equipment as any).last_update) {
-                                    const rawDate = String((equipment as any).last_update);
-                                    const dateValue = rawDate.split('T')[0].split(' ')[0]; // Handle both datetime and date strings
-                                    if (dateValue && dateValue.match(/^\d{4}-\d{2}-\d{2}$/)) {
-                                      return dateValue;
-                                    }
-                                  }
-                                  return '';
-                                })()}
-                                onChange={(e) => {
-                                  const raw = e.target.value;
-                                  setOverviewLastUpdateRaw(prev => ({ ...prev, [item.id]: raw }));
-                                  setEditFormData({
-                                    ...editFormData,
-                                    lastUpdate: raw ? formatDateOnly(raw) : ''
-                                  });
-                                }}
-                                className="text-xs h-8"
-                              />
-                              <p className="text-[11px] text-gray-400 mt-1">Reference date shown to the team</p>
-                              {(() => {
-                                const displayValue = overviewLastUpdateRaw[item.id] || 
-                                  (localEquipment.find(eq => eq.id === item.id) as any)?.last_update;
-                                return displayValue ? (
-                                <p className="text-[11px] text-blue-500 mt-1">
-                                    {formatDateDisplay(String(displayValue).split('T')[0])}
-                                </p>
-                                ) : null;
-                              })()}
-                            </div>
-                            <div>
-                              <Label className="text-xs text-gray-600">Next Milestone Date</Label>
-                              <Input
-                                type="date"
-                                value={(() => {
-                                  const dateValue = overviewNextMilestoneDate[item.id];
-                                  // Only return valid date format (YYYY-MM-DD), not strings like "To be scheduled"
-                                  if (dateValue && dateValue.match(/^\d{4}-\d{2}-\d{2}$/)) {
-                                    return dateValue;
-                                  }
-                                  return '';
-                                })()}
-                                onChange={(e) => {
-                                  const raw = e.target.value;
-                                  // Only set if it's a valid date format
-                                  if (raw && raw.match(/^\d{4}-\d{2}-\d{2}$/)) {
-                                  setOverviewNextMilestoneDate(prev => ({ ...prev, [item.id]: raw }));
-                                  setEditFormData({
-                                    ...editFormData,
-                                    nextMilestoneDate: raw ? new Date(raw).toISOString() : undefined
-                                  });
-                                  } else if (!raw) {
-                                    // Clear if empty
-                                    setOverviewNextMilestoneDate(prev => {
-                                      const updated = { ...prev };
-                                      delete updated[item.id];
-                                      return updated;
-                                    });
-                                    setEditFormData({
-                                      ...editFormData,
-                                      nextMilestoneDate: undefined
-                                    });
-                                  }
-                                }}
-                                className="text-xs h-8"
-                              />
-                              <p className="text-[11px] text-gray-400 mt-1">Pick the milestone date from the calendar</p>
-                              {overviewNextMilestoneDate[item.id] && overviewNextMilestoneDate[item.id].match(/^\d{4}-\d{2}-\d{2}$/) && (
-                                <p className="text-[11px] text-blue-500 mt-1">
-                                  {formatDateDisplay(overviewNextMilestoneDate[item.id])}
-                                </p>
-                              )}
-                            </div>
-                          </div>
-                          <div>
-                            <Label className="text-xs text-gray-600">Next Milestone Title / Summary</Label>
-                            <Input
-                              placeholder="e.g., Hydro Test"
-                              value={editFormData.nextMilestone ?? ''}
-                              onChange={(e) => setEditFormData({...editFormData, nextMilestone: e.target.value})}
-                              className="text-xs h-8"
-                            />
-                            <p className="text-[11px] text-gray-400 mt-1">Short description that appears with the milestone date</p>
-                          </div>
-                          <div>
-                            <Label className="text-xs text-gray-600">Update Description / Notes</Label>
-                            <Textarea
-                              placeholder="Share the latest progress, issues, or any client-facing summary"
-                              value={editFormData.notes ?? ''}
-                              onChange={(e) => setEditFormData({...editFormData, notes: e.target.value})}
-                              className="text-xs min-h-[88px]"
-                            />
-                            <p className="text-[11px] text-gray-400 mt-1">This summary will surface in the overview snapshot</p>
-                          </div>
-                        </div>
-                      ) : (
-                        (() => {
-                          const sizeValue = item.size && item.size.trim() !== '' ? item.size : '—';
-                          const materialValue = item.material && item.material.trim() !== '' ? item.material : '—';
-                          const designCodeValue = item.designCode && item.designCode.trim() !== '' ? item.designCode : '—';
-                          const equipmentEntries = progressEntries[item.id] || item.progressEntries || [];
-                          const latestEntry = equipmentEntries.length > 0 ? equipmentEntries[equipmentEntries.length - 1] : null;
-                          // Get last updated value and format it as date only
-                          // For standalone equipment, prioritize last_update (DATE column) over other fields
-                          // last_update is already in YYYY-MM-DD format, so use it directly
-                          const lastUpdatedRaw = (item as any).last_update || item.lastUpdate || latestEntry?.date || latestEntry?.created_at || item.updated_at || (item as any).updatedAt || '';
-                          const lastUpdatedValue = lastUpdatedRaw ? formatDateOnly(lastUpdatedRaw) : '—';
-                          const updateDescription =
-                            (item.notes && item.notes.trim() !== '' ? item.notes : '') ||
-                            latestEntry?.text || latestEntry?.comment || latestEntry?.entry_text ||
-                            (item.nextMilestone && item.nextMilestone.trim() !== '' ? item.nextMilestone : '') ||
-                            'No recent update details shared yet.';
-
-                          return (
-                            <>
-                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                                <div className="p-3 rounded-lg bg-gray-50 border border-gray-200">
-                                  <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Size</div>
-                                  <div className="text-sm font-semibold text-gray-900">{sizeValue}</div>
-                                  <div className="text-[11px] text-gray-400 mt-1">Dimensions (L × W × H)</div>
-                                </div>
-                                <div className="p-3 rounded-lg bg-gray-50 border border-gray-200">
-                                  <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Material</div>
-                                  <div className="text-sm font-semibold text-gray-900">{materialValue}</div>
-                                  <div className="text-[11px] text-gray-400 mt-1">Primary specification</div>
-                                </div>
-                                <div className="p-3 rounded-lg bg-gray-50 border border-gray-200">
-                                  <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Design Code</div>
-                                  <div className="text-sm font-semibold text-gray-900">{designCodeValue}</div>
-                                  <div className="text-[11px] text-gray-400 mt-1">Applicable standard</div>
-                                </div>
-                              </div>
-                              {/* Activities (replaces Last Updated / Next Milestone) */}
-                              <div className="p-4 rounded-lg border border-blue-100 bg-blue-50">
-                                {loadingActivities[item.id] ? (
-                                  <div className="flex items-center justify-center py-6">
-                                    <div className="animate-spin rounded-full h-6 w-6 border-2 border-indigo-500 border-t-transparent"></div>
-                                  </div>
-                                ) : !(equipmentActivities[item.id]?.length) ? (
-                                  <div className="space-y-2">
-                                    <p className="text-xs text-gray-600">Upload an Excel sheet with activities (Sr. No., Activity Name, Activity Type, Target). First row: Commencement Date.</p>
-                                    <div className="flex flex-wrap items-center gap-2">
-                                      <Button type="button" size="sm" variant="outline" className="text-xs h-8" onClick={downloadActivitiesTemplate}>
-                                        <Download size={14} className="mr-1" />
-                                        Download sample template
-                                      </Button>
-                                      <input
-                                        type="file"
-                                        accept=".xlsx,.xls"
-                                        className="text-xs"
-                                        id={`activities-upload-overview-${item.id}`}
-                                        onChange={(e) => {
-                                          const f = e.target.files?.[0];
-                                          if (f) handleUploadActivitiesExcel(item.id, f);
-                                          e.target.value = '';
-                                        }}
-                                        disabled={!!uploadingActivitiesForEquipment}
+                                      <img
+                                        src={imageUrl}
+                                        alt="Progress"
+                                        className="w-full max-w-full h-40 sm:h-52 md:h-64 object-cover rounded-md border border-gray-200 pointer-events-none"
                                       />
-                                      {uploadingActivitiesForEquipment === item.id && (
-                                        <span className="text-xs text-indigo-600">Uploading...</span>
-                                      )}
-                                    </div>
+                                      <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-20 transition-all rounded-md flex items-center justify-center pointer-events-none">
+                                        <Eye size={24} className="text-white opacity-0 group-hover:opacity-100 transition-opacity" />
+                                      </div>
                                   </div>
-                                ) : (() => {
-                                  const list = equipmentActivities[item.id] || [];
-                                  const { completed: completedSeg, current, next } = getActivitiesProgressSegments(list);
-                                  const lastCompleted = completedSeg[0];
-                                  const total = list.length;
-                                  const doneCount = list.filter((a: any) => a.completion).length;
-                                  const hasCurrent = current && !current.completion;
-                                  const pct = total
-                                    ? (doneCount >= total ? 100 : hasCurrent ? Math.min(100, Math.round(((doneCount + 0.55) / total) * 100)) : Math.round((doneCount / total) * 100))
-                                    : 0;
-                                  return (
-                                    <div className="space-y-1.5 sm:space-y-2">
-                                      <div className="flex items-center gap-1.5 sm:gap-2">
-                                        <div className="flex-1 min-w-0 rounded-full h-2.5 sm:h-3.5 bg-gray-200 overflow-hidden shadow-inner">
-                                          <div className="h-full rounded-full bg-gradient-to-r from-green-600 to-green-400 transition-all" style={{ width: `${pct}%` }} />
-                                        </div>
-                                        <div className="flex items-center gap-0.5 flex-shrink-0">
-                                          <Button type="button" size="icon" variant="ghost" className="h-6 w-6 sm:h-7 sm:w-7" onClick={() => openEditActivitiesModal(item.id)} title="Edit activity">
-                                            <Edit className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-gray-600" />
-                                          </Button>
-                                          <Button type="button" size="icon" variant="ghost" className="h-6 w-6 sm:h-7 sm:w-7" onClick={() => { setActivitiesHistoryEquipmentId(item.id); setActivitiesHistoryOpen(true); }} title="History">
-                                            <History className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-gray-600" />
-                                          </Button>
-                                          <label htmlFor={`activities-replace-overview-${item.id}`} className="cursor-pointer" title="Replace activities">
-                                            <span className="inline-flex items-center justify-center h-6 w-6 sm:h-7 sm:w-7 rounded-md hover:bg-gray-100 text-gray-600"><Upload className="w-3 h-3 sm:w-3.5 sm:h-3.5" /></span>
-                                          </label>
-                                          <input
-                                            type="file"
-                                            accept=".xlsx,.xls"
-                                            className="hidden"
-                                            id={`activities-replace-overview-${item.id}`}
-                                            onChange={(e) => {
-                                              const f = e.target.files?.[0];
-                                              if (f) handleUploadActivitiesExcel(item.id, f);
-                                              e.target.value = '';
-                                            }}
-                                            disabled={!!uploadingActivitiesForEquipment}
-                                          />
-                                        </div>
-                                      </div>
-                                      <div className="grid grid-cols-3 gap-1.5 sm:gap-2 min-w-0 text-[9px] sm:text-[10px]">
-                                        <div className="min-w-0">
-                                          <p className="text-[8px] sm:text-[9px] uppercase text-gray-400 mb-0.5">Done</p>
-                                          <p className="truncate text-gray-700 text-[10px] sm:text-[10px]">{lastCompleted ? lastCompleted.activity_name : '—'}</p>
-                                          {lastCompleted && (
-                                            <p className="text-[8px] sm:text-[9px] text-gray-500 mt-0.5">Completed on {lastCompleted.completion?.completed_on ? formatDateOnly(lastCompleted.completion.completed_on) : '—'}</p>
-                                          )}
-                                        </div>
-                                        <div className="min-w-0 border-l border-gray-100 pl-1 sm:pl-1.5">
-                                          <p className="text-[8px] sm:text-[9px] uppercase text-indigo-500 font-medium mb-0.5">Current</p>
-                                          <p className="truncate font-medium text-gray-800 text-[10px] sm:text-[10px]">{current ? current.activity_name : '—'}</p>
-                                          {current && (
-                                            <p className="text-[8px] sm:text-[9px] text-gray-500 mt-0.5">Target: {current.target_date ? formatDateOnly(current.target_date) : (current.target_relative || '—')}</p>
-                                          )}
-                                        </div>
-                                        <div className="min-w-0 border-l border-gray-100 pl-1 sm:pl-1.5">
-                                          <p className="text-[8px] sm:text-[9px] uppercase text-gray-400 mb-0.5">Next</p>
-                                          <p className="truncate text-gray-600 text-[10px] sm:text-[10px]">{next ? next.activity_name : '—'}</p>
-                                          {next && (
-                                            <p className="text-[8px] sm:text-[9px] text-gray-500 mt-0.5">Target: {next.target_date ? formatDateOnly(next.target_date) : (next.target_relative || '—')}</p>
-                                          )}
-                                        </div>
-                                      </div>
-                                      <div className="flex justify-between gap-1 sm:gap-2 flex-wrap">
-                                        <Button type="button" size="sm" variant="outline" className="text-[10px] sm:text-xs h-6 sm:h-7 px-1.5 sm:px-2" onClick={() => exportActivitiesReport(item.id)}>
-                                          <Download className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
-                                          Export report
-                                        </Button>
-                                        {current && !current.completion && currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                          <Button type="button" size="sm" variant="default" className="text-[10px] sm:text-xs h-6 sm:h-7 px-1.5 sm:px-2" onClick={() => openMarkCompleteModal(current, item.id)}>
-                                            Mark complete
-                                          </Button>
-                                        )}
-                                      </div>
-                                    </div>
-                                  );
-                                })()}
-                              </div>
-                            </>
-                          );
-                        })()
-                      )}
-                    </TabsContent>
-
-                    <TabsContent value="technical" className="mt-3 sm:mt-4 space-y-2 flex-1 flex flex-col">
-                      <div className="space-y-2 text-xs sm:text-sm flex-1 flex flex-col">
-                        {/* Technical Section Buttons */}
-                        <div className="overflow-x-auto overflow-y-hidden scroll-smooth mb-4 -mx-1 px-1">
-                          <div className="flex flex-nowrap sm:flex-wrap gap-2 min-w-max sm:min-w-0">
-                            {technicalSections[item.id] && technicalSections[item.id].length > 0 && (
-                              <>
-                                {technicalSections[item.id].map((section) => (
-                                  <Button
-                                    key={section.name}
-                                    variant={selectedSection[item.id] === section.name ? "default" : "outline"}
-                                    size="sm"
-                                    onClick={() => setSelectedSection(prev => ({ ...prev, [item.id]: section.name }))}
-                                    onDoubleClick={() => {
-                                      setEditingEquipmentId(item.id);
-                                      setEditingSectionName(section.name);
-                                      setEditingSectionOldName(section.name);
-                                      setIsEditSectionModalOpen(true);
-                                    }}
-                                    className={`text-xs sm:text-sm px-3 py-1.5 sm:py-1 h-8 sm:h-7 whitespace-nowrap flex-shrink-0 ${selectedSection[item.id] === section.name
-                                      ? 'bg-blue-600 text-white'
-                                      : 'bg-white text-gray-700 border-gray-300'
-                                      }`}
-                                  >
-                                    {section.name}
-                                  </Button>
-                                ))}
-                              </>
-                            )}
-                            {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && currentUserRole !== 'editor' && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => {
-                                  setEditingEquipmentId(item.id);
-                                  setIsAddSectionModalOpen(true);
-                                }}
-                                className="text-xs sm:text-sm px-3 py-1.5 sm:py-1 h-8 sm:h-7 bg-green-100 text-green-700 border-green-300 hover:bg-green-200 whitespace-nowrap flex-shrink-0"
-                              >
-                                <Plus className="w-3 h-3 sm:w-3.5 sm:h-3.5 mr-1" />
-                                Add Section
-                              </Button>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Selected Section Details */}
-                        {technicalSections[item.id] && technicalSections[item.id].length > 0 ? (
-                          (() => {
-                            // Auto-select first section if no section is selected
-                            const currentSectionName = selectedSection[item.id] || technicalSections[item.id][0]?.name;
-                            const currentSection = technicalSections[item.id].find(s => s.name === currentSectionName);
-
-                            // Update selected section if not set
-                            if (!selectedSection[item.id] && technicalSections[item.id].length > 0) {
-                              setSelectedSection(prev => ({ ...prev, [item.id]: technicalSections[item.id][0].name }));
-                            }
-
-                            return currentSection ? (
-                              <div className="space-y-3">
-                                {(() => {
-                                  const currentSection = technicalSections[item.id]?.find(s => s.name === selectedSection[item.id]);
-                                  if (!currentSection) return null;
-                                  return (
-                                    <>
-                                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-0 mb-3">
-                                        <h4 className="text-sm font-semibold text-gray-900">{currentSection.name}</h4>
-                                        {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && currentUserRole !== 'editor' && (
-                                          <div className="flex flex-row gap-2 flex-nowrap">
-                                            <Button
-                                              size="sm"
-                                              variant="outline"
-                                              onClick={() => {
-                                                setShowAddFieldInputs(prev => ({ ...prev, [item.id]: true }));
-                                                setNewFieldName('');
-                                                setNewFieldValue('');
-                                              }}
-                                              className="text-xs px-2 sm:px-3 py-1 h-7 bg-blue-600 text-white hover:bg-blue-700 whitespace-nowrap flex-shrink-0"
-                                            >
-                                              <Plus className="w-3 h-3 sm:mr-1" />
-                                              <span className="hidden sm:inline">Add Custom Field</span>
-                                              <span className="sm:hidden">Add Custom Field</span>
-                                            </Button>
-                                            <Button
-                                              size="sm"
-                                              variant="outline"
-                                              onClick={async () => {
-                                                if (isEditMode[item.id]) {
-                                                  // Done Editing - Save changes directly to database
-                                                  try {
-                                                    await fastAPI.updateEquipment(item.id, {
-                                                      technical_sections: technicalSections[item.id] || []
-                                                    }, user?.id);
-
-                                                    toast({
-                                                      title: "Success",
-                                                      description: "Custom fields updated successfully",
-                                                    });
-                                                  } catch (error) {
-                                                    console.error('Error saving custom fields:', error);
-                                                    toast({
-                                                      title: "Error",
-                                                      description: "Failed to save custom fields",
-                                                      variant: "destructive",
-                                                    });
-                                                  }
-                                                }
-                                                
-                                                setIsEditMode(prev => ({ ...prev, [item.id]: !prev[item.id] }));
-                                                setShowAddFieldInputs(prev => ({ ...prev, [item.id]: false }));
-                                              }}
-                                              className="text-xs px-2 sm:px-3 py-1 h-7 bg-green-600 text-white hover:bg-green-700 whitespace-nowrap flex-shrink-0"
-                                            >
-                                              <Edit className="w-3 h-3 sm:mr-1" />
-                                              <span className="hidden sm:inline">{isEditMode[item.id] ? 'Done Editing' : 'Edit Custom Field'}</span>
-                                              <span className="sm:hidden">{isEditMode[item.id] ? 'Done Editing' : 'Edit Custom Field'}</span>
-                                            </Button>
-                                          </div>
-                                        )}
-                                      </div>
-
-                                      {/* Add Field Inputs */}
-                                      {showAddFieldInputs[item.id] && (
-                                        <div className="space-y-2 p-3 bg-gray-50 rounded-md border">
-                                          <div className="flex gap-2">
-                                            <Input
-                                              placeholder="Field name (e.g., Pressure)"
-                                              value={newFieldName}
-                                              onChange={(e) => setNewFieldName(e.target.value)}
-                                              className="text-xs h-7"
-                                            />
-                                            <Input
-                                              placeholder="Field value (e.g., 150 PSI)"
-                                              value={newFieldValue}
-                                              onChange={(e) => setNewFieldValue(e.target.value)}
-                                              className="text-xs h-7"
-                                            />
-                                          </div>
-                                          {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                            <div className="flex gap-2">
-                                              <Button
-                                                size="sm"
-                                                onClick={async () => {
-                                                  // Capture field values before clearing
-                                                  const fieldNameToSave = newFieldName.trim();
-                                                  const fieldValueToSave = newFieldValue.trim();
-                                                  
-                                                  // Clear fields immediately but keep form open for next entry
-                                                  setNewFieldName('');
-                                                  setNewFieldValue('');
-
-                                                  if (fieldNameToSave) {
-                                                    const newField = { name: fieldNameToSave, value: fieldValueToSave };
-                                                    const currentSection = selectedSection[item.id];
-
-                                                    if (currentSection) {
-                                                      // Update technical sections with new custom field
-                                                      const updatedSections = (technicalSections[item.id] || []).map(section =>
-                                                        section.name === currentSection
-                                                          ? { ...section, customFields: [...section.customFields, newField] }
-                                                          : section
-                                                      );
-
-                                                      // Update local state
-                                                      setTechnicalSections(prev => ({
-                                                        ...prev,
-                                                        [item.id]: updatedSections
-                                                      }));
-
-                                                      // Save to database using the same API as main save
-                                                      try {
-                                                        await fastAPI.updateEquipment(item.id, {
-                                                          technical_sections: updatedSections
-                                                        }, user?.id);
-
-                                                        toast({
-                                                          title: "Success",
-                                                          description: "Custom field added successfully",
-                                                        });
-                                                      } catch (error) {
-                                                        console.error('Error saving custom field:', error);
-                                                        toast({
-                                                          title: "Error",
-                                                          description: "Failed to save custom field",
-                                                          variant: "destructive",
-                                                        });
-                                                      }
-                                                    }
-                                                  }
-                                                }}
-                                                className="text-xs px-3 py-1 h-6 bg-green-600 text-white hover:bg-green-700"
-                                              >
-                                                <Check className="w-3 h-3 mr-1" />
-                                                Save
-                                              </Button>
-                                              <Button
-                                                size="sm"
-                                                variant="outline"
-                                                onClick={() => {
-                                                  setShowAddFieldInputs(prev => ({ ...prev, [item.id]: false }));
-                                                  setNewFieldName('');
-                                                  setNewFieldValue('');
-                                                }}
-                                                className="text-xs px-3 py-1 h-6"
-                                              >
-                                                <X className="w-3 h-3 mr-1" />
-                                                Cancel
-                                              </Button>
-                                            </div>
-                                          )}
-                                        </div>
-                                      )}
-
-                                      {/* Display Custom Fields */}
-                                      {(() => {
-                                        const currentSection = technicalSections[item.id]?.find(s => s.name === selectedSection[item.id]);
-                                        const sectionFields = currentSection?.customFields || [];
-
-                                        return sectionFields.length > 0 ? (
-                                          <div className={`grid grid-cols-1 sm:grid-cols-2 gap-2 sm:gap-3 max-h-[200px] sm:max-h-64 overflow-y-auto pr-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]`}>
-                                            {sectionFields.map((field, index) => (
-                                              <div key={index} className="flex items-center justify-between px-3 sm:px-4 py-2.5 sm:py-3 bg-white border border-gray-300 rounded-lg shadow-sm hover:shadow-md transition-shadow duration-200 gap-2">
-                                                {isEditMode[item.id] ? (
-                                                  <div className="flex-1 flex gap-2">
-                                                    <Input
-                                                      value={field.name}
-                                                      onChange={async (e) => {
-                                                        const updatedSections = (technicalSections[item.id] || []).map(section =>
-                                                          section.name === selectedSection[item.id]
-                                                            ? {
-                                                              ...section,
-                                                              customFields: section.customFields.map((f, i) =>
-                                                                i === index ? { ...f, name: e.target.value } : f
-                                                              )
-                                                            }
-                                                            : section
-                                                        );
-                                                        setTechnicalSections(prev => ({
-                                                          ...prev,
-                                                          [item.id]: updatedSections
-                                                        }));
-
-                                                        // Save to database immediately
-                                                        try {
-                                                          await updateEquipment(item.id, {
-                                                            technical_sections: updatedSections
-                                                          });
-                                                          // // console.log('✅ Field name saved to database, refreshing data...');
-                                                          await refreshEquipmentData();
-                                                        } catch (error) {
-                                                          console.error('Error saving field name change:', error);
-                                                        }
-                                                      }}
-                                                      className="text-xs h-7"
-                                                    />
-                                                    <Input
-                                                      value={field.value}
-                                                      onChange={async (e) => {
-                                                        const updatedSections = (technicalSections[item.id] || []).map(section =>
-                                                          section.name === selectedSection[item.id]
-                                                            ? {
-                                                              ...section,
-                                                              customFields: section.customFields.map((f, i) =>
-                                                                i === index ? { ...f, value: e.target.value } : f
-                                                              )
-                                                            }
-                                                            : section
-                                                        );
-                                                        setTechnicalSections(prev => ({
-                                                          ...prev,
-                                                          [item.id]: updatedSections
-                                                        }));
-
-                                                        // Save to database immediately
-                                                        try {
-                                                          await updateEquipment(item.id, {
-                                                            technical_sections: updatedSections
-                                                          });
-                                                          // // console.log('✅ Field value saved to database, refreshing data...');
-                                                          await refreshEquipmentData();
-                                                        } catch (error) {
-                                                          console.error('Error saving field value change:', error);
-                                                        }
-                                                      }}
-                                                      className="text-xs h-7"
-                                                    />
-                                                  </div>
-                                                ) : (
-                                                  <span className="text-gray-800 font-medium text-xs sm:text-sm break-words">{field.name}: <span className="text-gray-600 font-normal">{field.value}</span></span>
-                                                )}
-                                                {isEditMode[item.id] && currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                                  <Button
-                                                    size="sm"
-                                                    variant="ghost"
-                                                    onClick={async () => {
-                                                      const updatedSections = (technicalSections[item.id] || []).map(section =>
-                                                        section.name === selectedSection[item.id]
-                                                          ? { ...section, customFields: section.customFields.filter((_, i) => i !== index) }
-                                                          : section
-                                                      );
-
-                                                      // Update local state
-                                                      setTechnicalSections(prev => ({
-                                                        ...prev,
-                                                        [item.id]: updatedSections
-                                                      }));
-
-                                                      // Save to database
-                                                      try {
-                                                        // // console.log('🗑️ Deleting custom field from database:', item.id, updatedSections);
-                                                        await updateEquipment(item.id, {
-                                                          technical_sections: updatedSections
-                                                        });
-                                                        // // console.log('✅ Custom field deleted successfully');
-                                                        toast({
-                                                          title: "Success",
-                                                          description: "Custom field deleted successfully",
-                                                        });
-                                                      } catch (error) {
-                                                        console.error('Error deleting custom field:', error);
-                                                        toast({
-                                                          title: "Error",
-                                                          description: "Failed to delete custom field",
-                                                          variant: "destructive",
-                                                        });
-                                                      }
-                                                    }}
-                                                    className="text-xs p-1 h-6 w-6 hover:bg-red-50 text-red-500 hover:text-red-700 transition-colors duration-200"
-                                                  >
-                                                    <X className="w-4 h-4" />
-                                                  </Button>
-                                                )}
-                                              </div>
-                                            ))}
-                                          </div>
+                                  ) : (
+                                    <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-md flex items-center justify-center min-h-0">
+                                      <div className="text-center text-gray-500">
+                                        {loading ? (
+                                          <>
+                                            <div className="animate-spin rounded-full h-8 w-8 border-2 border-gray-400 border-t-transparent mx-auto mb-2" />
+                                            <div className="text-sm">Loading image...</div>
+                                          </>
                                         ) : (
-                                          <div className="text-center py-8 text-gray-500 text-sm bg-gray-50 rounded-lg border-2 border-dashed border-gray-300">
-                                            <div className="flex flex-col items-center gap-2">
-                                              <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center">
-                                                <Plus className="w-6 h-6 text-gray-400" />
-                                              </div>
-                                              <p>No technical specifications added yet.</p>
-                                              <p className="text-xs text-gray-400">Click "Add Custom Field" to add specifications.</p>
-                                            </div>
-                                          </div>
-                                        );
-                                      })()}
-
-                                      {/* New section info removed - using new structure */}
-
-                                    </>
-                                  );
-                                })()}
-                              </div>
-                            ) : null;
-                          })()
-                        ) : (
-                          <div className="text-center py-8 text-gray-500 text-sm">
-                            <div className="flex flex-col items-center gap-2">
-                              <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center">
-                                <Plus className="w-6 h-6 text-gray-400" />
-                              </div>
-                              <p>Please add section first</p>
-                              <p className="text-xs text-gray-400">Click "+ Add Section" to create a new technical section.</p>
-                            </div>
-                          </div>
-                        )}
-
-                      </div>
-                    </TabsContent>
-
-                    <TabsContent value="team" className="mt-1 sm:mt-2 space-y-2 flex-1 flex flex-col">
-                      <div className="space-y-2 text-xs sm:text-sm flex-1 flex flex-col">
-                        {editingEquipmentId === item.id && currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && currentUserRole !== 'editor' ? (
-                          // Edit Mode
-                          <div className="space-y-3">
-                            {false && item.customTeamPositions && item.customTeamPositions.length > 0 && (
-                              <div className="space-y-4">
-                                <h4 className="text-sm font-medium text-gray-700">Custom Team Positions</h4>
-                                {item.customTeamPositions.map((pos, index) => (
-                                  <div key={pos.id} className="border border-gray-200 rounded-lg p-3 bg-gray-50">
-                                    <div className="grid grid-cols-2 gap-3">
-                                      <div>
-                                        <Label className="text-xs text-gray-600">Position</Label>
-                                        <Input
-                                          value={pos.position}
-                                          onChange={(e) => {
-                                            const updatedPositions = [...(item.customTeamPositions || [])];
-                                            updatedPositions[index] = { ...updatedPositions[index], position: e.target.value };
-                                            setLocalEquipment(prev => prev.map(eq =>
-                                              eq.id === item.id
-                                                ? { ...eq, customTeamPositions: updatedPositions }
-                                                : eq
-                                            ));
-                                          }}
-                                          className="text-xs h-8"
-                                          placeholder="Position name"
-                                        />
-                                      </div>
-                                      <div>
-                                        <Label className="text-xs text-gray-600">Name</Label>
-                                        <Input
-                                          value={pos.name}
-                                          onChange={(e) => {
-                                            const updatedPositions = [...(item.customTeamPositions || [])];
-                                            updatedPositions[index] = { ...updatedPositions[index], name: e.target.value };
-                                            setLocalEquipment(prev => prev.map(eq =>
-                                              eq.id === item.id
-                                                ? { ...eq, customTeamPositions: updatedPositions }
-                                                : eq
-                                            ));
-                                          }}
-                                          className="text-xs h-8"
-                                          placeholder="Person name"
-                                        />
+                                          <>
+                                            <Camera size={24} className="mx-auto mb-2" />
+                                            <div className="text-sm">No image</div>
+                                          </>
+                                        )}
                                       </div>
                                     </div>
-                                    <div className="grid grid-cols-2 gap-3 mt-2">
-                                      <div>
-                                        <Label className="text-xs text-gray-600">Email</Label>
-                                        <Input
-                                          value={pos.email || ''}
-                                          onChange={(e) => {
-                                            const updatedPositions = [...(item.customTeamPositions || [])];
-                                            updatedPositions[index] = { ...updatedPositions[index], email: e.target.value };
-                                            setLocalEquipment(prev => prev.map(eq =>
-                                              eq.id === item.id
-                                                ? { ...eq, customTeamPositions: updatedPositions }
-                                                : eq
-                                            ));
-                                          }}
-                                          className="text-xs h-8"
-                                          placeholder="Email"
-                                        />
-                                      </div>
-                                      <div>
-                                        <Label className="text-xs text-gray-600">Phone</Label>
-                                        <Input
-                                          value={pos.phone || ''}
-                                          onChange={(e) => {
-                                            const updatedPositions = [...(item.customTeamPositions || [])];
-                                            updatedPositions[index] = { ...updatedPositions[index], phone: e.target.value };
-                                            setLocalEquipment(prev => prev.map(eq =>
-                                              eq.id === item.id
-                                                ? { ...eq, customTeamPositions: updatedPositions }
-                                                : eq
-                                            ));
-                                          }}
-                                          className="text-xs h-8"
-                                          placeholder="Phone"
-                                        />
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-
-                            {/* Add New Team Position */}
-                           
-
-                            {/* Custom Team Positions List */}
-                            {teamPositions[item.id] && teamPositions[item.id].length > 0 && (
-                              <div className="space-y-2">
-                                <div className="text-xs font-medium text-gray-700">Custom Team Positions:</div>
-                                {teamPositions[item.id].map((pos) => (
-                                  <div key={pos.id} className="flex items-center justify-between p-2 bg-green-50 rounded border border-green-200">
-                                    <div className="flex-1">
-                                      <div className="flex items-center gap-2 mb-1">
-                                        <div className="text-xs font-medium text-green-800">{pos.position}</div>
-                                        <Badge variant={pos.role === 'editor' ? 'default' : 'secondary'} className="text-xs">
-                                          {pos.role}
-                                        </Badge>
-                                      </div>
-                                      <div className="text-xs text-green-700">{pos.name}</div>
-                                      {pos.email && (
-                                        <div className="text-xs text-green-600">{pos.email}</div>
-                                      )}
-                                      {pos.phone && (
-                                        <div className="text-xs text-green-600">{pos.phone}</div>
-                                      )}
-                                    </div>
-                                    {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
+                                  )}
+                                  {imageCount > 1 && (
+                                    <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 bg-black/50 rounded-md px-2 py-1">
                                       <Button
-                                        size="sm"
+                                        type="button"
+                                        size="icon"
                                         variant="ghost"
-                                        onClick={() => removeTeamPosition(item.id, pos.id)}
-                                        className="text-red-600 hover:text-red-700 p-1 h-6 w-6"
-                                      >
-                                        <X size={12} />
-                                      </Button>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        ) : (
-                          // View Mode - Show empty (team members will be shown in Team Custom Fields section)
-                          null
-                        )}
-
-                        {/* Team Custom Fields Section */}
-                        <div>
-                          <div className="flex flex-row items-center justify-between gap-2 mb-2">
-                            <div className="text-sm font-semibold text-gray-900">Team Custom Fields</div>
-                            <div className="flex gap-2">
-                              {/* Commented out buttons as requested */}
-                              {/* <Button
-                               size="sm"
-                               variant="outline"
-                               onClick={() => {
-                              setShowAddTeamFieldInputs(prev => ({ ...prev, [item.id]: true }));
-                              setNewTeamFieldName('');
-                              setNewTeamFieldValue('');
-                            }}
-                            className="text-xs px-3 py-1 h-7 bg-blue-600 text-white hover:bg-blue-700"
-                          >
-                            <Plus className="w-3 h-3 mr-1" />
-                            Add Custom Field
-                             </Button>
-                             <Button
-                               size="sm"
-                               variant="outline"
-                               onClick={() => {
-                              setIsEditTeamMode(prev => ({ ...prev, [item.id]: !prev[item.id] }));
-                              setShowAddTeamFieldInputs(prev => ({ ...prev, [item.id]: false }));
-                            }}
-                            className="text-xs px-3 py-1 h-7 bg-green-600 text-white hover:bg-green-700"
-                          >
-                            Edit Custom Field
-                             </Button> */}
-
-                              {/* Manage Team button that redirects to Settings tab */}
-                              {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && currentUserRole !== 'editor' && (
-                                <Button
-                                  size="sm"
-                                  className="bg-blue-600 hover:bg-blue-700 text-xs sm:text-sm h-7 sm:h-6 px-2 sm:px-3 whitespace-nowrap"
-                                  onClick={() => {
-                                  if (projectId === 'standalone') {
-                                    // For standalone equipment, navigate to Settings tab in equipment details view
-                                    markAsSeen(`equipment_${item.id}`);
-                                    markAsSeen(`equipment_${item.id}_team`);
-                                    setViewingEquipmentId(item.id);
-                                    // Use setTimeout to ensure viewingEquipmentId is set first
-                                    setTimeout(() => {
-                                      setEquipmentDetailsTab('settings');
-                                    }, 100);
-                                  } else {
-                                    // For projects, dispatch event to navigate to project Settings tab
-                                    const navigateEvent = new CustomEvent('navigateToTab', {
-                                      detail: { tab: 'settings' }
-                                    });
-                                    window.dispatchEvent(navigateEvent);
-                                  }
-                                  }}
-                                >
-                                  <Plus size={12} className="w-3 h-3 mr-1" />
-                                  Manage Team
-                                </Button>
-                              )}
-                              {/* <Button
-                               size="sm"
-                               variant="outline"
-                               onClick={() => {
-                              setIsEditTeamMode(prev => ({ ...prev, [item.id]: !prev[item.id] }));
-                              setShowAddTeamFieldInputs(prev => ({ ...prev, [item.id]: false }));
-                            }}
-                            className="text-xs px-3 py-1 h-7 bg-green-600 text-white hover:bg-green-700"
-                          >
-                            <Edit className="w-3 h-3 mr-1" />
-                            {isEditTeamMode[item.id] ? 'Done Editing' : 'Edit Custom Field'}
-                             </Button> */}
-                            </div>
-                          </div>
-
-                          {/* Add Field Inputs */}
-                          {showAddTeamFieldInputs[item.id] && (
-                            <div className="space-y-2 p-3 bg-gray-50 rounded-md border mb-3">
-                              <div className="flex gap-2">
-                                <Input
-                                  placeholder="Field name (e.g., Team Lead)"
-                                  value={newTeamFieldName}
-                                  onChange={(e) => setNewTeamFieldName(e.target.value)}
-                                  className="text-xs h-7"
-                                />
-                                <Select
-                                  value={newTeamFieldValue}
-                                  onValueChange={handleAddNewUser}
-                                >
-                                  <SelectTrigger className="text-xs h-7">
-                                    <SelectValue placeholder="Select user" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {allUsers.map((user) => (
-                                      <SelectItem key={user.id} value={user.name || user.email}>
-                                        {user.name || user.email}
-                                      </SelectItem>
-                                    ))}
-                                    <SelectItem value="add_new_user" className="text-blue-600 font-medium">
-                                      + Add New User
-                                    </SelectItem>
-                                  </SelectContent>
-                                </Select>
-                              </div>
-                              <div className="flex gap-2">
-                                <Button
-                                  size="sm"
-                                  onClick={async () => {
-                                    if (newTeamFieldName?.trim()) {
-                                      const newField = { name: newTeamFieldName?.trim(), value: newTeamFieldValue?.trim() };
-
-                                      // Update team custom fields
-                                      const currentTeamFields = (teamCustomFields[item.id] || []);
-                                      const updatedTeamFields = [...currentTeamFields, newField];
-
-                                      // Update local state
-                                      setTeamCustomFields(prev => ({
-                                        ...prev,
-                                        [item.id]: updatedTeamFields
-                                      }));
-
-                                      // Save to database
-                                      try {
-                                        // // console.log('💾 Saving team custom field to database:', item.id, updatedTeamFields);
-                                        await updateEquipment(item.id, {
-                                          team_custom_fields: updatedTeamFields
-                                        });
-                                        // // console.log('✅ Team custom field saved successfully');
-                                        toast({
-                                          title: "Success",
-                                          description: "Team custom field added successfully",
-                                        });
-                                      } catch (error) {
-                                        console.error('Error saving team custom field:', error);
-                                        toast({
-                                          title: "Error",
-                                          description: "Failed to save team custom field",
-                                          variant: "destructive",
-                                        });
-                                      }
-
-                                      setNewTeamFieldName('');
-                                      setNewTeamFieldValue('');
-                                      setShowAddTeamFieldInputs(prev => ({ ...prev, [item.id]: false }));
-                                    }
-                                  }}
-                                  className="text-xs px-3 py-1 h-6 bg-green-600 text-white hover:bg-green-700"
-                                >
-                                  <Check className="w-3 h-3 mr-1" />
-                                  Save
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => {
-                                    setShowAddTeamFieldInputs(prev => ({ ...prev, [item.id]: false }));
-                                    setNewTeamFieldName('');
-                                    setNewTeamFieldValue('');
-                                  }}
-                                  className="text-xs px-3 py-1 h-6"
-                                >
-                                  <X className="w-3 h-3 mr-1" />
-                                  Cancel
-                                </Button>
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Display Team Custom Fields + Project Members */}
-                          {(() => {
-                            const teamFields = teamCustomFields[item.id] || [];
-                            
-                            // // console.log('🔍 Team tab - projectMembers:', projectMembers);
-                            // // console.log('🔍 Team tab - equipment ID:', item.id);
-
-                            // For standalone equipment, get team members from standalone_equipment_team_positions
-                            let assignedMembers: any[] = [];
-                            if (projectId === 'standalone') {
-                              // First try to get from allEquipmentTeamMembers state (for equipment card)
-                              if (allEquipmentTeamMembers[item.id] && allEquipmentTeamMembers[item.id].length > 0) {
-                                assignedMembers = allEquipmentTeamMembers[item.id];
-                              } else {
-                                // Fallback to teamMembers state (for viewed equipment)
-                                assignedMembers = teamMembers.filter(member => 
-                                  member.equipmentAssignments && 
-                                  (member.equipmentAssignments.includes(item.id) || 
-                                   member.equipmentAssignments.includes("All Equipment"))
-                                );
-                                
-                                // OPTIMIZATION: If no team members found, trigger a fetch in background
-                                if (assignedMembers.length === 0) {
-                                  // Fetch team members for this equipment in background
-                                  (async () => {
-                                    try {
-                                      const { DatabaseService } = await import('@/lib/database');
-                                      const teamData = await DatabaseService.getStandaloneTeamPositions(item.id);
-                                      
-                                      if (teamData && teamData.length > 0) {
-                                        const transformedMembers = (teamData as any[]).map((member, index) => ({
-                                          id: member.id || `member-${index}`,
-                                          name: member.person_name || 'Unknown',
-                                          email: member.email || '',
-                                          phone: member.phone || '',
-                                          position: member.position_name || '',
-                                          role: member.role || 'viewer',
-                                          permissions: getPermissionsByRole(member.role || 'viewer'),
-                                          status: 'active',
-                                          avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
-                                          lastActive: 'Unknown',
-                                          equipmentAssignments: [item.id],
-                                          dataAccess: getDataAccessByRole(member.role || 'viewer'),
-                                          accessLevel: member.role || 'viewer'
-                                        }));
-                                        
-                                        setAllEquipmentTeamMembers(prev => ({
-                                          ...prev,
-                                          [item.id]: transformedMembers
-                                        }));
-                                        // console.log('✅ Fetched team members on-demand for equipment card:', item.id);
-                                      }
-                                    } catch (error) {
-                                      console.error('❌ Error fetching team members on-demand (non-fatal):', error);
-                                    }
-                                  })();
-                                }
-                              }
-                            } else {
-                              // For project equipment: merge projectMembers (PM/VDCR with "All Equipment") and equipment_team_positions so both always show
-                              const fromProjectMembers = projectMembers.filter(member => {
-                                return member.equipment_assignments &&
-                                  (member.equipment_assignments.includes(item.id) ||
-                                   member.equipment_assignments.includes("All Equipment"));
-                              });
-                              const fromEquipmentPositions = (allEquipmentTeamMembers[item.id] && allEquipmentTeamMembers[item.id].length > 0)
-                                ? allEquipmentTeamMembers[item.id]
-                                : [];
-                              const seenKey = (m: any) => {
-                                const email = (m.email || '').toString().toLowerCase().trim();
-                                const name = (m.name || m.person_name || '').toString().trim();
-                                const pos = (m.position || m.position_name || '').toString().trim();
-                                return email ? `e:${email}` : `n:${name}|${pos}`;
-                              };
-                              const seen = new Set<string>();
-                              assignedMembers = [];
-                              for (const m of fromProjectMembers) {
-                                const key = seenKey(m);
-                                if (!seen.has(key)) { seen.add(key); assignedMembers.push(m); }
-                              }
-                              for (const m of fromEquipmentPositions) {
-                                const key = seenKey(m);
-                                if (!seen.has(key)) { seen.add(key); assignedMembers.push(m); }
-                              }
-                            }
-                            
-                            // // console.log('🔍 Team tab - assignedMembers:', assignedMembers);
-
-                            // Create combined list of custom fields and project members
-                            const allTeamItems = [
-                              // Add project members as team items
-                              // 🆕 For standalone equipment, show Name - Position format
-                              ...assignedMembers.map(member => ({
-                                id: `member-${member.id}`,
-                                name: projectId === 'standalone' 
-                                  ? `${member.name} - ${member.position || member.position_name || 'Team Member'}` // Show "Name - Position" for standalone
-                                  : `${member.name || member.person_name || 'Unknown'} - ${member.position || member.position_name || 'Team Member'}`, // For projects: "Name - Position" from equipment_team_positions
-                                value: projectId === 'standalone' 
-                                  ? (member.position || member.position_name || 'Team Member')
-                                  : (member.name || member.person_name || 'Unknown'),
-                                isProjectMember: true,
-                                memberData: member
-                              })),
-                              // Add custom fields
-                              ...teamFields.map((field, index) => ({
-                                id: `custom-${index}`,
-                                name: field.name,
-                                value: field.value,
-                                isProjectMember: false,
-                                fieldIndex: index
-                              }))
-                            ];
-
-                            return allTeamItems.length > 0 ? (
-                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[200px] sm:max-h-64 overflow-y-auto pr-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-                                {allTeamItems.map((teamItem, index) => (
-                                  <div key={teamItem.id} className="flex items-center justify-between px-4 py-3 bg-white border border-gray-300 rounded-lg shadow-sm hover:shadow-md transition-shadow duration-200">
-                                    {isEditTeamMode[item.id] && !teamItem.isProjectMember ? (
-                                      <div className="flex-1 flex gap-2">
-                                        <Input
-                                          value={teamItem.name}
-                                          onChange={async (e) => {
-                                            const updatedFields = [...teamFields];
-                                            updatedFields[(teamItem as any).fieldIndex] = { ...updatedFields[(teamItem as any).fieldIndex], name: e.target.value };
-
-                                            setTeamCustomFields(prev => ({
-                                              ...prev,
-                                              [item.id]: updatedFields
-                                            }));
-
-                                            // Save to database immediately
-                                            try {
-                                              await updateEquipment(item.id, {
-                                                team_custom_fields: updatedFields
-                                              });
-                                              await refreshEquipmentData();
-                                            } catch (error) {
-                                              console.error('Error saving team field name change:', error);
-                                            }
-                                          }}
-                                          className="text-xs h-7"
-                                        />
-                                        <Select
-                                          value={teamItem.value}
-                                          onValueChange={(value) => handleEditAddNewUser(value, (teamItem as any).fieldIndex, teamFields)}
-                                        >
-                                          <SelectTrigger className="text-xs h-7">
-                                            <SelectValue />
-                                          </SelectTrigger>
-                                          <SelectContent>
-                                            {allUsers.map((user) => (
-                                              <SelectItem key={user.id} value={user.name || user.email}>
-                                                {user.name || user.email}
-                                              </SelectItem>
-                                            ))}
-                                            <SelectItem value="add_new_user" className="text-blue-600 font-medium">
-                                              + Add New User
-                                            </SelectItem>
-                                          </SelectContent>
-                                        </Select>
-                                      </div>
-                                    ) : (
-                                      <span className="text-gray-800 font-medium text-xs sm:text-sm break-words">
-                                        {teamItem.isProjectMember 
-                                          ? (projectId === 'standalone' 
-                                              ? teamItem.name // For standalone: name already contains "Name - Position" format
-                                              : `${(teamItem as any).memberData?.position || (teamItem as any).memberData?.position_name || 'Team Member'}: ${(teamItem as any).memberData?.name || (teamItem as any).memberData?.person_name || 'Unknown'}` // For projects: show only "Position: Name"
-                                            )
-                                          : `${teamItem.name}: ${teamItem.value}` // For custom fields, show "name: value"
-                                        }
-                                      </span>
-                                    )}
-                                    {!teamItem.isProjectMember && (
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        onClick={async () => {
-                                          const updatedFields = teamFields.filter((_, i) => i !== (teamItem as any).fieldIndex);
-
-                                          // Update local state
-                                          setTeamCustomFields(prev => ({
-                                            ...prev,
-                                            [item.id]: updatedFields
-                                          }));
-
-                                          // Save to database
-                                          try {
-                                            // // console.log('🗑️ Deleting team custom field from database:', item.id, updatedFields);
-                                            await updateEquipment(item.id, {
-                                              team_custom_fields: updatedFields
-                                            });
-                                            // // console.log('✅ Team custom field deleted successfully');
-                                            toast({
-                                              title: "Success",
-                                              description: "Team custom field deleted successfully",
-                                            });
-                                          } catch (error) {
-                                            console.error('Error deleting team custom field:', error);
-                                            toast({
-                                              title: "Error",
-                                              description: "Failed to delete team custom field",
-                                              variant: "destructive",
-                                            });
-                                          }
+                                        className="h-7 w-7 text-white hover:bg-white/20"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          const prevIndex = currentIndex > 0 ? currentIndex - 1 : imageCount - 1;
+                                          setProgressSectionImageIndex(prev => ({ ...prev, [item.id]: prevIndex }));
                                         }}
-                                        className="text-xs p-1 h-6 w-6 hover:bg-red-50 text-red-500 hover:text-red-700 transition-colors duration-200"
                                       >
-                                        <X className="w-4 h-4" />
+                                        <ChevronLeft className="w-3.5 h-3.5" />
                                       </Button>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            ) : (
-                              <div className="text-center py-8 text-gray-500 text-sm bg-gray-50 rounded-lg border-2 border-dashed border-gray-300">
-                                <div className="flex flex-col items-center gap-2">
-                                  <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center">
-                                    <Plus className="w-6 h-6 text-gray-400" />
-                                  </div>
-                                  <p>No team members or custom fields added yet.</p>
-                                  <p className="text-xs text-gray-400">Add team members from Settings tab or click "Add Custom Field" to add fields.</p>
+                                      <span className="text-xs text-white tabular-nums px-1">{currentIndex + 1} / {imageCount}</span>
+                                      <Button
+                                        type="button"
+                                        size="icon"
+                                        variant="ghost"
+                                        className="h-7 w-7 text-white hover:bg-white/20"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          const nextIndex = currentIndex < imageCount - 1 ? currentIndex + 1 : 0;
+                                          setProgressSectionImageIndex(prev => ({ ...prev, [item.id]: nextIndex }));
+                                        }}
+                                      >
+                                        <ChevronRight className="w-3.5 h-3.5" />
+                                      </Button>
+                                    </div>
+                                  )}
                                 </div>
                               </div>
                             );
-                          })()}
-                        </div>
-                      </div>
-                    </TabsContent>
-
-                    <TabsContent value="progress" className="mt-1 sm:mt-2 space-y-2 flex-1 flex flex-col">
-                      <div className="space-y-2 text-xs sm:text-sm flex-1 flex flex-col">
-                        {(editingEquipmentId === item.id || addingProgressEntryForEquipment === item.id || editingProgressEntryForEquipment === item.id) ? (
-                          // Edit Mode - Add/Edit Progress Entries
-                          <div className="space-y-3">
-                            {/* Header */}
-                            <div className="flex items-center justify-between">
-                              <h4 className="text-sm font-medium text-gray-700">
-                                {editingProgressEntryId ? 'Edit Progress Entry' : 'Add Progress Entry'}
-                              </h4>
-                              {(editingProgressEntryId || addingProgressEntryForEquipment === item.id || editingProgressEntryForEquipment === item.id) && (
-                                <button
-                                  onClick={() => {
-                                    setEditingProgressEntryId(null);
-                                    setAddingProgressEntryForEquipment(null);
-                                    setEditingProgressEntryForEquipment(null);
-                                    setNewProgressType('general');
-                                    setNewProgressEntry('');
-                                    setNewProgressImage(null);
-                                    setImageDescription('');
-                                    setIsAddingCustomProgressType(false);
-                                    setCustomProgressTypeName('');
-                                    // Reset audio recording state
-                                    setAudioChunks([]);
-                                    setRecordingDuration(0);
-                                    setIsRecording(false);
-                                  }}
-                                  className="text-xs text-gray-500 hover:text-gray-700"
-                                >
-                                  {editingProgressEntryId ? 'Cancel Edit' : 'Cancel Add'}
-                                </button>
-                              )}
-                            </div>
-
-                            {/* 3 Inputs in a Row */}
-                            <div className="grid grid-cols-3 gap-3">
-                              <div>
-                                <Label className="text-xs text-gray-600">Progress Type</Label>
-                                <Select
-                                  value={newProgressType}
-                                  onValueChange={(value) => {
-                                    if (value === 'add-custom') {
-                                      setIsAddingCustomProgressType(true);
-                                      setNewProgressType('general'); // Temporary default
-                                    } else {
-                                      setIsAddingCustomProgressType(false);
-                                      setCustomProgressTypeName('');
-                                      setNewProgressType(value);
-                                    }
-                                  }}
-                                >
-                                  <SelectTrigger className="text-xs h-8">
-                                    <SelectValue placeholder="Select type" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    <SelectItem value="welding">Welding</SelectItem>
-                                    <SelectItem value="material">Material</SelectItem>
-                                    <SelectItem value="inspection">Inspection</SelectItem>
-                                    <SelectItem value="assembly">Assembly</SelectItem>
-                                    <SelectItem value="testing">Testing</SelectItem>
-                                    <SelectItem value="general">General</SelectItem>
-                                    <SelectItem value="comment">Comment</SelectItem>
-                                    <SelectItem value="image">Image</SelectItem>
-                                    {customProgressTypes.map((customType) => (
-                                      <SelectItem key={customType} value={customType}>
-                                        {customType}
-                                      </SelectItem>
-                                    ))}
-                                    <SelectItem value="add-custom">+ Add Custom</SelectItem>
-                                  </SelectContent>
-                                </Select>
-                              </div>
-                              
-                              {/* Custom Progress Type Input - Spans 2 columns */}
-                              {isAddingCustomProgressType && (
-                                <div className="col-span-2 mt-2 flex items-center space-x-2">
-                                  <Input
-                                    type="text"
-                                    placeholder="Enter custom type name"
-                                    value={customProgressTypeName}
-                                    onChange={(e) => setCustomProgressTypeName(e.target.value)}
-                                    onKeyPress={(e) => {
-                                      if (e.key === 'Enter' && customProgressTypeName.trim()) {
-                                        const trimmedName = customProgressTypeName.trim();
-                                        setNewProgressType(trimmedName);
-                                        setCustomProgressTypes(prev => {
-                                          if (!prev.includes(trimmedName)) {
-                                            return [...prev, trimmedName];
-                                          }
-                                          return prev;
-                                        });
-                                        setIsAddingCustomProgressType(false);
-                                        setCustomProgressTypeName('');
-                                      }
+                          }
+                          if (item.progressImages && item.progressImages.length > 0) {
+                            const rawLatest = item.progressImages[0];
+                            const isPlaceholderOrEmpty = !rawLatest || rawLatest === PROGRESS_IMAGE_PLACEHOLDER || (rawLatest.startsWith('data:image/svg') && rawLatest.length < 200);
+                            const latestImage = isPlaceholderOrEmpty ? null : rawLatest;
+                            if (!latestImage) {
+                              const isOnDemandLoading = item.progressImagesMetadata?.length && !item.progressImages?.[0] && !isPlaceholderOrEmpty;
+                              if (isOnDemandLoading) {
+                                return (
+                                  <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-md flex items-center justify-center min-h-0">
+                                    <div className="text-center text-gray-500">
+                                      <div className="animate-spin rounded-full h-8 w-8 border-2 border-gray-400 border-t-transparent mx-auto mb-2" />
+                                      <div className="text-sm">Loading image...</div>
+                                    </div>
+                                  </div>
+                                );
+                              }
+                              return (
+                                <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-md flex items-center justify-center min-h-0">
+                                  <div className="text-center text-gray-500">
+                                    <Camera size={24} className="mx-auto mb-2" />
+                                    <div className="text-sm">{isPlaceholderOrEmpty ? 'No progress image' : 'Image not found'}</div>
+                                  </div>
+                                </div>
+                              );
+                            }
+                            return (
+                              <div className="space-y-2 rounded-md border border-indigo-100 border-t bg-white">
+                                <div className="relative">
+                                  <div
+                                    className="relative cursor-pointer group"
+                                    onClick={() => {
+                                      setShowImagePreview({ url: latestImage, equipmentId: item.id, currentIndex: 0 });
                                     }}
-                                    className="flex-grow text-xs h-8"
-                                  />
-                                  {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                    <>
-                                      <Button
-                                        size="sm"
-                                        onClick={() => {
-                                          if (customProgressTypeName.trim()) {
-                                            const trimmedName = customProgressTypeName.trim();
-                                            setNewProgressType(trimmedName);
-                                            setCustomProgressTypes(prev => {
-                                              if (!prev.includes(trimmedName)) {
-                                                return [...prev, trimmedName];
-                                              }
-                                              return prev;
-                                            });
-                                            setIsAddingCustomProgressType(false);
-                                            setCustomProgressTypeName('');
-                                          }
-                                        }}
-                                        disabled={!customProgressTypeName.trim()}
-                                        className="text-xs h-8 px-2"
-                                      >
-                                        Add
-                                      </Button>
-                                      <Button
-                                        size="sm"
-                                        variant="outline"
-                                        onClick={() => {
-                                          setIsAddingCustomProgressType(false);
-                                          setCustomProgressTypeName('');
-                                          setNewProgressType('general');
-                                        }}
-                                        className="text-xs h-8 px-2"
-                                      >
-                                        Cancel
-                                      </Button>
-                                    </>
-                                  )}
-                                </div>
-                              )}
-                              <div>
-                                <Label className="text-xs text-gray-600">Comment</Label>
-                                <Input
-                                  placeholder="Enter progress details"
-                                  value={newProgressEntry}
-                                  onChange={(e) => setNewProgressEntry(e.target.value)}
-                                  className="text-xs h-8"
-                                />
-                              </div>
-
-                              {/* Audio Recording Section */}
-                              {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                <div>
-                                  <Label className="text-xs text-gray-600">Voice Message</Label>
-                                  <div className="flex items-center gap-2 mt-1">
-                                    {!isRecording ? (
-                                      <button
-                                        onClick={startAudioRecording}
-                                        className="flex items-center gap-2 px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded-md border border-blue-200 text-xs font-medium transition-colors"
-                                        title="Start voice recording"
-                                      >
-                                        <Mic className="w-4 h-4" />
-                                        Record Voice
-                                      </button>
-                                    ) : (
-                                      <div className="flex items-center gap-2">
-                                        <button
-                                          onClick={stopAudioRecording}
-                                          className="flex items-center gap-2 px-3 py-2 bg-red-500 hover:bg-red-600 text-white rounded-md text-xs font-medium transition-colors"
-                                          title="Stop recording"
-                                        >
-                                          <MicOff className="w-4 h-4" />
-                                          Stop Recording
-                                        </button>
-                                        <div className="flex items-center gap-2 px-2 py-1 bg-red-50 rounded-md border border-red-200">
-                                          <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
-                                          <span className="text-xs text-red-600 font-medium">
-                                            {formatDuration(recordingDuration)}
-                                          </span>
-                                        </div>
-                                      </div>
-                                    )}
-                                    {audioChunks.length > 0 && (
-                                      <div className="flex items-center gap-2 px-2 py-1 bg-green-50 rounded-md border border-green-200">
-                                        <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-                                        <span className="text-xs text-green-600 font-medium">
-                                          Voice recorded ({formatDuration(recordingDuration)})
-                                        </span>
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              )}
-                              <div className="col-span-3">
-                                <Label className="text-xs text-gray-600">Image</Label>
-                                {editingProgressEntryId && typeof newProgressImage === 'string' && newProgressImage && (
-                                  <div className="relative mt-1 mb-2">
+                                  >
                                     <img
-                                      src={newProgressImage}
-                                      alt="Existing progress image"
-                                      className="w-24 h-24 object-cover rounded-lg border border-gray-200"
+                                      src={latestImage}
+                                      alt="Progress"
+                                      className="w-full max-w-full h-40 sm:h-52 md:h-64 object-cover rounded-md border border-gray-200 pointer-events-none"
                                     />
-                                    {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                      <button
-                                        onClick={() => setNewProgressImage(null)}
-                                        className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-xs"
-                                        title="Remove image"
-                                      >
-                                        <X className="w-3 h-3" />
-                                      </button>
-                                    )}
-                                    <p className="text-xs text-gray-500 mt-1">Current image (click below to replace)</p>
+                                    <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-20 transition-all rounded-md flex items-center justify-center pointer-events-none">
+                                      <Eye size={24} className="text-white opacity-0 group-hover:opacity-100 transition-opacity" />
+                                    </div>
                                   </div>
-                                )}
-                                <div className="mt-1 flex flex-row items-center gap-2" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
-                                  {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' ? (
-                                    <>
-                                      <input
-                                        ref={el => { entryImgCameraRefs.current[item.id] = el; }}
-                                        type="file"
-                                        accept="image/*"
-                                        capture="environment"
-                                        onChange={(e) => {
-                                          const file = e.target.files?.[0];
-                                          if (file) setNewProgressImage(file);
-                                          e.target.value = '';
-                                        }}
-                                        className="hidden"
-                                        id={`entry-img-camera-${item.id}`}
-                                      />
-                                      <input
-                                        ref={el => { entryImgGalleryRefs.current[item.id] = el; }}
-                                        type="file"
-                                        accept="image/*"
-                                        onChange={(e) => {
-                                          const file = e.target.files?.[0];
-                                          if (file) setNewProgressImage(file);
-                                          e.target.value = '';
-                                        }}
-                                        className="hidden"
-                                        id={`entry-img-gallery-${item.id}`}
-                                      />
-                                      <label
-                                        htmlFor={`entry-img-gallery-${item.id}`}
-                                        className="cursor-pointer inline-block rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
-                                        onClick={e => e.stopPropagation()}
-                                      >
-                                        Choose File
-                                      </label>
-                                      <span className="text-sm text-gray-500">
-                                        {newProgressImage && typeof newProgressImage !== 'string' ? newProgressImage.name : 'No file chosen'}
-                                      </span>
-                                    </>
-                                  ) : (
-                                    <span className="text-xs text-gray-500 italic">Image upload not available</span>
-                                  )}
                                 </div>
                               </div>
-                            </div>
-
-                            {/* Image Description */}
-                            {(newProgressImage || imageDescription) && (
-                              <div>
-                                <Label className="text-xs text-gray-600">Image Description</Label>
-                                <Input
-                                  placeholder="Describe the image (optional)"
-                                  value={imageDescription}
-                                  onChange={(e) => setImageDescription(e.target.value)}
-                                  className="text-xs h-8"
-                                />
+                            );
+                          }
+                          return (
+                            <div className="w-full h-40 sm:h-52 md:h-64 bg-gray-100 border-2 border-dashed border-gray-300 rounded-md border border-indigo-100 flex items-center justify-center min-h-0">
+                              <div className="text-center text-gray-500">
+                                <Camera size={24} className="mx-auto mb-2" />
+                                <div className="text-sm">No progress image</div>
                               </div>
-                            )}
-
-                            {/* Action Buttons */}
-                            {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                              <div className="flex gap-2">
-                                <Button
-                                  type="button"
-                                  size="sm"
-                                  onClick={() => addProgressEntry(item.id)}
-                                  disabled={!newProgressEntry?.trim()}
-                                  className="flex-1 bg-blue-600 hover:bg-blue-700 text-xs"
-                                >
-                                  {editingProgressEntryId ? (
-                                    <>
-                                      <Check size={14} className="mr-2" />
-                                      Update
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Plus size={14} className="mr-2" />
-                                      Add
-                                    </>
-                                  )}
-                                </Button>
-                                <Button
-                                  type="button"
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => {
-                                    setNewProgressType('general');
-                                    setNewProgressEntry('');
-                                    setNewProgressImage(null);
-                                    setImageDescription('');
-                                    setEditingProgressEntryId(null);
-                                    setIsAddingCustomProgressType(false);
-                                    setCustomProgressTypeName('');
-                                    // Reset audio recording state
-                                    setAudioChunks([]);
-                                    setRecordingDuration(0);
-                                    setIsRecording(false);
-                                    // Reset image audio recording state
-                                    setImageAudioChunks([]);
-                                    setImageRecordingDuration(0);
-                                    setIsImageRecording(false);
-                                  }}
-                                  className="flex-1 bg-white hover:bg-gray-50 border-gray-300 text-gray-700 text-xs"
-                                >
-                                  <X size={14} className="mr-2" />
-                                  Cancel
-                                </Button>
-                              </div>
-                            )}
-                          </div>
-                        ) : (
-                          // View Mode - Show Progress Entries
-                          <>
-                            {/* Progress Entries List */}
-                            <div className="flex flex-row items-center justify-between gap-2 mb-2">
-                              <div className="text-sm font-semibold text-gray-900">Progress Entries</div>
-                              {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                <Button
-                                  size="sm"
-                                  onClick={() => {
-                                    // // console.log('➕ Add Entry button clicked for equipment:', item.id);
-                                    setAddingProgressEntryForEquipment(item.id);
-                                    setNewProgressType('general');
-                                    setNewProgressEntry('');
-                                    setNewProgressImage(null);
-                                    setImageDescription('');
-                                    setEditingProgressEntryId(null);
-                                    setIsAddingCustomProgressType(false);
-                                    setCustomProgressTypeName('');
-                                    // Reset audio recording state
-                                    setAudioChunks([]);
-                                    setRecordingDuration(0);
-                                    setIsRecording(false);
-                                    // Reset image audio recording state
-                                    setImageAudioChunks([]);
-                                    setImageRecordingDuration(0);
-                                    setIsImageRecording(false);
-                                    // // console.log('🔄 Form reset for new entry');
-                                  }}
-                                  className="bg-blue-600 hover:bg-blue-700 text-xs sm:text-sm h-7 sm:h-6 px-2 sm:px-3 whitespace-nowrap"
-                                >
-                                  <Plus size={12} className="w-3 h-3 mr-1" />
-                                  Add Entry
-                                </Button>
-                              )}
                             </div>
-                            <div className="space-y-3 max-h-[280px] sm:max-h-80 overflow-y-auto pr-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-                                {/* New Consolidated Progress Entries */}
-                                {item.progressEntries && item.progressEntries.length > 0 ? (
-                                  item.progressEntries.map((entry, index) => (
-                                    <div key={entry.id} className="bg-white rounded-lg border border-gray-200 hover:border-gray-300 hover:shadow-sm transition-all p-3 sm:p-4">
-                                      {/* Header: Type Badge */}
-                                      <div className="flex items-start justify-between gap-2 sm:gap-3 mb-2 sm:mb-3">
-                                        <span className="inline-flex items-center gap-1.5 px-2 sm:px-3 py-0.5 sm:py-1 text-[10px] sm:text-xs font-semibold rounded-full border bg-blue-100 text-blue-800 border-blue-200">
-                                          {(entry as any).entry_type || entry.type || 'General'}
-                                        </span>
-                                        
-                                        {/* Right Side: Image + Action Buttons - image loaded on click (metadata first) */}
-                                        <div className="flex items-center gap-1.5 sm:gap-2">
-                                          {/* Image Preview - show placeholder until user clicks to load */}
-                                          <div 
-                                            className={`relative group w-10 h-10 sm:w-12 sm:h-12 flex-shrink-0 rounded-lg border border-gray-200 ${(entry.image || (entry as any).image_url || progressEntryImageUrls[entry.id]) ? 'cursor-pointer' : 'cursor-pointer bg-gray-50 hover:bg-gray-100'}`}
-                                            onClick={async () => {
-                                              const url = entry.image || (entry as any).image_url || progressEntryImageUrls[entry.id];
-                                              if (url) {
-                                                let userName = (entry as any).users?.full_name || (entry as any).uploadedBy;
-                                                if (!userName) userName = (user as any)?.full_name;
-                                                if (!userName) {
-                                                  try {
-                                                    const userData = JSON.parse(localStorage.getItem('userData') || '{}');
-                                                    userName = userData?.full_name || userData?.name;
-                                                  } catch (_) {}
-                                                }
-                                                if (!userName) userName = localStorage.getItem('userName');
-                                                if (!userName) userName = user?.email || 'Unknown User';
-                                                setShowProgressImageModal({
-                                                  url,
-                                                  description: entry.imageDescription || (entry as any).image_description,
-                                                  uploadedBy: userName,
-                                                  uploadDate: entry.uploadDate || (entry as any).created_at
-                                                });
-                                                return;
-                                              }
-                                              setProgressEntryImageLoading(prev => ({ ...prev, [entry.id]: true }));
-                                              const loadedUrl = await fastAPI.getProgressEntryImageUrl(entry.id, projectId === 'standalone');
-                                              setProgressEntryImageLoading(prev => ({ ...prev, [entry.id]: false }));
-                                              if (loadedUrl) {
-                                                setProgressEntryImageUrls(prev => ({ ...prev, [entry.id]: loadedUrl }));
-                                                let userName = (entry as any).users?.full_name || (entry as any).uploadedBy;
-                                                if (!userName) userName = (user as any)?.full_name;
-                                                if (!userName) {
-                                                  try {
-                                                    const userData = JSON.parse(localStorage.getItem('userData') || '{}');
-                                                    userName = userData?.full_name || userData?.name;
-                                                  } catch (_) {}
-                                                }
-                                                if (!userName) userName = user?.email || 'Unknown User';
-                                                setShowProgressImageModal({
-                                                  url: loadedUrl,
-                                                  description: entry.imageDescription || (entry as any).image_description,
-                                                  uploadedBy: userName,
-                                                  uploadDate: entry.uploadDate || (entry as any).created_at
-                                                });
-                                              }
-                                            }}
-                                            title={(entry.image || (entry as any).image_url || progressEntryImageUrls[entry.id]) ? 'Click to view larger image' : 'Click to load image'}
-                                          >
-                                            {(entry.image || (entry as any).image_url || progressEntryImageUrls[entry.id]) ? (
-                                              <>
-                                                <img
-                                                  src={entry.image || (entry as any).image_url || progressEntryImageUrls[entry.id]}
-                                                  alt={`Progress ${index + 1}`}
-                                                  className="w-10 h-10 sm:w-12 sm:h-12 object-cover rounded-lg border-0 shadow-sm transition-all hover:shadow-md hover:border-blue-300"
-                                                />
-                                                <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-0 group-hover:bg-opacity-30 rounded-lg transition-all opacity-0 group-hover:opacity-100 pointer-events-none">
-                                                  <Eye className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white" />
-                                                </div>
-                                              </>
-                                            ) : progressEntryImageLoading[entry.id] ? (
-                                              <div className="w-full h-full flex items-center justify-center rounded-lg bg-gray-100">
-                                                <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
-                                              </div>
-                                            ) : (
-                                              <div className="w-full h-full flex items-center justify-center rounded-lg text-gray-400">
-                                                <Eye className="w-4 h-4" />
-                                              </div>
-                                            )}
-                                          </div>
-                                          
-                                          {/* Action Buttons */}
-                                          {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                            <div className="flex items-center gap-0.5 sm:gap-1">
-                                              <button
-                                                onClick={() => editProgressEntry(item.id, entry.id)}
-                                                className="p-1 sm:p-1.5 hover:bg-blue-50 rounded-md text-blue-600 transition-colors"
-                                                title="Edit entry"
-                                              >
-                                                <Edit className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-                                              </button>
-                                              <button
-                                                onClick={() => {
-                                                  if (confirm('Are you sure you want to delete this progress entry?')) {
-                                                    deleteProgressEntry(item.id, entry.id);
-                                                  }
-                                                }}
-                                                className="p-1 sm:p-1.5 hover:bg-red-50 rounded-md text-red-600 transition-colors"
-                                                title="Delete entry"
-                                              >
-                                                <X className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-                                              </button>
-                                            </div>
-                                          )}
-                                        </div>
-                                      </div>
-
-                                      {/* Description */}
-                                      <div className="mb-2 sm:mb-3">
-                                        <p className="text-xs sm:text-sm text-gray-800 leading-relaxed break-words whitespace-pre-line">
-                                          {entry.comment || (entry as any).entry_text || 'No comment'}
-                                        </p>
-                                      </div>
-
-                                      {/* Audio Section - Only if audio exists */}
-                                      {(entry.audio || (entry as any).audio_data) && (
-                                        <div className="mb-2 sm:mb-3 pb-2 sm:pb-3 border-b border-gray-100">
-                                          <div className="flex items-center gap-2 bg-green-50 px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg border border-green-200 w-fit">
-                                            <button
-                                              onClick={() => playAudio(entry.audio || (entry as any).audio_data, entry.id)}
-                                              className="flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 bg-green-500 hover:bg-green-600 rounded-full text-white transition-all hover:shadow-md"
-                                              title={playingAudioId === entry.id ? "Pause audio" : "Play audio"}
-                                            >
-                                              {playingAudioId === entry.id ? (
-                                                <Pause className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-                                              ) : (
-                                                <Play className="w-3.5 h-3.5 sm:w-4 sm:h-4 ml-0.5" />
-                                              )}
-                                            </button>
-                                            <div className="flex flex-col">
-                                              <span className="text-[10px] sm:text-xs font-semibold text-green-800">
-                                                Voice
-                                              </span>
-                                              <span className="text-[10px] sm:text-xs text-green-600">
-                                                {(entry.audioDuration || (entry as any).audio_duration) ? formatDuration(entry.audioDuration || (entry as any).audio_duration) : '0:00'}
-                                              </span>
-                                            </div>
-                                          </div>
-                                        </div>
-                                      )}
-
-                                      {/* Footer: Metadata */}
-                                      <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 pt-2 border-t border-gray-100 text-[10px] sm:text-xs text-gray-500">
-                                        <div className="flex items-center gap-1 sm:gap-1.5">
-                                          <User className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
-                                          <span className="text-blue-600 font-medium truncate">
-                                            {(() => {
-                                              // Get user name from the entry's creator - priority: users (joined) > created_by_user > uploadedBy
-                                              // DO NOT fall back to current user - always show the actual creator
-                                              let userName = (entry as any).users?.full_name || 
-                                                           (entry as any).created_by_user?.full_name || 
-                                                           (entry as any).uploadedBy;
-                                              
-                                              // If still no name, try to fetch it (but don't use current user as fallback)
-                                              if (!userName && (entry as any).created_by) {
-                                                // Could fetch user data here, but for now show "Unknown User"
-                                                userName = 'Unknown User';
-                                              }
-                                              
-                                              // Last resort: show "Unknown User" instead of current user's name
-                                              return userName || 'Unknown User';
-                                            })()}
-                                          </span>
-                                        </div>
-                                        <div className="flex items-center gap-1 sm:gap-1.5">
-                                          <Clock className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
-                                          <span>
-                                            {(() => {
-                                              const dateValue = entry.uploadDate || (entry as any).created_at;
-                                              if (!dateValue) return 'Unknown date';
-                                              try {
-                                                const date = new Date(dateValue);
-                                                return date.toLocaleDateString('en-US', { 
-                                                  month: 'short', 
-                                                  day: 'numeric', 
-                                                  year: 'numeric' 
-                                                });
-                                              } catch (error) {
-                                                return 'Invalid date';
-                                              }
-                                            })()}
-                                          </span>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  ))
+                          );
+                        })()}
+                        </div>
+                        {/* Progress bar & caption below image (direction for image) */}
+                        <div className="mt-2 pt-2 border-t border-indigo-100/80">
+                              <div className="text-[9px] sm:text-[10px] text-gray-500 font-medium mb-1">Overall progress</div>
+                              <div className="mt-1">
+                                <div className="h-2.5 w-full rounded-full overflow-hidden bg-gray-200">
+                                  <div className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-emerald-500 transition-all duration-300" style={{ width: `${displayProgress}%` }} />
+                      </div>
+                  </div>
+                              <div className="mt-2 pt-2 border-t border-indigo-100/50">
+                                <div className="text-[9px] sm:text-[10px] text-gray-500 font-medium mb-1">Recently completed</div>
+                              <div className="flex items-center justify-between gap-2 mt-0.5">
+                                {lastCompleted?.activity_name && lastCompleted?.completion?.completed_on ? (
+                                  <p className="text-[9px] sm:text-[10px] text-gray-500 min-w-0 flex-1">
+                                    {lastCompleted.activity_name}, completed on {formatDateOnly(lastCompleted.completion.completed_on)}
+                                  </p>
                                 ) : (
-                                  <div className="flex flex-col items-center justify-center p-8 bg-gradient-to-br from-gray-50 to-gray-100 rounded-xl border-2 border-dashed border-gray-300">
-                                    <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center mb-3">
-                                      <FileText className="w-6 h-6 text-gray-400" />
-                                    </div>
-                                    <span className="text-sm text-gray-500 font-medium">No progress entries yet</span>
-                                    <span className="text-xs text-gray-400 mt-1">Add your first entry to get started</span>
-                                  </div>
+                                  <span className="flex-1" />
                                 )}
-                              </div>
-                          </>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    className={`flex-shrink-0 h-7 px-3 text-[10px] sm:text-xs font-semibold text-white border-0 transform -translate-y-0.5 ${
+                                      (equipmentActivities[item.id] && equipmentActivities[item.id].length)
+                                        ? 'bg-blue-600 hover:bg-blue-700'
+                                        : 'bg-emerald-600 hover:bg-emerald-700'
+                                    }`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setQapPopupEquipmentId(item.id);
+                                    }}
+                                  >
+                                    {(equipmentActivities[item.id] && equipmentActivities[item.id].length)
+                                      ? 'Track QAP Status'
+                                      : 'Start QAP Tracking'}
+                                  </Button>
+                          </div>
+                        </div>
+                                          </div>
+                                      </div>
+                                  );
+                                })()}
+                          </div>
                         )}
                       </div>
-                    </TabsContent>
 
-                    <TabsContent value="documents" className="mt-1 sm:mt-2 space-y-2 flex-1 flex flex-col">
+
+
+
+
+                  <div className="mt-1 sm:mt-2 space-y-2 flex-1 flex flex-col">
                       <div className="space-y-2 text-xs sm:text-sm flex-1 flex flex-col">
                         {editingEquipmentId === item.id ? (
-                          // Edit Mode - Upload Documents
+                          // Edit Mode - Upload Documents (click or drag & drop)
                           <div className="space-y-3">
-                            <div className="border-2 border-dashed border-gray-300 rounded-lg bg-gray-50 p-6 text-center" onClick={e => e.stopPropagation()}>
+                            <div
+                              className="border-2 border-dashed border-gray-300 rounded-lg bg-gray-50 p-6 text-center"
+                              onClick={e => e.stopPropagation()}
+                              onDragOver={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onDrop={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const files = Array.from(e.dataTransfer.files || []);
+                                if (files.length > 0) handleDocumentUpload(item.id, files);
+                              }}
+                            >
                               <input
                                 type="file"
                                 accept="image/*"
@@ -11213,7 +10210,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                 onClick={e => e.stopPropagation()}
                               >
                                 <FileText size={28} className="mx-auto text-gray-400" strokeWidth={1.5} />
-                                <div className="text-sm font-medium text-gray-600">Click to upload documents</div>
+                                <div className="text-sm font-medium text-gray-600">Click or drag to upload documents</div>
                                 <div className="text-xs text-gray-500">PDF, DOC, XLS, DWG, Images supported</div>
                               </label>
                             </div>
@@ -11231,7 +10228,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                             )}
 
                             {/* Existing Equipment Documents Display */}
-                            {documents[item.id] && documents[item.id]
+                            {documents[item.id] && filterDocsByUserDepartmentAccess(documents[item.id] || [])
                               .filter((doc) => {
                                 // Filter out Core Documents - they should only appear in Details tab
                                 const coreDocumentTypes = ['Unpriced PO File', 'Design Inputs PID', 'Client Reference Doc', 'Other Documents'];
@@ -11241,7 +10238,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                               <div className="mt-2 p-3 bg-green-50 border border-green-200 border-t-2 border-t-green-300 rounded-md">
                                 <p className="text-sm font-medium text-green-800 mb-2">Existing Equipment Documents:</p>
                                 <div className="space-y-1">
-                                  {documents[item.id]
+                                  {filterDocsByUserDepartmentAccess(documents[item.id] || [])
                                     .filter((doc) => {
                                       // Filter out Core Documents - they should only appear in Details tab
                                       const coreDocumentTypes = ['Unpriced PO File', 'Design Inputs PID', 'Client Reference Doc', 'Other Documents'];
@@ -11322,188 +10319,378 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         ) : (
                           // View Mode - Show Documents
                           <>
-                            <div className="flex flex-row items-center justify-between gap-2 mb-2">
-                              <div className="text-sm font-semibold text-gray-900">Equipment Documents</div>
-                              {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                <Button
-                                  size="sm"
-                                  onClick={() => {
-                                    // // console.log('➕ Add Document button clicked for equipment:', item.id);
-                                    setEditingEquipmentId(item.id);
-                                  }}
-                                  className="bg-blue-600 hover:bg-blue-700 text-xs sm:text-sm h-7 sm:h-6 px-2 sm:px-3 whitespace-nowrap"
-                                >
-                                  <Plus size={12} className="w-3 h-3 mr-1" />
-                                  Add Document
-                                </Button>
-                              )}
-                            </div>
-                            <div className="relative mb-2">
-                              <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
-                              <input
-                                type="text"
-                                placeholder="Search documents..."
-                                value={docsSearchByEquipmentId[item.id] ?? ''}
-                                onChange={(e) => setDocsSearchByEquipmentId(prev => ({ ...prev, [item.id]: e.target.value }))}
-                                className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                              />
-                            </div>
-                            <div className="max-h-[200px] sm:h-36 overflow-y-auto border border-gray-200 rounded bg-gray-50 p-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+                            {/* QA Document Dashboard – design from screenshot (collapsed/expanded) + department subtabs */}
                               {(() => {
-                                // // console.log('📄 PERFECT: Rendering documents for equipment:', item.id);
-                                // // console.log('📄 PERFECT: Documents state:', documents);
-                                // // console.log('📄 PERFECT: Documents for this equipment:', documents[item.id]);
-                                // // console.log('📄 PERFECT: Documents length:', documents[item.id]?.length || 0);
-                                // // console.log('📄 PERFECT: Documents loading:', documentsLoading[item.id]);
-                                return null;
-                              })()}
-                              {documentsLoading[item.id] ? (
-                                <div className="p-4 space-y-3">
-                                  <Skeleton className="h-4 w-full" />
-                                  <Skeleton className="h-4 w-3/4" />
-                                  <Skeleton className="h-4 w-1/2" />
-                                </div>
-                              ) : documents[item.id] && documents[item.id].length > 0 ? (
-                                documents[item.id]
-                                  .filter((doc) => {
-                                    // Filter out Core Documents - they should only appear in Details tab
-                                    const coreDocumentTypes = ['Unpriced PO File', 'Design Inputs PID', 'Client Reference Doc', 'Other Documents'];
-                                    return !coreDocumentTypes.includes(doc.document_type || '');
-                                  })
-                                  .filter((doc) => {
-                                    const q = (docsSearchByEquipmentId[item.id] ?? '').trim().toLowerCase();
-                                    if (!q) return true;
-                                    const name = (doc.document_name || doc.name || '').toLowerCase();
-                                    const type = ((doc as { document_type?: string }).document_type || '').toLowerCase();
-                                    return name.includes(q) || type.includes(q);
-                                  })
-                                  .map((doc) => {
-                                  const getDocumentCategory = (fileName: string) => {
-                                    const ext = fileName.split('.').pop()?.toLowerCase();
-                                    if (['pdf'].includes(ext || '')) return 'PDF';
-                                    if (['dwg', 'dxf'].includes(ext || '')) return 'CAD';
-                                    if (['doc', 'docx'].includes(ext || '')) return 'Document';
-                                    if (['xls', 'xlsx'].includes(ext || '')) return 'Spreadsheet';
-                                    if (['jpg', 'jpeg', 'png', 'gif'].includes(ext || '')) return 'Image';
-                                    return 'Other';
-                                  };
-
-                                  const getCategoryColor = (category: string) => {
-                                    const colors: Record<string, string> = {
-                                      'PDF': 'bg-red-100 text-red-800',
-                                      'CAD': 'bg-blue-100 text-blue-800',
-                                      'Document': 'bg-green-100 text-green-800',
-                                      'Spreadsheet': 'bg-yellow-100 text-yellow-800',
-                                      'Image': 'bg-blue-100 text-blue-800',
-                                      'Other': 'bg-gray-100 text-gray-800'
-                                    };
-                                    return colors[category] || colors['Other'];
-                                  };
-
-                                  const getFileIcon = (fileName: string) => {
-                                    const ext = fileName.split('.').pop()?.toLowerCase();
-                                    if (['pdf'].includes(ext || '')) return '📄';
-                                    if (['dwg', 'dxf'].includes(ext || '')) return '📐';
-                                    if (['doc', 'docx'].includes(ext || '')) return '📝';
-                                    if (['xls', 'xlsx'].includes(ext || '')) return '📊';
-                                    if (['jpg', 'jpeg', 'png', 'gif'].includes(ext || '')) return '🖼️';
-                                    return '📎';
-                                  };
-
-                                  const category = getDocumentCategory(doc.document_name || doc.name);
-                                  const categoryColor = getCategoryColor(category);
-                                  const fileIcon = getFileIcon(doc.document_name || doc.name);
-                                  const d = doc as { document_type?: string; vdcr_code_status?: string; vdcr_document_status?: string; [k: string]: unknown };
-                                  const isVDCRDoc = d.document_type === 'VDCR Approved Document' || d.vdcr_code_status || d.vdcr_document_status;
-                                  const codeStatus = d.vdcr_code_status || '';
-                                  const codeCapsuleColors: Record<string, string> = {
-                                    'Code 1': 'bg-green-100 text-green-800 border-green-200',
-                                    'Code 2': 'bg-blue-100 text-blue-800 border-blue-200',
-                                    'Code 3': 'bg-yellow-100 text-yellow-800 border-yellow-200',
-                                    'Code 4': 'bg-red-100 text-red-800 border-red-200'
-                                  };
-                                  const codeCapsuleClass = codeCapsuleColors[codeStatus] || 'bg-gray-100 text-gray-800 border-gray-200';
-                                  const docStatusLabels: Record<string, string> = {
-                                    'pending': 'Pending',
-                                    'sent-for-approval': 'Submitted for Review',
-                                    'received-for-comment': 'Received with Comments',
-                                    'approved': 'Approved',
-                                    'rejected': 'Rejected'
-                                  };
-                                  const docStatusLabel = d.vdcr_document_status ? (docStatusLabels[d.vdcr_document_status] || d.vdcr_document_status) : '';
-
+                              const docsList = filterDocsByUserDepartmentAccess(documents[item.id] || []);
+                              const selectedDept = qaDashboardDepartmentByEquipment[item.id] ?? 'All';
+                              const docsListFiltered = filterDocsByDepartment(docsList, selectedDept);
+                              const hasOtherDocs = docsList.some((d: any) => !d.department);
+                              const deptTabs = ['All', ...qaDashboardDepartments, ...(hasOtherDocs ? ['Other'] : [])];
+                              const activities = equipmentActivities[item.id] || [];
+                              const totalDocuments = docsListFiltered.length;
+                              const completionsWithReports = activities.filter((a: any) => (a.completion?.inspection_report_count ?? 0) > 0);
+                              const completionsWithReportsFiltered = selectedDept === 'All' ? completionsWithReports : selectedDept === 'Other' ? completionsWithReports.filter((a: any) => !(a.completion?.department ?? '').trim()) : completionsWithReports.filter((a: any) => (a.completion?.department ?? '').trim() === selectedDept);
+                              const inspectionReportsCount = completionsWithReportsFiltered.reduce((sum: number, a: any) => sum + (a.completion?.inspection_report_count ?? 0), 0);
+                              const checklistTasks = productionChecklistByEquipment[item.id] ?? [];
+                              const completedChecklist = checklistTasks.filter((t: any) => !!t.completion).length;
+                              const totalChecklist = checklistTasks.length;
+                              const checklistPct = totalChecklist > 0 ? Math.round((completedChecklist / totalChecklist) * 100) : 0;
+                              const pendingTasksCount = Math.max(0, totalChecklist - completedChecklist);
+                              const isQADashboardExpanded = qaDashboardExpandedByEquipment[item.id] ?? false;
+                              const toggleQADashboard = () => setQADashboardExpandedByEquipment(prev => ({ ...prev, [item.id]: !(prev[item.id] ?? false) }));
+                              const handleViewLess = () => toggleQADashboard();
+                              const codeLabels = ['Code 1', 'Code 2', 'Code 3', 'Code 4'] as const;
+                              const getCodeCount = (code: string) => docsListFiltered.filter((d: any) => (d.vdcr_code_status || '') === code).length;
+                              const getCodeLastUpdated = (code: string) => {
+                                const codeDocs = docsListFiltered.filter((d: any) => (d.vdcr_code_status || '') === code);
+                                if (codeDocs.length === 0) return null;
+                                const withDate = codeDocs.map((d: any) => d.updated_at || d.created_at).filter(Boolean);
+                                if (withDate.length === 0) return null;
+                                const latest = new Date(Math.max(...withDate.map((d: string) => new Date(d).getTime())));
+                                const diffMs = Date.now() - latest.getTime();
+                                const hours = Math.floor(diffMs / (1000 * 60 * 60));
+                                if (hours < 1) return 'Updated just now';
+                                if (hours < 24) return `Updated ${hours}h ago`;
+                                const days = Math.floor(hours / 24);
+                                return days === 1 ? 'Updated yesterday' : `Updated ${days} days ago`;
+                              };
+                              const otherRefsCount = docsListFiltered.filter((d: any) => !codeLabels.includes((d.vdcr_code_status || '') as any)).length;
+                              const setSelectedDept = (dept: string) => setQaDashboardDepartmentByEquipment(prev => ({ ...prev, [item.id]: dept }));
                                   return (
-                                    <div key={doc.id} className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-0 p-2 sm:p-2 bg-white rounded border border-gray-200 mb-2 last:mb-0 hover:shadow-sm transition-shadow">
-                                      <div className="flex-1 min-w-0 cursor-pointer" onClick={() => { markAsSeen(`document_${doc.id}`); handleOpenDocument(doc, item.id); }}>
-                                        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 mb-1">
-                                          <span className="text-sm flex-shrink-0">{fileIcon}</span>
-                                          <span className="text-xs sm:text-sm font-medium text-gray-800 hover:text-gray-900 break-words min-w-0 flex-1">
-                                            {doc.document_name || doc.name}
+                                <div className="mt-1.5 pt-2 border-t border-gray-200">
+                                  <div className="flex items-center justify-between gap-2 px-0 py-1 mb-3">
+                                    <div className="flex items-center gap-2">
+                                      <div className="w-6 h-6 rounded bg-gray-200 flex items-center justify-center flex-shrink-0">
+                                        <FileStack className="w-3.5 h-3.5 text-gray-600" />
+                                      </div>
+                                      <h3 className="text-xs font-medium text-gray-600 uppercase tracking-wide">Documentation Control</h3>
+                                    </div>
+                                    <button type="button" className="p-1 rounded text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors" aria-label="Options">
+                                      <MoreVertical className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                  {/* Department subtabs – max 5 visible, bar length fixed, more breathing room; arrows when more than 5 */}
+                                  {deptTabs.length > 1 && (() => {
+                                    const MAX_VISIBLE = 5;
+                                    const totalTabs = deptTabs.length;
+                                    const selectedIndex = deptTabs.indexOf(selectedDept);
+                                    let rawStart = qaDashboardDeptWindowStart[item.id] ?? 0;
+                                    rawStart = Math.max(0, Math.min(rawStart, Math.max(0, totalTabs - MAX_VISIBLE)));
+                                    const effectiveStart = selectedIndex >= 0 && (selectedIndex < rawStart || selectedIndex >= rawStart + MAX_VISIBLE)
+                                      ? Math.max(0, Math.min(selectedIndex, Math.max(0, totalTabs - MAX_VISIBLE)))
+                                      : rawStart;
+                                    const visibleTabs = totalTabs <= MAX_VISIBLE ? deptTabs : deptTabs.slice(effectiveStart, effectiveStart + MAX_VISIBLE);
+                                    const n = visibleTabs.length;
+                                    const activeIdxInWindow = visibleTabs.indexOf(selectedDept);
+                                    const showArrows = totalTabs > MAX_VISIBLE;
+                                    const canGoLeft = effectiveStart > 0;
+                                    const canGoRight = effectiveStart + MAX_VISIBLE < totalTabs;
+                                    const goLeft = () => setQaDashboardDeptWindowStart(prev => ({ ...prev, [item.id]: Math.max(0, effectiveStart - 1) }));
+                                    const goRight = () => setQaDashboardDeptWindowStart(prev => ({ ...prev, [item.id]: Math.min(totalTabs - MAX_VISIBLE, effectiveStart + 1) }));
+                                    return (
+                                      <div className="mb-4 flex w-full items-center gap-1">
+                                        {showArrows && (
+                                          <button
+                                            type="button"
+                                            onClick={goLeft}
+                                            disabled={!canGoLeft}
+                                            className="shrink-0 rounded-full p-1.5 text-gray-400 hover:bg-gray-200 hover:text-gray-700 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                                            aria-label="Previous departments"
+                                          >
+                                            <ChevronLeft className="w-4 h-4" />
+                                          </button>
+                                        )}
+                                        <nav
+                                          className="relative flex flex-1 min-w-0 overflow-hidden rounded-full bg-gray-100/90 p-1"
+                                          aria-label="Department tabs"
+                                        >
+                                          <div
+                                            className="absolute top-0.5 bottom-0.5 rounded-full bg-white shadow-sm transition-[left,width] duration-300 ease-out"
+                                            style={{
+                                              left: `calc(2px + (100% - 4px) * ${activeIdxInWindow} / ${n})`,
+                                              width: `calc((100% - 4px) / ${n} - 2px)`
+                                            }}
+                                            aria-hidden
+                                          />
+                                          {visibleTabs.map((dept) => {
+                                            const isActive = selectedDept === dept;
+                                            const docCount = dept === 'All' ? docsList.length : dept === 'Other' ? docsList.filter((d: any) => !d.department).length : docsList.filter((d: any) => d.department === dept).length;
+                                            const inspectionCountForDept = dept === 'All' ? completionsWithReports.reduce((s: number, a: any) => s + (a.completion?.inspection_report_count ?? 0), 0) : dept === 'Other' ? completionsWithReports.filter((a: any) => !(a.completion?.department ?? '').trim()).reduce((s: number, a: any) => s + (a.completion?.inspection_report_count ?? 0), 0) : completionsWithReports.filter((a: any) => (a.completion?.department ?? '').trim() === dept).reduce((s: number, a: any) => s + (a.completion?.inspection_report_count ?? 0), 0);
+                                            const count = docCount + inspectionCountForDept;
+                                            return (
+                                              <button
+                                                key={dept}
+                                                type="button"
+                                                onClick={() => setSelectedDept(dept)}
+                                                className={`relative z-10 flex flex-1 items-center justify-center gap-1.5 py-2.5 px-2 text-[11px] font-medium transition-colors whitespace-nowrap min-w-0 overflow-hidden ${
+                                                  isActive ? 'text-[#2B62FF]' : 'text-gray-500 hover:text-gray-800'
+                                                }`}
+                                                title={dept}
+                                              >
+                                                <span className="truncate">{dept}</span>
+                                                {count > 0 && (
+                                                  <span className={`shrink-0 tabular-nums text-[10px] ${isActive ? 'text-[#2B62FF]/80' : 'text-gray-400'}`}>{count}</span>
+                                                )}
+                                              </button>
+                                            );
+                                          })}
+                                        </nav>
+                                        {showArrows && (
+                                          <button
+                                            type="button"
+                                            onClick={goRight}
+                                            disabled={!canGoRight}
+                                            className="shrink-0 rounded-full p-1.5 text-gray-400 hover:bg-gray-200 hover:text-gray-700 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                                            aria-label="Next departments"
+                                          >
+                                            <ChevronRight className="w-4 h-4" />
+                                          </button>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
+                                  <div className="space-y-5">
+                                    {/* Summary row: invert-on-hover like Code 1–4 */}
+                                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                      <button
+                                        type="button"
+                                        onClick={toggleQADashboard}
+                                        className="group rounded-lg bg-white border border-gray-200 shadow-sm hover:shadow-md hover:border-[#2B62FF] hover:bg-[#2B62FF] transition-all p-3 flex flex-col gap-2 text-left min-h-[100px] w-full cursor-pointer"
+                                      >
+                                        <div className="flex items-start gap-3 min-w-0">
+                                        <div className="w-10 h-10 rounded-full bg-blue-100 group-hover:bg-white/20 flex items-center justify-center flex-shrink-0 p-1 transition-colors">
+                                          <div className="w-7 h-7 rounded-full bg-[#2B62FF] group-hover:bg-white flex items-center justify-center transition-colors">
+                                            <FileText className="w-3.5 h-3.5 text-white group-hover:text-[#2B62FF] transition-colors" />
+                            </div>
+                            </div>
+                                        <div className="min-w-0 flex-1">
+                                          <p className="text-xs font-semibold text-gray-800 group-hover:text-white leading-tight transition-colors">Total<br />Documents</p>
+                                          <p className="text-xl font-bold text-gray-900 group-hover:text-white tabular-nums leading-none mt-0.5 transition-colors">{totalDocuments}</p>
+                                          <p className="text-[11px] text-gray-500 group-hover:text-white/90 mt-1 leading-tight transition-colors">Across all codes</p>
+                                </div>
+                                        </div>
+                                        <div className="mt-auto pt-1">
+                                          <div className="h-1.5 w-full rounded-full overflow-hidden bg-gray-200 group-hover:bg-white/30 transition-colors">
+                                            <div className="h-full rounded-full bg-[#2B62FF] group-hover:bg-white transition-all duration-300" style={{ width: `${totalDocuments > 0 ? 100 : 0}%` }} />
+                                          </div>
+                                        </div>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={toggleQADashboard}
+                                        className="group rounded-lg bg-white border border-gray-200 shadow-sm hover:shadow-md hover:border-orange-500 hover:bg-orange-500 transition-all p-3 flex flex-col gap-2 text-left min-h-[100px] w-full cursor-pointer"
+                                      >
+                                        <div className="flex items-start gap-3 min-w-0">
+                                        <div className="w-10 h-10 rounded-full bg-orange-100 group-hover:bg-white/20 flex items-center justify-center flex-shrink-0 p-1 transition-colors">
+                                          <div className="w-7 h-7 rounded-full bg-orange-500 group-hover:bg-white flex items-center justify-center transition-colors">
+                                            <FileText className="w-3.5 h-3.5 text-white group-hover:text-orange-500 transition-colors" />
+                                          </div>
+                                        </div>
+                                        <div className="min-w-0 flex-1">
+                                          <p className="text-xs font-semibold text-gray-800 group-hover:text-white leading-tight transition-colors">Inspection Reports</p>
+                                          <p className="text-xl font-bold text-gray-900 group-hover:text-white tabular-nums leading-none mt-0.5 transition-colors">{inspectionReportsCount}</p>
+                                          <p className="text-[11px] text-gray-500 group-hover:text-white/90 mt-1 leading-tight transition-colors">In total</p>
+                                        </div>
+                                        </div>
+                                        <div className="mt-auto pt-1">
+                                          <div className="h-1.5 w-full rounded-full overflow-hidden bg-gray-200 group-hover:bg-white/30 transition-colors">
+                                            <div className="h-full rounded-full bg-orange-500 group-hover:bg-white transition-all duration-300" style={{ width: `${inspectionReportsCount > 0 ? 100 : 0}%` }} />
+                                          </div>
+                                        </div>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={toggleQADashboard}
+                                        className="group rounded-lg bg-white border border-gray-200 shadow-sm hover:shadow-md hover:border-teal-600 hover:bg-teal-600 transition-all p-3 flex flex-col gap-2 text-left min-h-[100px] w-full cursor-pointer"
+                                      >
+                                        <div className="flex items-start gap-3 min-w-0">
+                                        <div className="w-10 h-10 rounded-full bg-teal-100 group-hover:bg-white/20 flex items-center justify-center flex-shrink-0 p-1 transition-colors">
+                                          <div className="w-7 h-7 rounded-full bg-teal-600 group-hover:bg-white flex items-center justify-center transition-colors">
+                                            <ClipboardList className="w-3.5 h-3.5 text-white group-hover:text-teal-600 transition-colors" />
+                                          </div>
+                                        </div>
+                                        <div className="min-w-0 flex-1">
+                                          <p className="text-xs font-semibold text-gray-800 group-hover:text-white leading-tight transition-colors">Pending Tasks</p>
+                                          <p className="text-xl font-bold text-gray-900 group-hover:text-white tabular-nums leading-none mt-0.5 transition-colors">{pendingTasksCount}</p>
+                                          <p className="text-[11px] text-gray-500 group-hover:text-white/90 mt-1 leading-tight transition-colors">In production checklist</p>
+                                        </div>
+                                        </div>
+                                        <div className="mt-auto pt-1">
+                                          <div className="h-1.5 w-full rounded-full overflow-hidden bg-gray-200 group-hover:bg-white/30 transition-colors">
+                                            <div className="h-full rounded-full bg-teal-600 group-hover:bg-white transition-all duration-300" style={{ width: `${pendingTasksCount > 0 ? checklistPct : 0}%` }} />
+                                          </div>
+                                        </div>
+                                      </button>
+                                    </div>
+                                    <div className="flex items-center justify-between gap-3 w-full whitespace-nowrap">
+                                      <button
+                                        type="button"
+                                        onClick={isQADashboardExpanded ? handleViewLess : toggleQADashboard}
+                                        className="flex items-center gap-1 text-xs sm:text-sm font-medium text-blue-600 hover:text-blue-700 underline-offset-2 hover:underline min-w-0"
+                                      >
+                                        {isQADashboardExpanded ? 'View less' : 'Expand to view all'}
+                                        {isQADashboardExpanded ? <ChevronUp className="w-4 h-4 flex-shrink-0" /> : <ChevronDown className="w-4 h-4 flex-shrink-0" />}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          invalidateRecentActivityCache(item.id);
+                                          loadRecentActivityForEquipment(item.id, true);
+                                          setRecentActivityUpdatesModalPage(0);
+                                          setRecentActivityUpdatesModalEquipment({ equipmentId: item.id, equipmentName: item.name, tagNumber: item.tag_number });
+                                        }}
+                                        className="flex items-center gap-1 text-xs sm:text-sm font-medium text-blue-600 hover:text-blue-700 underline-offset-2 hover:underline ml-auto min-w-0"
+                                      >
+                                        View recent activity
+                                        <ChevronDown className="w-4 h-4 flex-shrink-0" />
+                                      </button>
+                                    </div>
+                                    {isQADashboardExpanded && (
+                                      <>
+                                        <div>
+                                          <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-3">Document Control</p>
+                                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                                            {codeLabels.map((code) => {
+                                              const count = getCodeCount(code);
+                                              const lastUpdated = getCodeLastUpdated(code);
+                                  return (
+                                                <button
+                                                  key={code}
+                                                  type="button"
+                                                  onClick={() => setClientsDocsCodeModal({ equipmentId: item.id, code, departmentFilter: selectedDept })}
+                                                  className="group rounded-xl border border-gray-200 bg-white shadow-sm hover:shadow-md hover:border-blue-500 hover:bg-blue-600 transition-all p-4 flex flex-col text-left w-full h-[124px]"
+                                                >
+                                                  <div className="flex flex-nowrap items-center justify-between gap-2 w-full -mx-4 -mt-4 px-4 pt-4">
+                                                    <span className="inline-flex items-center shrink-0 pl-4 pr-3 py-1 -ml-4 rounded-l-none rounded-r-md bg-blue-600 text-white group-hover:bg-white group-hover:text-blue-600 text-[11px] font-bold leading-none whitespace-nowrap transition-colors">
+                                                      {code}
                                           </span>
-                                          <UnreadEntityDot entityKey={`document_${doc.id}`} updatedAt={doc.uploadDate || doc.updated_at || doc.created_at} />
-                                          {isVDCRDoc && codeStatus && (
-                                            <span className={`px-1.5 py-0.5 text-[10px] sm:text-xs rounded-full flex-shrink-0 font-medium border ${codeCapsuleClass}`}>
-                                              {codeStatus}
-                                            </span>
-                                          )}
-                                          {isVDCRDoc && docStatusLabel && (
-                                            <span className="px-1.5 py-0.5 text-[10px] sm:text-xs rounded-full flex-shrink-0 bg-gray-100 text-gray-700 border border-gray-200">
-                                              {docStatusLabel}
-                                            </span>
-                                          )}
-                                          <span className={`px-1.5 py-0.5 text-[10px] sm:text-xs rounded-full flex-shrink-0 ${categoryColor}`}>
-                                            {category}
+                                                    <div className="w-6 h-6 shrink-0 rounded-full flex items-center justify-center bg-blue-100 border border-gray-200/80 group-hover:bg-white/20 group-hover:border-white/40 transition-colors">
+                                                      <FileText className="w-3 h-3 text-blue-600 group-hover:text-white transition-colors" />
+                                                    </div>
+                                                  </div>
+                                                  <p className="text-2xl font-bold text-gray-900 group-hover:text-white leading-none mt-0.5 transition-colors">{count}</p>
+                                                  <p className="text-xs text-gray-600 group-hover:text-white mt-1.5 leading-none transition-colors">Documents</p>
+                                                  {lastUpdated && (
+                                                    <p className="text-[10px] text-gray-500 group-hover:text-white/90 mt-1 leading-tight transition-colors">Manufacturing Procedure Docs<br />{lastUpdated}</p>
+                                                  )}
+                                                  <div className="mt-auto pt-1.5 self-start">
+                                                    <span className="inline-flex items-center gap-0.5 whitespace-nowrap pl-1.5 pr-2 py-px rounded-sm border border-gray-200 bg-white text-gray-600 group-hover:bg-white group-hover:text-blue-600 group-hover:border-white text-[10px] font-normal leading-tight -ml-0.5 transition-colors">
+                                                      View Docs
+                                                      <ArrowRight className="w-2.5 h-2.5 text-gray-600 group-hover:text-blue-600 flex-shrink-0 transition-colors" />
                                           </span>
                                         </div>
-                                        <div className="text-[10px] sm:text-xs text-gray-500 truncate">
-                                          By: {doc.uploadedBy} • {new Date(doc.uploadDate).toLocaleDateString()}
+                                                </button>
+                                              );
+                                            })}
                                         </div>
                                       </div>
-                                      <div className="flex gap-2 sm:gap-1 justify-end sm:justify-start flex-shrink-0">
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          className="h-7 w-7 sm:h-6 sm:w-6 p-0 flex-shrink-0"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            markAsSeen(`document_${doc.id}`);
-                                            handleOpenDocument(doc, item.id);
-                                          }}
-                                        >
-                                          <Eye size={14} className="sm:w-3 sm:h-3" />
-                                        </Button>
-                                        <Button
-                                          size="sm"
-                                          variant="outline"
-                                          className="h-7 w-7 sm:h-6 sm:w-6 p-0 text-red-600 hover:text-red-700 flex-shrink-0"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteDocument(item.id, doc.id);
-                                          }}
-                                        >
-                                          <Trash2 size={14} className="sm:w-3 sm:h-3" />
-                                        </Button>
+                                        <div>
+                                          <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-3">Operations Tracking</p>
+                                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                if (inspectionReportsCount === 0) {
+                                                  setInspectionReportListModal({ completionId: '', reports: [] });
+                                                  return;
+                                                }
+                                                if (completionsWithReportsFiltered.length === 1) {
+                                                  setInspectionReportListLoading(true);
+                                                  fastAPI.getEquipmentActivityCompletionInspectionReports(completionsWithReportsFiltered[0].completion.id, projectId === 'standalone')
+                                                    .then((reports) => setInspectionReportListModal({ completionId: completionsWithReportsFiltered[0].completion.id, reports }))
+                                                    .finally(() => setInspectionReportListLoading(false));
+                                                } else {
+                                                  setInspectionReportPickerModal({
+                                                    equipmentId: item.id,
+                                                    activities: completionsWithReportsFiltered.map((a: any) => ({
+                                                      activityId: a.id,
+                                                      activityName: a.activity_name || 'Activity',
+                                                      completionId: a.completion.id,
+                                                      reportCount: a.completion?.inspection_report_count ?? 0,
+                                                      department: (a.completion?.department ?? '').trim() || null
+                                                    }))
+                                                  });
+                                                }
+                                              }}
+                                              className="group rounded-lg border border-gray-200 bg-white shadow-sm hover:shadow-md hover:border-orange-500 hover:bg-orange-500 transition-all p-3 flex items-start gap-2.5 text-left w-full h-[108px]"
+                                            >
+                                              <div className="w-10 h-10 rounded-full bg-orange-100 group-hover:bg-white/20 flex items-center justify-center flex-shrink-0 p-1 transition-colors">
+                                                <div className="w-7 h-7 rounded-full bg-orange-500 group-hover:bg-white flex items-center justify-center transition-colors">
+                                                  <FileText className="w-3.5 h-3.5 text-white group-hover:text-orange-500 transition-colors" />
+                                                </div>
+                                              </div>
+                                              <div className="min-w-0 flex-1">
+                                                <p className="text-xs font-semibold text-gray-900 group-hover:text-white leading-tight transition-colors">Inspection Reports</p>
+                                                <p className="text-xs text-gray-700 group-hover:text-white mt-0.5 leading-tight transition-colors">{inspectionReportsCount} Reports</p>
+                                                <p className="text-[11px] font-medium text-blue-600 group-hover:text-white mt-1 flex items-center gap-0.5 transition-colors">View documents <ArrowRight className="w-3 h-3 group-hover:text-white" /></p>
+                                              </div>
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => setClientsDocsOtherRefsModal({ equipmentId: item.id, departmentFilter: selectedDept })}
+                                              className="group rounded-lg border border-gray-200 bg-white shadow-sm hover:shadow-md hover:border-[#2B62FF] hover:bg-[#2B62FF] transition-all p-3 flex items-start gap-2.5 text-left w-full h-[108px]"
+                                            >
+                                              <div className="w-10 h-10 rounded-full bg-blue-100 group-hover:bg-white/20 flex items-center justify-center flex-shrink-0 p-1 transition-colors">
+                                                <div className="w-7 h-7 rounded-full bg-[#2B62FF] group-hover:bg-white flex items-center justify-center transition-colors">
+                                                  <FileText className="w-3.5 h-3.5 text-white group-hover:text-[#2B62FF] transition-colors" />
                                       </div>
                                     </div>
-                                  );
-                                })
-                              ) : (
-                                <div className="flex items-center justify-center p-4 bg-white rounded border border-gray-200">
-                                  <div className="text-center">
-                                    <FileText size={24} className="text-gray-400 mx-auto mb-2" />
-                                    <span className="text-xs text-gray-500">No documents uploaded</span>
-                                  </div>
-                                </div>
+                                              <div className="min-w-0 flex-1">
+                                                <p className="text-xs font-semibold text-gray-900 group-hover:text-white leading-tight transition-colors">TPI, Audits & other doc</p>
+                                                <p className="text-xs text-gray-700 group-hover:text-white mt-0.5 leading-tight transition-colors">{otherRefsCount} Documents</p>
+                                                <p className="text-[11px] font-medium text-blue-600 group-hover:text-white mt-1 flex items-center gap-0.5 transition-colors">View Documents <ArrowRight className="w-3 h-3 group-hover:text-white" /></p>
+                                              </div>
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => setClientsDocsChecklistModal({ equipmentId: item.id })}
+                                              className="group rounded-lg border border-gray-200 bg-white shadow-sm hover:shadow-md hover:border-teal-600 hover:bg-teal-600 transition-all p-3 flex items-start gap-2.5 text-left w-full h-[108px]"
+                                            >
+                                              <div className="w-10 h-10 rounded-full bg-teal-100 group-hover:bg-white/20 flex items-center justify-center flex-shrink-0 p-1 transition-colors">
+                                                <div className="w-7 h-7 rounded-full bg-teal-600 group-hover:bg-white flex items-center justify-center transition-colors">
+                                                  <ClipboardCheck className="w-3.5 h-3.5 text-white group-hover:text-teal-600 transition-colors" />
+                                                </div>
+                                              </div>
+                                              <div className="min-w-0 flex-1">
+                                                <p className="text-xs font-semibold text-gray-900 group-hover:text-white leading-tight transition-colors">Production & Pre-Dispatch Checklist</p>
+                                                <p className="text-xs font-semibold text-teal-600 group-hover:text-white mt-0.5 transition-colors">{checklistPct}%</p>
+                                                <p className="text-[11px] font-medium text-blue-600 group-hover:text-white mt-1 flex items-center gap-0.5 transition-colors">Continue <ArrowRight className="w-3 h-3 group-hover:text-white" /></p>
+                                              </div>
+                                            </button>
+                                          </div>
+                                        </div>
+                                      </>
                               )}
                             </div>
+                                </div>
+                              );
+                            })()}
                           </>
                         )}
                       </div>
-                    </TabsContent>
-                  </Tabs>
+                  </div>
+
+                  {/* Dossier Report – below tabs, above edit/view action buttons (hidden while editing) */}
+                  {onOpenDossierReport && editingEquipmentId !== item.id && (
+                    <div className="mt-3 mb-2">
+                      <Button
+                        type="button"
+                        variant="default"
+                        size="sm"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenDossierReport({ projectId, equipmentId: item.id, projectName, equipment: item });
+                        }}
+                        className="w-full font-semibold bg-indigo-600 hover:bg-indigo-700 text-white shadow-md hover:shadow-lg transition-all py-2 text-xs sm:text-sm"
+                      >
+                        <BookMarked className="w-4 h-4 mr-2 flex-shrink-0" />
+                        Dossier Report
+                      </Button>
+                    </div>
+                  )}
 
                   {/* Action Buttons */}
-                  <div className="flex flex-row flex-wrap gap-2 mt-3 mt-auto">
+                  <div className="flex flex-row flex-wrap gap-2 mt-5 mt-auto">
                     {editingEquipmentId === item.id ? (
                       // Edit Mode - Show Save/Cancel
                       <>
@@ -11729,12 +10916,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               </div>
             );
           })()}
+        </div>
         </>
       )}
 
       {/* Image Preview Modal */}
       {showImagePreview && (
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50" onClick={() => {
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[120]" onClick={() => {
           setShowImagePreview(null);
         }}>
           <div className="bg-white rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
@@ -11752,90 +10940,19 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               </Button>
             </div>
             <div className="relative">
-              {/* Image with Navigation Overlay */}
-              <div className="relative">
-                {(() => {
-                  const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
-                  const urlForIndex = currentEquipment?.progressImages?.[showImagePreview.currentIndex];
-                  const displayUrl = (USE_ON_DEMAND_PROGRESS_IMAGES ? urlForIndex : null) ?? showImagePreview.url;
-                  const isOnDemandLoading = USE_ON_DEMAND_PROGRESS_IMAGES && !urlForIndex && currentEquipment?.progressImagesMetadata?.length && showImagePreview.currentIndex < (currentEquipment.progressImagesMetadata?.length ?? 0);
-                  if (isOnDemandLoading) {
-                    return (
-                      <div className="w-full min-h-[300px] bg-gray-100 rounded-lg border border-gray-200 flex items-center justify-center">
-                        <div className="text-center text-gray-500 py-12">
-                          <div className="animate-spin rounded-full h-10 w-10 border-2 border-gray-400 border-t-transparent mx-auto mb-3" />
-                          <div className="text-sm">Loading image...</div>
-                        </div>
-                      </div>
-                    );
-                  }
-                  return (
-                    <img
-                      src={displayUrl}
-                      alt="Progress"
-                      className="w-full h-auto rounded-lg border border-gray-200"
-                    />
-                  );
-                })()}
-
-                {/* Image Navigation - Left/Right Sides like Carousel */}
-                {(() => {
-                  const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
-                  const images = currentEquipment?.progressImages || []; // Use progressImages instead of images
-
-
-                  if (images.length > 1) {
-                    return (
-                      <>
-                        {/* Left Navigation Button */}
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            const prevIndex = showImagePreview.currentIndex > 0 ? showImagePreview.currentIndex - 1 : images.length - 1;
-                            const url = images[prevIndex] ?? showImagePreview.url;
-                            setShowImagePreview({ url, equipmentId: showImagePreview.equipmentId, currentIndex: prevIndex });
-                            setCurrentProgressImageIndex(prev => ({ ...prev, [showImagePreview.equipmentId]: prevIndex }));
-                            fetchProgressImageForIndex(showImagePreview.equipmentId, prevIndex);
-                          }}
-                          className="absolute left-4 top-1/2 transform -translate-y-1/2 bg-white/90 hover:bg-white border-gray-300 shadow-lg"
-                        >
-                          <ChevronLeft size={20} />
-                        </Button>
-
-                        {/* Right Navigation Button */}
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            const nextIndex = showImagePreview.currentIndex < images.length - 1 ? showImagePreview.currentIndex + 1 : 0;
-                            const url = images[nextIndex] ?? showImagePreview.url;
-                            setShowImagePreview({ url, equipmentId: showImagePreview.equipmentId, currentIndex: nextIndex });
-                            setCurrentProgressImageIndex(prev => ({ ...prev, [showImagePreview.equipmentId]: nextIndex }));
-                            fetchProgressImageForIndex(showImagePreview.equipmentId, nextIndex);
-                          }}
-                          className="absolute right-4 top-1/2 transform -translate-y-1/2 bg-white/90 hover:bg-white border-gray-300 shadow-lg"
-                        >
-                          <ChevronRight size={20} />
-                        </Button>
-
-                        {/* Image Counter - Top Center */}
-                        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-sm">
-                          {showImagePreview.currentIndex + 1} of {images.length}
-                        </div>
-                      </>
-                    );
-                  }
-                  return null;
-                })()}
-              </div>
+              {/* Single latest progress image (no navigation) */}
+              <img
+                src={showImagePreview.url}
+                alt="Progress"
+                className="w-full h-auto rounded-lg border border-gray-200"
+              />
 
               <div className="space-y-2 mt-4">
                 <div className="text-sm text-gray-600">
                   <strong>Description:</strong> {(() => {
                     const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
                     const metadata = currentEquipment?.progressImagesMetadata || [];
-                    const currentMetadata = metadata[showImagePreview.currentIndex];
+                    const currentMetadata = metadata[0];
 
                     return currentMetadata?.description || "Progress image";
                   })()}
@@ -11844,7 +10961,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   <strong>Uploaded by:</strong> {(() => {
                     const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
                     const metadata = currentEquipment?.progressImagesMetadata || [];
-                    const currentMetadata = metadata[showImagePreview.currentIndex] as { created_by_user?: { full_name?: string }; uploaded_by?: string } | undefined;
+                    const currentMetadata = metadata[0] as { created_by_user?: { full_name?: string }; uploaded_by?: string } | undefined;
                     return currentMetadata?.created_by_user?.full_name || currentMetadata?.uploaded_by || "Team Member";
                   })()}
                 </div>
@@ -11852,7 +10969,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   <strong>Date:</strong> {(() => {
                     const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
                     const metadata = currentEquipment?.progressImagesMetadata || [];
-                    const currentMetadata = metadata[showImagePreview.currentIndex];
+                    const currentMetadata = metadata[0];
 
                     if (currentMetadata?.upload_date) {
                       const date = new Date(currentMetadata.upload_date);
@@ -11884,6 +11001,836 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           </div>
         </div>
       )}
+
+      {/* Step image larger preview (QAP step image click) with left/right navigation */}
+      {stepImagePreview && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[110]" onClick={() => setStepImagePreview(null)}>
+          <div className="bg-white rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-800">Step image</h3>
+              <Button variant="ghost" size="sm" onClick={() => setStepImagePreview(null)} className="text-gray-500 hover:text-gray-700">
+                <X size={20} />
+              </Button>
+            </div>
+            <div className="relative">
+              {stepImagePreview.imageCount > 1 && (
+                <div className="text-center text-sm text-gray-600 mb-3">
+                  {stepImagePreview.currentIndex + 1} of {stepImagePreview.imageCount}
+                </div>
+              )}
+              {(() => {
+                const { completionId, currentIndex, imageCount } = stepImagePreview;
+                const cacheKey = `${completionId}_${currentIndex}`;
+                const imageUrl = stepImageCache[cacheKey];
+                const loading = stepImageLoading[cacheKey];
+                if (!imageUrl) {
+                  return (
+                    <div className="w-full min-h-[300px] bg-gray-100 rounded-lg border border-gray-200 flex items-center justify-center">
+                      <div className="text-center text-gray-500 py-12">
+                        {loading ? (
+                          <>
+                            <div className="animate-spin rounded-full h-10 w-10 border-2 border-gray-400 border-t-transparent mx-auto mb-3" />
+                            <div className="text-sm">Loading image...</div>
+                          </>
+                        ) : (
+                          <div className="text-sm">No image</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                }
+                return (
+                  <img src={imageUrl} alt="Step" className="w-full h-auto rounded-lg border border-gray-200" />
+                );
+              })()}
+              {/* Left/Right arrows when step has multiple images */}
+              {stepImagePreview.imageCount > 1 && (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const prevIndex = stepImagePreview.currentIndex > 0 ? stepImagePreview.currentIndex - 1 : stepImagePreview.imageCount - 1;
+                      setStepImagePreview({ ...stepImagePreview, currentIndex: prevIndex });
+
+                      // Ensure the new index image is fetched if not already in cache
+                      const cacheKey = `${stepImagePreview.completionId}_${prevIndex}`;
+                      if (!stepImageCache[cacheKey]) {
+                        setStepImageLoading(prev => ({ ...prev, [cacheKey]: true }));
+                        fastAPI
+                          .getEquipmentActivityCompletionImageUrl(
+                            stepImagePreview.completionId,
+                            prevIndex,
+                            projectId === 'standalone'
+                          )
+                          .then((url) => {
+                            if (url) {
+                              setStepImageCache(prev => ({ ...prev, [cacheKey]: url }));
+                            }
+                          })
+                          .finally(() => {
+                            setStepImageLoading(prev => ({ ...prev, [cacheKey]: false }));
+                          });
+                      }
+                    }}
+                    className="absolute left-4 top-1/2 transform -translate-y-1/2 bg-white/90 hover:bg-white border-gray-300 shadow-lg z-20"
+                  >
+                    <ChevronLeft size={24} />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const nextIndex = stepImagePreview.currentIndex < stepImagePreview.imageCount - 1 ? stepImagePreview.currentIndex + 1 : 0;
+                      setStepImagePreview({ ...stepImagePreview, currentIndex: nextIndex });
+
+                      // Ensure the new index image is fetched if not already in cache
+                      const cacheKey = `${stepImagePreview.completionId}_${nextIndex}`;
+                      if (!stepImageCache[cacheKey]) {
+                        setStepImageLoading(prev => ({ ...prev, [cacheKey]: true }));
+                        fastAPI
+                          .getEquipmentActivityCompletionImageUrl(
+                            stepImagePreview.completionId,
+                            nextIndex,
+                            projectId === 'standalone'
+                          )
+                          .then((url) => {
+                            if (url) {
+                              setStepImageCache(prev => ({ ...prev, [cacheKey]: url }));
+                            }
+                          })
+                          .finally(() => {
+                            setStepImageLoading(prev => ({ ...prev, [cacheKey]: false }));
+                          });
+                      }
+                    }}
+                    className="absolute right-4 top-1/2 transform -translate-y-1/2 bg-white/90 hover:bg-white border-gray-300 shadow-lg z-20"
+                  >
+                    <ChevronRight size={24} />
+                  </Button>
+                </>
+              )}
+                  </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clients Documentations: pick which activity's inspection reports to open */}
+      {inspectionReportPickerModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[110]" onClick={() => setInspectionReportPickerModal(null)}>
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-800">Inspection reports – choose activity</h3>
+              <Button variant="ghost" size="sm" onClick={() => setInspectionReportPickerModal(null)} className="text-gray-500 hover:text-gray-700">
+                <X size={20} />
+              </Button>
+            </div>
+            {(() => {
+              const activities = inspectionReportPickerModal.activities;
+              const byDept = activities.reduce((acc: Record<string, typeof activities>, act) => {
+                const dept = (act.department && act.department.trim()) || 'Other';
+                if (!acc[dept]) acc[dept] = [];
+                acc[dept].push(act);
+                return acc;
+              }, {});
+              const deptOrder = Object.keys(byDept).sort((a, b) => (a === 'Other' ? 1 : b === 'Other' ? -1 : a.localeCompare(b)));
+              return (
+                <div className="space-y-4">
+                  {deptOrder.map((dept) => (
+                    <div key={dept}>
+                      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">{dept}</p>
+                      <ul className="space-y-2">
+                        {byDept[dept].map((act) => (
+                          <li key={act.activityId}>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              className="w-full justify-start text-left h-auto py-2"
+                              onClick={() => {
+                                setInspectionReportListLoading(true);
+                                setInspectionReportPickerModal(null);
+                                fastAPI.getEquipmentActivityCompletionInspectionReports(act.completionId, projectId === 'standalone')
+                                  .then((reports) => setInspectionReportListModal({ completionId: act.completionId, reports }))
+                                  .finally(() => setInspectionReportListLoading(false));
+                              }}
+                            >
+                              <FileText className="w-4 h-4 mr-2 flex-shrink-0" />
+                              {act.activityName} <span className="text-gray-500 ml-1">({act.reportCount})</span>
+                            </Button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {/* Inspection report list modal (choose which report to open) */}
+      {inspectionReportListModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[110]" onClick={() => setInspectionReportListModal(null)}>
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-800">Inspection reports</h3>
+              <Button variant="ghost" size="sm" onClick={() => setInspectionReportListModal(null)} className="text-gray-500 hover:text-gray-700">
+                <X size={20} />
+              </Button>
+            </div>
+            {inspectionReportListModal.reports.length === 0 ? (
+              <p className="text-sm text-gray-500">No documents in this category.</p>
+            ) : (
+            <ul className="space-y-2">
+              {inspectionReportListModal.reports.map((r, idx) => (
+                <li key={r.id}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full justify-start text-left h-auto py-2"
+                    disabled={!r.report_url}
+                    onClick={() => {
+                      if (r.report_url) {
+                        setInspectionReportPreview({ reportUrl: r.report_url, fileName: r.file_name || `Inspection report ${idx + 1}.pdf` });
+                        setInspectionReportListModal(null);
+                      }
+                    }}
+                  >
+                    <FileText className="w-4 h-4 mr-2 flex-shrink-0" />
+                    {r.file_name || `Inspection report ${idx + 1}`}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Inspection report PDF preview modal */}
+      {inspectionReportPreview && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[110]" onClick={() => setInspectionReportPreview(null)}>
+          <div className="bg-white rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-800">{inspectionReportPreview.fileName}</h3>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const a = document.createElement('a');
+                    a.href = inspectionReportPreview.reportUrl;
+                    a.download = inspectionReportPreview.fileName;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                  }}
+                  className="bg-green-600 hover:bg-green-700 text-white"
+                >
+                  <Download size={16} className="mr-2" />
+                  Download
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setInspectionReportPreview(null)} className="text-gray-500 hover:text-gray-700">
+                  <X size={20} />
+                </Button>
+              </div>
+            </div>
+            <div className="border border-gray-200 rounded-lg overflow-hidden bg-gray-100">
+              <iframe
+                src={inspectionReportPreview.reportUrl}
+                title={inspectionReportPreview.fileName}
+                className="w-full h-[70vh] min-h-[400px]"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clients Documentations: Code 1 / Code 2 / Code 3 / Code 4 docs list */}
+      {clientsDocsCodeModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50" onClick={() => setClientsDocsCodeModal(null)}>
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-800">{clientsDocsCodeModal.code} docs</h3>
+              <Button variant="ghost" size="sm" onClick={() => setClientsDocsCodeModal(null)} className="text-gray-500 hover:text-gray-700">
+                <X size={20} />
+              </Button>
+            </div>
+            {renderClientsDocsCodeContent(clientsDocsCodeModal.equipmentId, clientsDocsCodeModal.code, clientsDocsCodeModal.departmentFilter)}
+          </div>
+        </div>
+      )}
+
+      {/* Clients Documentations: Other reference / internal drawings & documents */}
+      {clientsDocsOtherRefsModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-2 sm:p-4" onClick={() => setClientsDocsOtherRefsModal(null)}>
+          <div className="bg-white rounded-lg p-4 sm:p-6 max-w-md w-full mx-2 sm:mx-4 max-h-[85vh] sm:max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-base sm:text-lg font-semibold text-gray-800 pr-2">Other reference / internal drawings & documents</h3>
+              <Button variant="ghost" size="sm" onClick={() => setClientsDocsOtherRefsModal(null)} className="text-gray-500 hover:text-gray-700">
+                <X size={20} />
+              </Button>
+            </div>
+            {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
+              <div className="mb-4">
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setClientsDocsOtherRefsModal(null);
+                    setEditingEquipmentId(clientsDocsOtherRefsModal.equipmentId);
+                  }}
+                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs h-8 px-3 rounded-md"
+                >
+                  <Plus size={14} className="mr-1.5" />
+                  Add Document
+                </Button>
+              </div>
+            )}
+            {renderClientsDocsOtherRefsContent(clientsDocsOtherRefsModal.equipmentId, clientsDocsOtherRefsModal.departmentFilter)}
+          </div>
+        </div>
+      )}
+
+      {/* Clients Documentations: Production & pre-dispatch checklist */}
+      {clientsDocsChecklistModal && (
+        <ProductionChecklistModal
+          equipmentId={clientsDocsChecklistModal.equipmentId}
+          equipmentTag={localEquipment.find((e: Equipment) => e.id === clientsDocsChecklistModal.equipmentId)?.tagNumber}
+          equipmentName={localEquipment.find((e: Equipment) => e.id === clientsDocsChecklistModal.equipmentId)?.name}
+          projectId={projectId ?? ''}
+          isStandalone={projectId === 'standalone'}
+          tasks={productionChecklistByEquipment[clientsDocsChecklistModal.equipmentId] ?? []}
+          currentUserId={user?.id ?? null}
+          currentUserDisplayName={(localStorage.getItem('userName') || (user as any)?.full_name || user?.email) ?? null}
+          onClose={() => setClientsDocsChecklistModal(null)}
+          onRefresh={async () => {
+            const id = clientsDocsChecklistModal.equipmentId;
+            const list = projectId === 'standalone'
+              ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(id)
+              : await fastAPI.getEquipmentProductionChecklistTasks(id);
+            setProductionChecklistByEquipment(prev => ({ ...prev, [id]: list }));
+            await refreshEquipmentData(true);
+          }}
+        />
+      )}
+
+      {/* Recent Activity detail modal (z-[60]) – Documentation: Uploaded By, Department, View doc; QAP: Completed by, Department, Update by */}
+      {recentActivityDetailModal && (() => {
+        const log = recentActivityDetailModal.log;
+        const t = log.activity_type || '';
+        const isDoc = t === 'document_uploaded' || t === 'document_updated';
+        const isQAP = t === 'activity_completed';
+        const isVDCR = (t || '').startsWith('vdcr_');
+        const dateStr = log.created_at ? new Date(log.created_at).toLocaleString() : '—';
+        const vdcrDocName = log.metadata?.documentName || log.vdcr_record?.document_name || 'Document';
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[60]" onClick={() => setRecentActivityDetailModal(null)}>
+            <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-6 max-w-lg w-full mx-4 max-h-[85vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold text-gray-900">{isDoc ? 'Documentation update' : isQAP ? 'QAP update' : isVDCR ? 'Documentation phase' : 'Activity detail'}</h3>
+                <Button variant="ghost" size="sm" onClick={() => setRecentActivityDetailModal(null)} className="text-gray-500 hover:text-gray-700">
+                  <X size={20} />
+                </Button>
+              </div>
+              {recentActivityDetailModal.equipmentTag && (
+                <p className="text-sm text-gray-500 mb-3">Equipment: {recentActivityDetailModal.equipmentName || recentActivityDetailModal.equipmentTag} ({recentActivityDetailModal.equipmentTag})</p>
+              )}
+              <p className="text-sm text-gray-700 mb-4">{log.action_description || '—'}</p>
+              <p className="text-xs text-gray-500 mb-1">Date & time</p>
+              <p className="text-sm text-gray-700 mb-4">{dateStr}</p>
+
+              {isDoc && (
+                <>
+                  <p className="text-xs text-gray-500 mb-1">Uploaded by</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.created_by_user?.full_name || log.created_by_user?.email || '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Department</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.department ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Remarks</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.remarks ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Notable remarks</p>
+                  <p className="text-sm text-gray-700 mb-4">{log.metadata?.notable_change_title ?? log.metadata?.notableRemarks ?? '—'}</p>
+                  <div className="pt-4 border-t border-gray-100">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        const equipmentId = recentActivityDetailModal.equipmentId;
+                        const docId = log.metadata?.document_id;
+                        setRecentActivityDetailModal(null);
+                        if (docId) {
+                          const name = log.metadata?.fileName || log.metadata?.documentName || 'Document';
+                          setDocumentUrlModal({ name, loading: true, documentId: docId });
+                          try {
+                            const data = await getDocumentUrlById(docId, projectId === 'standalone');
+                            if (!data?.document_url) {
+                              setDocumentUrlModal(null);
+                              toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
+                              return;
+                            }
+                            setDocumentUrlModal({ url: data.document_url, name: data.document_name || name, uploadedBy: (data as any).uploaded_by_user?.full_name || data.uploaded_by, uploadDate: data.upload_date, previewLoading: true });
+                            fetchAndSetBlobUrl(data.document_url);
+                          } catch {
+                            setDocumentUrlModal(null);
+                            toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' });
+                          }
+                        } else if (equipmentId) {
+                          setViewingEquipmentId(equipmentId);
+                          setEquipmentDetailsTab('equipment-details');
+                        }
+                      }}
+                      className="border-blue-500 text-blue-600 hover:bg-blue-500 hover:text-white hover:border-blue-600"
+                    >
+                      View doc
+                    </Button>
+                  </div>
+                </>
+              )}
+
+              {isQAP && (
+                <>
+                  <p className="text-xs text-gray-500 mb-1">Activity completed</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.activityName ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Completed by</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.completedByDisplayName ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Department</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.department ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Update by</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.updatedByDisplayName ?? (log.created_by_user?.full_name || log.created_by_user?.email) ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Completed on</p>
+                  <p className="text-sm text-gray-700 mb-3">{dateStr}</p>
+                  <p className="text-xs text-gray-500 mb-1">Remarks</p>
+                  <p className="text-sm text-gray-700 mb-4">{log.metadata?.remarks ?? '—'}</p>
+                  <div className="pt-4 border-t border-gray-100 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        if (recentActivityDetailModal.equipmentId) {
+                          setRecentActivityDetailModal(null);
+                          setViewingEquipmentId(recentActivityDetailModal.equipmentId);
+                          setEquipmentDetailsTab('equipment-details');
+                        }
+                      }}
+                      className="border-teal-600 text-teal-600 hover:bg-teal-600 hover:text-white"
+                    >
+                      View in checklist
+                    </Button>
+                    {log.metadata?.document_id && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="border-blue-500 text-blue-600 hover:bg-blue-500 hover:text-white"
+                        onClick={async () => {
+                          const docId = log.metadata.document_id;
+                          setRecentActivityDetailModal(null);
+                          const data = await getDocumentUrlById(docId, projectId === 'standalone');
+                          if (data?.document_url) {
+                            setDocumentUrlModal({ name: log.metadata?.fileName || 'Document', url: data.document_url, uploadedBy: (data as any).uploaded_by_user?.full_name, uploadDate: data.upload_date, previewLoading: true });
+                            fetchAndSetBlobUrl(data.document_url);
+                          }
+                        }}
+                      >
+                        View doc
+                      </Button>
+                    )}
+                    {log.metadata?.progress_image_id && recentActivityDetailModal.equipmentId && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white"
+                        onClick={async () => {
+                          setRecentActivityDetailModal(null);
+                          const url = await fastAPI.getProgressImageUrlById(log.metadata.progress_image_id, projectId === 'standalone');
+                          if (url) setShowImagePreview({ url, equipmentId: recentActivityDetailModal.equipmentId!, currentIndex: 0 });
+                        }}
+                      >
+                        View image
+                      </Button>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {isVDCR && (
+                <>
+                  <p className="text-xs text-gray-500 mb-1">Document</p>
+                  <p className="text-sm text-gray-700 mb-3">{vdcrDocName}</p>
+                  {(log.old_value != null || log.new_value != null) && (
+                    <>
+                      <p className="text-xs text-gray-500 mb-1">Change</p>
+                      <p className="text-sm text-gray-700 mb-3">{[log.old_value, log.new_value].filter(Boolean).join(' → ')}</p>
+                    </>
+                  )}
+                  <p className="text-xs text-gray-500 mb-1">Department</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.department ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Completed by</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.created_by_user?.full_name || log.created_by_user?.email || '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Completed on</p>
+                  <p className="text-sm text-gray-700 mb-3">{dateStr}</p>
+                  <p className="text-xs text-gray-500 mb-1">Remarks</p>
+                  <p className="text-sm text-gray-700 mb-3">{log.metadata?.remarks ?? '—'}</p>
+                  <p className="text-xs text-gray-500 mb-1">Notable remarks</p>
+                  <p className="text-sm text-gray-700 mb-4">{log.metadata?.notable_change_title ?? log.metadata?.notableRemarks ?? '—'}</p>
+                  <div className="pt-4 border-t border-gray-100">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        if (recentActivityDetailModal.equipmentId) {
+                          setRecentActivityDetailModal(null);
+                          setViewingEquipmentId(recentActivityDetailModal.equipmentId);
+                          setEquipmentDetailsTab('equipment-details');
+                        }
+                      }}
+                      className="border-blue-600 text-blue-600 hover:bg-blue-600 hover:text-white"
+                    >
+                      View in Documentation
+                    </Button>
+                  </div>
+                </>
+              )}
+
+              {!isDoc && !isQAP && !isVDCR && (
+                <div className="pt-4 border-t border-gray-100 mt-4">
+                  <p className="text-xs text-gray-500 mb-2">View update</p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        const equipmentId = recentActivityDetailModal.equipmentId;
+                        const docId = log.metadata?.document_id;
+                        setRecentActivityDetailModal(null);
+                        if (docId) {
+                          const name = log.metadata?.fileName || log.metadata?.documentName || 'Document';
+                          setDocumentUrlModal({ name, loading: true, documentId: docId });
+                          try {
+                            const data = await getDocumentUrlById(docId, projectId === 'standalone');
+                            if (!data?.document_url) { setDocumentUrlModal(null); toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' }); return; }
+                            setDocumentUrlModal({ url: data.document_url, name: data.document_name || name, uploadedBy: (data as any).uploaded_by_user?.full_name || data.uploaded_by, uploadDate: data.upload_date, previewLoading: true });
+                            fetchAndSetBlobUrl(data.document_url);
+                          } catch { setDocumentUrlModal(null); toast({ title: 'Error', description: 'Could not load document.', variant: 'destructive' }); }
+                        } else if (equipmentId) { setViewingEquipmentId(equipmentId); setEquipmentDetailsTab('equipment-details'); }
+                      }}
+                      className="border-blue-500 text-blue-600 hover:bg-blue-500 hover:text-white hover:border-blue-600"
+                    >
+                      View document
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        const equipmentId = recentActivityDetailModal.equipmentId;
+                        const progressImageId = log.metadata?.progress_image_id;
+                        setRecentActivityDetailModal(null);
+                        if (progressImageId && equipmentId) {
+                          const url = await fastAPI.getProgressImageUrlById(progressImageId, projectId === 'standalone');
+                          if (url) setShowImagePreview({ url, equipmentId, currentIndex: 0 });
+                          else { toast({ title: 'Error', description: 'Could not load image.', variant: 'destructive' }); setViewingEquipmentId(equipmentId); setEquipmentDetailsTab('equipment-details'); }
+                        } else if (equipmentId) { setViewingEquipmentId(equipmentId); setEquipmentDetailsTab('equipment-details'); }
+                      }}
+                      className="border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white hover:border-orange-600"
+                    >
+                      View image
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Recent Activity updates list modal (carousel: 4 per page, Prev/Next, dots) */}
+      {recentActivityUpdatesModalEquipment && (() => {
+        const eqId = recentActivityUpdatesModalEquipment.equipmentId;
+        const allLogs = recentActivityLogsByEquipment[eqId] ?? [];
+        const logs = allLogs.filter((l: any) => RECENT_ACTIVITY_TYPES.includes(l.activity_type as any));
+        const loading = recentActivityLoadingByEquipment[eqId];
+
+        const search = recentActivitySearch.trim().toLowerCase();
+        const allDepartments = Array.from(
+          new Set(
+            logs
+              .map((l: any) => (l.metadata?.department ?? '').trim())
+              .filter((d: string) => d.length > 0)
+          )
+        ).sort((a, b) => a.localeCompare(b));
+
+        const filteredLogs = logs.filter((log: any) => {
+          const dept = (log.metadata?.department ?? '—').trim() || '—';
+          if (recentActivityDeptFilter !== 'All' && dept !== recentActivityDeptFilter) return false;
+          if (!search) return true;
+
+          const updateType = getUpdateTypeLabel(log);
+          const title = getRecentActivityRowTitle(log);
+          const remarks = log.metadata?.remarks ?? '';
+          const notableRemarks = (log.metadata?.notable_change_title ?? log.metadata?.notableRemarks ?? '').trim();
+          const isDocUpload = log.activity_type === 'document_uploaded' || log.activity_type === 'document_updated';
+          const byValue = isDocUpload
+            ? (log.created_by_user?.full_name ?? log.created_by_user?.email ?? '')
+            : (log.metadata?.completedByDisplayName ?? log.created_by_user?.full_name ?? log.created_by_user?.email ?? '');
+
+          const haystack = [updateType, title, dept, remarks, notableRemarks, byValue].join(' ').toLowerCase();
+          return haystack.includes(search);
+        });
+
+        const ITEMS_PER_PAGE = 4;
+        const totalPages = Math.max(1, Math.ceil(filteredLogs.length / ITEMS_PER_PAGE));
+        const page = Math.min(recentActivityUpdatesModalPage, totalPages - 1);
+        const pageLogs = filteredLogs.slice(page * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE + ITEMS_PER_PAGE);
+        const canPrev = page > 0;
+        const canNext = page < totalPages - 1;
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => { setRecentActivityUpdatesModalEquipment(null); setRecentActivityExpandedLogId(null); }}>
+            <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-6 max-w-2xl w-full mx-4 max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-2 flex-shrink-0">
+                <h3 className="text-lg font-semibold text-gray-900">
+                  Recent activity updates
+                  {recentActivityUpdatesModalEquipment.tagNumber && (
+                    <span className="text-sm font-normal text-gray-500 ml-2">({recentActivityUpdatesModalEquipment.tagNumber})</span>
+                  )}
+                </h3>
+                <Button variant="ghost" size="sm" onClick={() => { setRecentActivityUpdatesModalEquipment(null); setRecentActivityExpandedLogId(null); }} className="text-gray-500 hover:text-gray-700">
+                  <X size={20} />
+                </Button>
+              </div>
+              <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                <Input
+                  value={recentActivitySearch}
+                  onChange={(e) => {
+                    setRecentActivitySearch(e.target.value);
+                    setRecentActivityUpdatesModalPage(0);
+                  }}
+                  placeholder="Search updates, department, remarks..."
+                  className="w-full md:w-64"
+                  aria-label="Search recent activity updates"
+                />
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-600">Department:</span>
+                  <Select
+                    value={recentActivityDeptFilter}
+                    onValueChange={(value) => {
+                      setRecentActivityDeptFilter(value);
+                      setRecentActivityUpdatesModalPage(0);
+                    }}
+                  >
+                    <SelectTrigger className="h-8 w-40 text-xs">
+                      <SelectValue placeholder="All departments" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="All">All departments</SelectItem>
+                      {allDepartments.map((dept) => (
+                        <SelectItem key={dept} value={dept}>
+                          {dept}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              {loading || logs === undefined ? (
+                <div className="flex items-center justify-center py-12 text-gray-500 text-sm">
+                  <Loader2 className="w-6 h-6 animate-spin mr-2" />
+                  Loading activity...
+                </div>
+              ) : !logs.length ? (
+                <p className="py-8 text-center text-sm text-gray-500">No documentation or QAP updates for this equipment yet.</p>
+              ) : (
+                <>
+                  <div className="space-y-3 flex-1 min-h-0 overflow-y-auto pr-1">
+                    {pageLogs.map((log: any, idx: number) => {
+                      const logKey = log.id || `log-${idx}`;
+                      const isExpanded = recentActivityExpandedLogId === logKey;
+                      const updateType = getUpdateTypeLabel(log);
+                      const title = getRecentActivityRowTitle(log);
+                      const dateStr = log.created_at ? new Date(log.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+                      const isDocUpload = log.activity_type === 'document_uploaded' || log.activity_type === 'document_updated';
+                      const byLabel = isDocUpload ? 'Uploaded by' : 'Completed by';
+                      const byValue = isDocUpload ? (log.created_by_user?.full_name ?? log.created_by_user?.email ?? '—') : (log.metadata?.completedByDisplayName ?? log.created_by_user?.full_name ?? log.created_by_user?.email ?? '—');
+                      const dateLabel = isDocUpload ? 'Uploaded on' : 'Completed on';
+                      const dept = log.metadata?.department ?? '—';
+                      const remarks = log.metadata?.remarks ?? '';
+                      const notableRemarks = (log.metadata?.notable_change_title ?? log.metadata?.notableRemarks ?? '').trim();
+                      const isDocPhase = updateType === 'Documentation update';
+                      const isQAP = log.activity_type === 'activity_completed';
+                      const completionId = typeof log.metadata?.completion_id === 'string' ? log.metadata.completion_id : '';
+                      const inspectionReportCount = Number(log.metadata?.inspection_report_count ?? 0);
+                      const completionImageCount = Number(log.metadata?.image_count ?? 0);
+                      const hasDoc = !!log.metadata?.document_id;
+                      const hasCompletionReports = isQAP && !!completionId && inspectionReportCount > 0;
+                      const hasProgressImage = isQAP && !!log.metadata?.progress_image_id;
+                      const hasCompletionImage = isQAP && !!completionId && completionImageCount > 0;
+                      const hasImage = hasProgressImage || hasCompletionImage;
+                      const badgeClass = updateType === 'Documentation update' ? 'bg-blue-100 text-blue-800 border-blue-200' : updateType === 'QAP update' ? 'bg-teal-100 text-teal-800 border-teal-200' : updateType === 'Inspection report update' ? 'bg-orange-100 text-orange-800 border-orange-200' : updateType === 'Task completion update' ? 'bg-indigo-100 text-indigo-800 border-indigo-200' : updateType === 'Audit, TPI & other docs' ? 'bg-gray-100 text-gray-800 border-gray-200' : 'bg-gray-100 text-gray-800 border-gray-200';
+                      return (
+                        <div
+                          key={logKey}
+                          className={`rounded-xl border bg-white shadow-sm transition-all p-4 text-left flex flex-col gap-2 ${isExpanded ? 'border-blue-300 ring-1 ring-blue-200' : 'border-gray-200 hover:shadow-md'}`}
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className={`inline-flex shrink-0 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide rounded border ${badgeClass}`}>
+                              {updateType}
+                            </span>
+                            <span className="text-sm font-semibold text-gray-900 break-words">{title}</span>
+                          </div>
+                          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-600">
+                            <span>Department: {dept}</span>
+                            <span>{byLabel}: {byValue}</span>
+                            <span>{dateLabel}: <span className="font-semibold text-blue-600 bg-blue-50/80 px-1.5 py-0.5 rounded">{dateStr}</span></span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-1">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className={`text-xs h-7 ${isExpanded ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-blue-500 text-blue-600 hover:bg-blue-500 hover:text-white'}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRecentActivityExpandedLogId(isExpanded ? null : logKey);
+                              }}
+                            >
+                              {isExpanded ? 'Collapse' : 'View details'}
+                            </Button>
+                          </div>
+                          {isExpanded && (
+                            <div className="pt-3 mt-2 border-t border-gray-100 flex flex-col gap-2">
+                              <div className="text-xs text-gray-600">
+                                <span className="font-medium text-gray-700">Remarks: </span>
+                                <span>{remarks || '—'}</span>
+                              </div>
+                              {isDocPhase && (
+                                <div className="text-xs text-gray-600">
+                                  <span className="font-medium text-gray-700">Notable remarks: </span>
+                                  <span>{notableRemarks || '—'}</span>
+                                </div>
+                              )}
+                              <div className="flex flex-wrap items-center gap-2">
+                                {hasDoc && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="text-xs h-7 border-blue-500 text-blue-600 hover:bg-blue-500 hover:text-white"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (log.metadata?.document_id) {
+                                        setDocumentUrlModal({ name: log.metadata?.fileName || log.metadata?.documentName || 'Document', loading: true, documentId: log.metadata.document_id });
+                                        getDocumentUrlById(log.metadata.document_id, projectId === 'standalone').then((data) => {
+                                          if (!data?.document_url) { setDocumentUrlModal(null); return; }
+                                          setDocumentUrlModal({ url: data.document_url, name: data.document_name || '', uploadedBy: (data as any).uploaded_by_user?.full_name, uploadDate: data.upload_date, previewLoading: true });
+                                          fetchAndSetBlobUrl(data.document_url);
+                                        }).catch(() => setDocumentUrlModal(null));
+                                      } else {
+                                        setViewingEquipmentId(eqId);
+                                        setEquipmentDetailsTab('equipment-details');
+                                      }
+                                    }}
+                                  >
+                                    View doc
+                                  </Button>
+                                )}
+                                {hasImage && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="text-xs h-7 border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white"
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      const url = hasProgressImage
+                                        ? await fastAPI.getProgressImageUrlById(log.metadata.progress_image_id, projectId === 'standalone')
+                                        : await fastAPI.getEquipmentActivityCompletionImageUrl(completionId, 0, projectId === 'standalone');
+                                      if (url) setShowImagePreview({ url, equipmentId: eqId, currentIndex: 0 });
+                                    }}
+                                  >
+                                    View image
+                                  </Button>
+                                )}
+                                {hasCompletionReports && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="text-xs h-7 border-indigo-500 text-indigo-600 hover:bg-indigo-500 hover:text-white"
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      setInspectionReportListLoading(true);
+                                      try {
+                                        const reports = await fastAPI.getEquipmentActivityCompletionInspectionReports(completionId, projectId === 'standalone');
+                                        setInspectionReportListModal({ completionId, reports });
+                                      } finally {
+                                        setInspectionReportListLoading(false);
+                                      }
+                                    }}
+                                  >
+                                    View report{inspectionReportCount > 1 ? 's' : ''}
+                                  </Button>
+                                )}
+                                {!hasDoc && !hasImage && !hasCompletionReports && (
+                                  <span className="text-xs text-gray-400">No doc or image linked to this update.</span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {totalPages > 1 && (
+                    <div className="flex items-center justify-between gap-4 mt-4 pt-4 border-t border-gray-100 flex-shrink-0">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={!canPrev}
+                        onClick={() => setRecentActivityUpdatesModalPage(p => Math.max(0, p - 1))}
+                        className="shrink-0"
+                      >
+                        <ChevronLeft className="w-4 h-4 mr-1" />
+                        Previous
+                      </Button>
+                      <div className="flex items-center gap-1.5" aria-label="Page navigation">
+                        {Array.from({ length: totalPages }, (_, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => setRecentActivityUpdatesModalPage(i)}
+                            className={`w-8 h-8 rounded-full text-xs font-medium transition-colors ${i === page ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                            aria-label={`Page ${i + 1}`}
+                            aria-current={i === page ? 'page' : undefined}
+                          >
+                            {i + 1}
+                          </button>
+                        ))}
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={!canNext}
+                        onClick={() => setRecentActivityUpdatesModalPage(p => Math.min(totalPages - 1, p + 1))}
+                        className="shrink-0"
+                      >
+                        Next
+                        <ChevronRight className="w-4 h-4 ml-1" />
+                      </Button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Document Preview Modal */}
       {documentPreview && (
@@ -12062,6 +12009,382 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           </div>
         </div>
       )}
+
+      {/* QAP full popup – opens when View QAP is clicked; auto-scrolls to current step */}
+      {qapPopupEquipmentId && (() => {
+        const popupItem = localEquipment.find((e: any) => e.id === qapPopupEquipmentId);
+        const list = equipmentActivities[qapPopupEquipmentId] || [];
+        const commencementRaw = popupItem ? (popupItem as any).commencementDate ?? (popupItem as any).commencement_date ?? null : null;
+        const commencementStr = commencementRaw ? (() => {
+          try {
+            const d = new Date(commencementRaw);
+            return isNaN(d.getTime()) ? null : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+          } catch { return null; }
+        })() : null;
+        return createPortal(
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100] p-2 sm:p-4" onClick={() => setQapPopupEquipmentId(null)}>
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[92vh] sm:max-h-[90vh] overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+              <div className="p-3 sm:p-4 border-b border-gray-100 flex-shrink-0">
+                <div className="flex items-start sm:items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <BarChart3 className="w-4 h-4 sm:w-5 sm:h-5 text-indigo-600 flex-shrink-0" />
+                    <div>
+                      <h4 className="text-sm font-semibold text-gray-900">QAP / Activities</h4>
+                      {commencementStr && <p className="text-[11px] sm:text-xs text-gray-500 truncate">Equipment started on <span className="font-semibold text-gray-700">{commencementStr}</span></p>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 flex-wrap sm:flex-nowrap flex-shrink-0">
+                    <Button type="button" size="icon" variant="ghost" className="h-7 w-7" onClick={() => { openEditActivitiesModal(qapPopupEquipmentId); }} title="Edit activity list"><Edit className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-gray-600" /></Button>
+                    <Button type="button" size="icon" variant="ghost" className="h-7 w-7" onClick={() => { setActivitiesHistoryEquipmentId(qapPopupEquipmentId); setActivitiesHistoryOpen(true); }} title="History"><History className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-gray-600" /></Button>
+                    <label className="cursor-pointer inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-gray-100 text-gray-600" title="Replace activities">
+                      <Upload className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                      <input type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUploadActivitiesExcel(qapPopupEquipmentId, f); e.target.value = ''; }} disabled={!!uploadingActivitiesForEquipment} />
+                    </label>
+                    <Button type="button" size="sm" variant="outline" className="h-7 text-[11px] sm:text-xs px-2" onClick={() => exportActivitiesReport(qapPopupEquipmentId)}>Export</Button>
+                    <Button type="button" size="sm" variant="outline" className="h-7 text-[11px] sm:text-xs px-2 gap-1" onClick={() => setQapPopupEquipmentId(null)} title="Close"><X className="w-3 h-3 sm:w-3.5 sm:h-3.5" /> Close</Button>
+                  </div>
+                </div>
+              </div>
+              <div ref={qapPopupScrollRef} className="p-3 sm:p-4 flex-1 min-h-0 overflow-y-auto">
+                {!list.length ? (
+                  <div className="space-y-3 py-4">
+                    <p className="text-xs text-gray-600 text-center">Upload an Excel sheet with activities (Sr. No., Activity Name, Activity Type, Target). First row: Commencement Date.</p>
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                      <Button type="button" size="sm" variant="outline" onClick={downloadActivitiesTemplate}>
+                        <Download size={14} className="mr-1" />
+                        Download sample template
+                      </Button>
+                      <label className="cursor-pointer inline-flex items-center justify-center rounded-md border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50">
+                        <Upload className="w-3.5 h-3.5 mr-1" />
+                        Upload Excel
+                        <input type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUploadActivitiesExcel(qapPopupEquipmentId, f); e.target.value = ''; }} disabled={!!uploadingActivitiesForEquipment} />
+                      </label>
+                      {uploadingActivitiesForEquipment === qapPopupEquipmentId && (
+                        <span className="text-xs text-indigo-600">Uploading...</span>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div className="flex items-center justify-between sm:justify-end gap-2 mb-3">
+                      <Label htmlFor="qap-variance-toggle" className="text-xs font-medium text-gray-600 cursor-pointer">Show variance days calculator</Label>
+                      <Switch
+                        id="qap-variance-toggle"
+                        checked={qapShowVarianceDays}
+                        onCheckedChange={setQapShowVarianceDays}
+                      />
+                    </div>
+                    <div className="relative">
+                      <div className="absolute left-[11px] top-2 bottom-2 w-1 bg-green-500" />
+                      {(() => {
+                      const dayMs = 24 * 60 * 60 * 1000;
+                      const resolveTarget = (a: any): string | null => {
+                        const explicit = parseExplicitTargetDate(a.target_date) ?? parseExplicitTargetDate(a.target_relative);
+                        return explicit ?? (commencementRaw && a.target_relative ? computeTargetDate(commencementRaw, a.target_relative) : a.target_date || null);
+                      };
+                      const resolvedTargetDates = list.map((a: any) => resolveTarget(a));
+                      return list.map((activity: any, idx: number) => {
+                      const isCompleted = !!activity.completion;
+                      const isCurrent = !isCompleted && list.slice(0, idx).every((a: any) => !!a.completion);
+                      const rawDate = isCompleted && activity.completion?.completed_on
+                        ? activity.completion.completed_on
+                        : activity.target_date || activity.target_relative;
+                      const dateStr = rawDate && rawDate !== activity.target_relative
+                        ? (() => {
+                            try {
+                              const d = new Date(rawDate);
+                              return isNaN(d.getTime()) ? rawDate : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                            } catch { return rawDate; }
+                          })()
+                        : (rawDate || '—');
+                      const daysVariance = activity.completion?.completed_on && activity.target_date
+                        ? (() => {
+                            try {
+                              const completed = new Date(activity.completion.completed_on);
+                              const target = new Date(activity.target_date);
+                              if (isNaN(completed.getTime()) || isNaN(target.getTime())) return null;
+                              const diffMs = completed.getTime() - target.getTime();
+                              return Math.round(diffMs / (24 * 60 * 60 * 1000));
+                            } catch { return null; }
+                          })()
+                        : null;
+                      const varianceLabel = isCompleted && daysVariance !== null
+                        ? daysVariance === 0
+                          ? 'On time'
+                          : daysVariance < 0
+                            ? `${Math.abs(daysVariance)} days early`
+                            : `${daysVariance} days late`
+                        : null;
+                      const myTarget = resolvedTargetDates[idx];
+                      let predIdx: number | null = null;
+                      if (myTarget) {
+                        const myMs = new Date(myTarget).getTime();
+                        if (!isNaN(myMs)) {
+                          let bestMs = -Infinity;
+                          for (let j = 0; j < idx; j++) {
+                            const tj = resolvedTargetDates[j];
+                            if (!tj) continue;
+                            const mj = new Date(tj).getTime();
+                            if (isNaN(mj) || mj >= myMs) continue;
+                            if (mj > bestMs) { bestMs = mj; predIdx = j; }
+                          }
+                        }
+                      }
+                      const refTargetDate = predIdx !== null ? resolvedTargetDates[predIdx] : commencementRaw;
+                      const refActualDate = predIdx !== null && list[predIdx].completion?.completed_on
+                        ? list[predIdx].completion.completed_on
+                        : commencementRaw;
+                      const daysAssigned = (refTargetDate && myTarget) ? (() => {
+                        try {
+                          const refMs = new Date(refTargetDate).getTime();
+                          const tMs = new Date(myTarget).getTime();
+                          if (isNaN(refMs) || isNaN(tMs)) return null;
+                          return Math.round((tMs - refMs) / dayMs);
+                        } catch { return null; }
+                      })() : null;
+                      const daysTaken = (isCompleted && activity.completion?.completed_on && refActualDate) ? (() => {
+                        try {
+                          const refMs = new Date(refActualDate).getTime();
+                          const doneMs = new Date(activity.completion.completed_on).getTime();
+                          if (isNaN(refMs) || isNaN(doneMs)) return null;
+                          return Math.round((doneMs - refMs) / dayMs);
+                        } catch { return null; }
+                      })() : null;
+                      const hasPreview = isCompleted && daysAssigned !== null && daysTaken !== null;
+                      const previewCapsule = hasPreview
+                        ? (() => {
+                            const diff = daysTaken! - daysAssigned!;
+                            if (diff > 0) return { label: `${diff} days late`, className: 'bg-red-500 text-white' };
+                            if (diff < 0) return { label: `${Math.abs(diff)} days early`, className: 'bg-green-600 text-white' };
+                            return { label: 'On time', className: 'bg-gray-500 text-white' };
+                          })()
+                        : null;
+                      const targetDateStr = activity.target_date
+                        ? (() => {
+                            try {
+                              const d = new Date(activity.target_date);
+                              return isNaN(d.getTime()) ? activity.target_date : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                            } catch { return activity.target_date; }
+                          })()
+                        : (activity.target_relative || '—');
+                      const completedOnStr = activity.completion?.completed_on
+                        ? (() => {
+                            try {
+                              const d = new Date(activity.completion.completed_on);
+                              return isNaN(d.getTime()) ? activity.completion.completed_on : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                            } catch { return activity.completion.completed_on; }
+                          })()
+                        : null;
+                      const isStepDetailsOpen = qapStepDetails?.equipmentId === qapPopupEquipmentId && qapStepDetails?.activityId === (activity.id || String(idx));
+                      const isMilestone = activity.activity_type === 'milestone';
+                      const milestoneRingClass = isMilestone ? 'rounded-full ring-2 ring-green-500 ring-offset-2 ring-offset-white inline-flex' : 'inline-flex';
+                      return (
+                        <div
+                          key={activity.id || idx}
+                          className="relative flex gap-3 pb-4 last:pb-0"
+                          {...(isCurrent ? { 'data-qap-current': 'true' } : {})}
+                        >
+                          <div className="relative z-10 flex-shrink-0 mt-0.5">
+                            {isCompleted ? (
+                              <span className={milestoneRingClass}>
+                                <div className="w-6 h-6 rounded-full bg-green-600 flex items-center justify-center"><Check className="w-3.5 h-3.5 text-white" /></div>
+                              </span>
+                            ) : isCurrent ? (
+                              <span className={milestoneRingClass}>
+                                <div className="w-6 h-6 rounded-full bg-green-500 flex items-center justify-center" />
+                              </span>
+                            ) : (
+                              <span className={milestoneRingClass}>
+                                <div className="w-6 h-6 rounded-full border-2 border-gray-300 bg-white" />
+                              </span>
+                            )}
+                          </div>
+                          <div
+                            className="group flex-1 min-w-0 pt-0 cursor-pointer flex items-start justify-between gap-2 flex-wrap rounded-lg px-2 -mx-2 py-1 -my-0.5 transition-colors hover:bg-gray-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setQapStepDetails((prev) =>
+                                prev?.equipmentId === qapPopupEquipmentId && prev?.activityId === (activity.id || String(idx))
+                                  ? null
+                                  : { equipmentId: qapPopupEquipmentId, activityId: activity.id || String(idx) }
+                              );
+                            }}
+                            title="Click to view details"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <p className="text-sm font-medium text-gray-900">{activity.activity_name || '—'}</p>
+                              <p className="text-xs text-gray-500 mt-0.5">
+                                {isCompleted ? `Completed ${dateStr}` : isCurrent ? `Current - ${dateStr}` : `Target - ${dateStr}`}
+                              </p>
+                              {isCurrent && (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="default"
+                                  className="mt-2 h-7 text-xs px-2 sm:px-3 bg-emerald-600 hover:bg-emerald-700"
+                                  onClick={(e) => { e.stopPropagation(); openMarkCompleteModal(activity, qapPopupEquipmentId); }}
+                                >
+                                  <Check className="w-3 h-3 mr-1" />
+                                  Mark complete
+                                </Button>
+                              )}
+                              {isStepDetailsOpen && (
+                                <div className="mt-3 p-3 rounded-lg bg-gray-50 border border-gray-200 text-left space-y-2 text-xs" onClick={(e) => e.stopPropagation()}>
+                                  <div className="space-y-2">
+                                    <div className="flex items-center gap-2">
+                                      <Calendar className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                                      <span className="text-gray-700">Expected date of completion: <span className="font-medium text-gray-900">{targetDateStr}</span></span>
+                                    </div>
+                                    {completedOnStr && (
+                                      <div className="flex items-center gap-2">
+                                        <Calendar className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                                        <span className="text-gray-700">Actual date of completion: <span className="font-medium text-gray-900">{completedOnStr}</span></span>
+                                      </div>
+                                    )}
+                                    {isCompleted && (activity.completion?.completed_by_display_name ?? activity.completion?.completed_by_user_id) && (
+                                      <div className="flex items-center gap-2">
+                                        <User className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                                        <span className="text-gray-700">Completed by: <span className="font-medium text-gray-900">{activity.completion?.completed_by_display_name || activity.completion?.completed_by_user_id || '—'}</span></span>
+                                      </div>
+                                    )}
+                                    {daysVariance !== null && (
+                                      <div className="space-y-1">
+                                        <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${daysVariance <= 0 ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'}`}>
+                                          <Check className="w-3.5 h-3.5" />
+                                          {daysVariance === 0 ? 'On time' : daysVariance < 0 ? `${Math.abs(daysVariance)} days early` : `${daysVariance} days late`}
+                                        </span>
+                                        <p className="text-xs text-gray-500">from targeted timeline</p>
+                                      </div>
+                                    )}
+                                  </div>
+                                  {activity.completion?.notes && (
+                                    <>
+                                      <div className="border-t border-gray-200 mt-2 pt-2" />
+                                      <div>
+                                        <span className="text-gray-500 block mb-0.5">Remark (notes when marked complete):</span>
+                                        <div className="text-gray-800 bg-white p-2 rounded border border-gray-100 text-xs break-words whitespace-normal max-h-[7.5rem] overflow-y-auto">{activity.completion.notes}</div>
+                                      </div>
+                                    </>
+                                  )}
+                                  {(() => {
+                                    const completionId = activity.completion?.id;
+                                    const imageCount = completionId
+                                      ? (activity.completion?.image_count != null ? activity.completion.image_count : 1)
+                                      : 0;
+                                    if (!completionId || imageCount === 0) return null;
+                                    const isViewing = stepImageViewer?.completionId === completionId;
+                                    const currentIndex = isViewing ? (stepImageViewer?.currentIndex ?? 0) : 0;
+                                    const cacheKey = `${completionId}_${currentIndex}`;
+                                    const imageUrl = stepImageCache[cacheKey];
+                                    const loading = stepImageLoading[cacheKey];
+                                    return (
+                                      <div className="pt-1 space-y-2">
+                                        {!isViewing ? (
+                                          <Button type="button" size="sm" variant="outline" className="h-7 text-xs" onClick={() => setStepImageViewer({ completionId, currentIndex: 0 })}>
+                                            <Image className="w-3 h-3 mr-1" />
+                                            View step image
+                                          </Button>
+                                        ) : (
+                                          <div className="space-y-2">
+                                            {imageCount > 1 && (
+                                              <div className="flex items-center justify-center gap-2">
+                                                <Button type="button" size="icon" variant="outline" className="h-7 w-7" onClick={(e) => { e.stopPropagation(); setStepImageViewer({ completionId, currentIndex: (currentIndex - 1 + imageCount) % imageCount }); }}><ChevronLeft className="w-3.5 h-3.5" /></Button>
+                                                <span className="text-xs text-gray-600">{currentIndex + 1} / {imageCount}</span>
+                                                <Button type="button" size="icon" variant="outline" className="h-7 w-7" onClick={(e) => { e.stopPropagation(); setStepImageViewer({ completionId, currentIndex: (currentIndex + 1) % imageCount }); }}><ChevronRight className="w-3.5 h-3.5" /></Button>
+                                              </div>
+                                            )}
+                                            {loading && !imageUrl ? (
+                                              <div className="h-32 rounded border border-gray-200 flex items-center justify-center text-gray-500 text-xs">Loading…</div>
+                                            ) : imageUrl ? (
+                                              <div
+                                                className="relative rounded border border-gray-200 max-h-48 bg-gray-50 cursor-pointer group/img overflow-hidden"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  setStepImagePreview({ completionId, currentIndex, imageCount });
+                                                }}
+                                                title="Click to view full size and navigate"
+                                              >
+                                                <img
+                                                  src={imageUrl}
+                                                  alt="Step"
+                                                  className="max-w-full w-full rounded max-h-48 object-contain transition-shadow group-hover/img:ring-2 group-hover/img:ring-indigo-300"
+                                                />
+                                                <div className="absolute inset-0 rounded bg-black/0 group-hover/img:bg-black/30 flex items-center justify-center transition-colors">
+                                                  <Eye className="w-10 h-10 text-white opacity-0 group-hover/img:opacity-100 drop-shadow transition-opacity" />
+                                                </div>
+                                              </div>
+                                            ) : null}
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                              <Button type="button" size="sm" variant="outline" className="h-7 text-xs" onClick={(e) => { e.stopPropagation(); setStepImagePreview({ completionId, currentIndex, imageCount }); }} title="Open full size with navigation">
+                                                <Image className="w-3 h-3 mr-1" />
+                                                View full size
+                                              </Button>
+                                              <Button type="button" size="sm" variant="ghost" className="h-7 text-xs" onClick={(e) => { e.stopPropagation(); setStepImageViewer(null); }}>Close image</Button>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
+                                  {(() => {
+                                    const completionId = activity.completion?.id;
+                                    const reportCount = activity.completion?.inspection_report_count ?? 0;
+                                    if (!completionId || reportCount === 0) return null;
+                                    return (
+                                      <div className="pt-1">
+                                        <Button
+                                          type="button"
+                                          size="sm"
+                                          variant="outline"
+                                          className="h-7 text-xs"
+                                          disabled={inspectionReportListLoading}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setInspectionReportListLoading(true);
+                                            fastAPI.getEquipmentActivityCompletionInspectionReports(completionId, projectId === 'standalone')
+                                              .then((reports) => setInspectionReportListModal({ completionId, reports }))
+                                              .finally(() => setInspectionReportListLoading(false));
+                                          }}
+                                        >
+                                          <FileText className="w-3 h-3 mr-1" />
+                                          {inspectionReportListLoading ? 'Loading…' : `View uploaded documents (${reportCount})`}
+                                        </Button>
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              {qapShowVarianceDays && hasPreview && !isStepDetailsOpen && previewCapsule && (
+                                <div className="text-right">
+                                  <div className="text-xs font-medium text-gray-600">
+                                    <div>{daysAssigned} days assigned</div>
+                                    <div>{daysTaken} days taken</div>
+                                  </div>
+                                  <span className={`inline-block mt-1 px-2 py-0.5 rounded text-xs font-medium text-white ${previewCapsule.className}`}>
+                                    {previewCapsule.label}
+                                  </span>
+                                </div>
+                              )}
+                              <span className="text-gray-400 group-hover:text-gray-600 transition-colors flex-shrink-0" aria-hidden>
+                                {isStepDetailsOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    });
+                    })()}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>,
+          document.body
+        );
+      })()}
 
       {/* Add Technical Section Modal */}
       <AddTechnicalSectionModal
@@ -12436,7 +12759,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
       {/* Mark activity complete modal */}
       {markCompleteModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100] p-4" onClick={() => setMarkCompleteModalOpen(false)}>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[110] p-4" onClick={() => setMarkCompleteModalOpen(false)}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto p-4" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold text-gray-900">Mark activity complete</h3>
@@ -12459,6 +12782,56 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   onChange={e => setMarkCompleteModalData(prev => ({ ...prev, completedOn: e.target.value }))}
                   className="mt-1 text-sm h-9"
                 />
+              </div>
+              {/* Percentage completed: fixed weight (from QAP) or manual slider */}
+              <div className="rounded-lg border border-emerald-200 bg-gradient-to-br from-emerald-50/80 to-teal-50/60 p-3 space-y-2">
+                {markCompleteModalData.progressWeight != null ? (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <Label className="text-xs font-medium text-gray-800 flex items-center gap-1.5">
+                        <TrendingUp className="w-4 h-4 text-emerald-600" />
+                        Progress (fixed from QAP)
+                      </Label>
+                      <span className="text-sm font-bold text-emerald-700 tabular-nums">{markCompleteModalData.percentageCompleted}%</span>
+                    </div>
+                    <p className="text-[11px] text-gray-500">This step adds {markCompleteModalData.progressWeight}% (defined in QAP). Total progress will be {markCompleteModalData.percentageCompleted}%.</p>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <Label className="text-xs font-medium text-gray-800 flex items-center gap-1.5">
+                        <TrendingUp className="w-4 h-4 text-emerald-600" />
+                        Percentage completed
+                      </Label>
+                      <span className="text-sm font-bold text-emerald-700 tabular-nums">{markCompleteModalData.percentageCompleted}%</span>
+                    </div>
+                    <p className="text-[11px] text-gray-500">Progress can only move forward (min {markCompleteModalData.currentProgress}%)</p>
+                    <div className="flex w-full items-center py-2" style={{ minHeight: 28 }}>
+                      {markCompleteModalData.currentProgress > 0 && (
+                        <div
+                          className={`h-2 flex-shrink-0 bg-emerald-500 transition-[width] duration-200 ${markCompleteModalData.currentProgress >= 100 ? 'rounded-full' : 'rounded-l-full rounded-r-none'}`}
+                          style={{ width: `${markCompleteModalData.currentProgress}%` }}
+                        />
+                      )}
+                      {markCompleteModalData.currentProgress < 100 && renderPercentageRemainingSlider()}
+                      {markCompleteModalData.currentProgress === 100 && (
+                        <div className="h-2 flex-1 rounded-r-full bg-emerald-500" />
+                      )}
+                    </div>
+                    <div className="grid grid-cols-10 gap-1 pt-0.5 min-w-0">
+                      {[10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map((n) => (
+                        <button
+                          key={n}
+                          type="button"
+                          onClick={() => setMarkCompleteModalData(prev => ({ ...prev, percentageCompleted: Math.max(n, prev.currentProgress) }))}
+                          className={`min-w-0 px-1 py-0.5 rounded text-[10px] font-medium transition-all ${markCompleteModalData.percentageCompleted >= n ? 'bg-emerald-600 text-white shadow-sm' : 'bg-white border border-emerald-200 text-emerald-700 hover:bg-emerald-100'}`}
+                        >
+                          {n}%
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
               </div>
               <div>
                 <Label className="text-xs text-gray-700">Completed by (team)</Label>
@@ -12487,6 +12860,43 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 </Select>
               </div>
               <div>
+                <Label className="text-xs text-gray-700">Department (optional)</Label>
+                <p className="text-[11px] text-gray-500 mt-0.5 mb-1">From Documentation tab or add new. Used for inspection reports by department.</p>
+                <Select
+                  value={markCompleteModalData.department || '__none__'}
+                  onValueChange={value => {
+                    if (value === '__add_new__') {
+                      setMarkCompleteModalData(prev => ({ ...prev, department: '__add_new__' }));
+                      return;
+                    }
+                    setMarkCompleteModalData(prev => ({ ...prev, department: value === '__none__' ? '' : value }));
+                  }}
+                >
+                  <SelectTrigger className="mt-1 text-sm h-9">
+                    <SelectValue placeholder="Select department..." />
+                  </SelectTrigger>
+                  <SelectContent className="z-[200]">
+                    <SelectItem value="__none__">— None —</SelectItem>
+                    {markCompleteAvailableDepartments.map((d) => (
+                      <SelectItem key={d} value={d}>{d}</SelectItem>
+                    ))}
+                    <SelectItem value="__add_new__">+ Add new department...</SelectItem>
+                  </SelectContent>
+                </Select>
+                {(markCompleteModalData.department === '__add_new__' || (markCompleteModalData.department && !markCompleteAvailableDepartments.includes(markCompleteModalData.department))) && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <Input
+                      value={markCompleteNewDepartmentInput}
+                      onChange={e => setMarkCompleteNewDepartmentInput(e.target.value)}
+                      placeholder="New department name"
+                      className="text-sm h-9"
+                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); const v = markCompleteNewDepartmentInput.trim(); if (v) { setMarkCompleteAvailableDepartments(prev => [...prev, v].sort()); setMarkCompleteModalData(prev => ({ ...prev, department: v })); setMarkCompleteNewDepartmentInput(''); } } }}
+                    />
+                    <Button type="button" size="sm" variant="outline" className="h-9" onClick={() => { const v = markCompleteNewDepartmentInput.trim(); if (v) { setMarkCompleteAvailableDepartments(prev => [...prev, v].sort()); setMarkCompleteModalData(prev => ({ ...prev, department: v })); setMarkCompleteNewDepartmentInput(''); } }}>Add</Button>
+                  </div>
+                )}
+              </div>
+              <div>
                 <Label className="text-xs text-gray-700">Notes (optional)</Label>
                 <Textarea
                   value={markCompleteModalData.notes}
@@ -12496,7 +12906,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 />
               </div>
               <div>
-                <Label className="text-xs text-gray-700">Upload image (optional)</Label>
+                <Label className="text-xs text-gray-700">Upload image(s) (optional)</Label>
                 <div className="flex flex-row items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
                   <input
                     ref={markCompleteCameraInputRef}
@@ -12504,7 +12914,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     accept="image/*"
                     capture="environment"
                     onChange={e => {
-                      setMarkCompleteModalData(prev => ({ ...prev, imageFile: e.target.files?.[0] || null }));
+                      const f = e.target.files?.[0];
+                      if (f) setMarkCompleteModalData(prev => ({ ...prev, imageFiles: [...prev.imageFiles, f] }));
                       e.target.value = '';
                     }}
                     className="hidden"
@@ -12514,8 +12925,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     ref={markCompleteGalleryInputRef}
                     type="file"
                     accept="image/*"
+                    multiple
                     onChange={e => {
-                      setMarkCompleteModalData(prev => ({ ...prev, imageFile: e.target.files?.[0] || null }));
+                      const files = e.target.files ? Array.from(e.target.files) : [];
+                      if (files.length) setMarkCompleteModalData(prev => ({ ...prev, imageFiles: [...prev.imageFiles, ...files] }));
                       e.target.value = '';
                     }}
                     className="hidden"
@@ -12535,10 +12948,38 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     onClick={e => e.stopPropagation()}
                   >
                     <Upload className="w-4 h-4" />
-                    Choose file
+                    Choose file(s)
                   </label>
                   <span className="text-sm text-gray-500">
-                    {markCompleteModalData.imageFile ? markCompleteModalData.imageFile.name : 'No file chosen'}
+                    {markCompleteModalData.imageFiles?.length ? `${markCompleteModalData.imageFiles.length} file(s) chosen` : 'No file chosen'}
+                  </span>
+                </div>
+              </div>
+              <div>
+                <Label className="text-xs text-gray-700">Upload inspection reports (if applicable)</Label>
+                <div className="flex flex-row items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+                  <input
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    multiple
+                    onChange={e => {
+                      const files = e.target.files ? Array.from(e.target.files) : [];
+                      if (files.length) setMarkCompleteModalData(prev => ({ ...prev, reportFiles: [...(prev.reportFiles ?? []), ...files] }));
+                      e.target.value = '';
+                    }}
+                    className="hidden"
+                    id="mark-complete-reports-grid"
+                  />
+                  <label
+                    htmlFor="mark-complete-reports-grid"
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <FileText className="w-4 h-4" />
+                    Choose PDF(s)
+                  </label>
+                  <span className="text-sm text-gray-500">
+                    {markCompleteModalData.reportFiles?.length ? `${markCompleteModalData.reportFiles.length} report(s)` : ''}
                   </span>
                 </div>
               </div>
@@ -12566,14 +13007,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         const startDate = (editModalEquipment as any)?.commencementDate ?? (editModalEquipment as any)?.commencement_date;
         const startDateLabel = startDate ? new Date(startDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null;
         return (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[100] p-4" onClick={() => setEditActivitiesModalOpen(false)}>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[110] p-4" onClick={() => setEditActivitiesModalOpen(false)}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="p-4 border-b space-y-1">
               <div className="flex items-center justify-between">
                 <h3 className="text-lg font-semibold text-gray-900">Edit activity list</h3>
                 <button type="button" onClick={() => setEditActivitiesModalOpen(false)} className="text-gray-400 hover:text-gray-600 p-1 rounded-full hover:bg-gray-100"><X className="w-5 h-5" /></button>
               </div>
-              <p className="text-sm text-gray-500">Marked start date: {startDateLabel ?? 'Not set'}</p>
+              <p className="text-sm text-gray-500">Marked start date: {startDateLabel ?? 'Not set'}. Tick &quot;Inspection/TPI&quot; if this step involves inspection or third party.</p>
             </div>
             <div className="p-4 overflow-y-auto flex-1 space-y-2">
               {editActivitiesDraft.map((row, idx) => (
@@ -12583,11 +13024,15 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   <Select value={row.activity_type} onValueChange={v => setEditActivitiesDraft(prev => prev.map((r, i) => i === idx ? { ...r, activity_type: v as 'regular_update' | 'milestone' } : r))}>
                     <SelectTrigger className="w-[120px] h-8 text-xs"><SelectValue /></SelectTrigger>
                     <SelectContent className="z-[200]">
-                      <SelectItem value="regular_update">Process Update</SelectItem>
-                      <SelectItem value="milestone">Milestone</SelectItem>
+                      <SelectItem value="regular_update">Minor</SelectItem>
+                      <SelectItem value="milestone">Major</SelectItem>
                     </SelectContent>
                   </Select>
                   <Input className="w-24 h-8 text-xs" placeholder="e.g. 1st week" value={row.target_relative} onChange={e => setEditActivitiesDraft(prev => prev.map((r, i) => i === idx ? { ...r, target_relative: e.target.value } : r))} />
+                  <label className="flex items-center gap-1.5 shrink-0 text-xs text-gray-600 whitespace-nowrap">
+                    <input type="checkbox" checked={row.inspection_tpi_involved ?? false} onChange={e => setEditActivitiesDraft(prev => prev.map((r, i) => i === idx ? { ...r, inspection_tpi_involved: e.target.checked } : r))} className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 h-3.5 w-3.5" />
+                    Inspection/TPI
+                  </label>
                   <div className="flex items-center gap-0.5">
                     <Button type="button" size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={idx === 0} onClick={() => setEditActivitiesDraft(prev => { const a = [...prev]; [a[idx - 1], a[idx]] = [a[idx], a[idx - 1]]; return a.map((r, i) => ({ ...r, sort_order: i })); })}><ChevronUp className="w-4 h-4" /></Button>
                     <Button type="button" size="sm" variant="ghost" className="h-7 w-7 p-0" disabled={idx === editActivitiesDraft.length - 1} onClick={() => setEditActivitiesDraft(prev => { const a = [...prev]; [a[idx], a[idx + 1]] = [a[idx + 1], a[idx]]; return a.map((r, i) => ({ ...r, sort_order: i })); })}><ChevronDown className="w-4 h-4" /></Button>
@@ -12597,7 +13042,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ))}
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 p-4 border-t">
-              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length }])}>
+              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length, inspection_tpi_involved: false }])}>
                 <Plus size={14} className="mr-1" />
                 Add activity
               </Button>
@@ -12639,7 +13084,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           return { text: `${v} days delay`, className: 'text-amber-600' };
         };
         return (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4" onClick={() => { setActivitiesHistoryOpen(false); setActivitiesHistoryEquipmentId(null); }}>
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[110] p-4" onClick={() => { setActivitiesHistoryOpen(false); setActivitiesHistoryEquipmentId(null); }}>
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b">
               <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">

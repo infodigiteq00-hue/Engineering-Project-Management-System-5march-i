@@ -1,0 +1,837 @@
+schema,function_name,definition
+public,project_client_views_updated_at,"CREATE OR REPLACE FUNCTION public.project_client_views_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$function$
+"
+public,is_user_assigned_to_standalone_equipment,"CREATE OR REPLACE FUNCTION public.is_user_assigned_to_standalone_equipment(equipment_id_param uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 FROM public.standalone_equipment_team_positions tp
+    JOIN public.users u ON LOWER(TRIM(tp.email)) = LOWER(TRIM(u.email))
+    WHERE tp.equipment_id = equipment_id_param
+    AND u.id = auth.uid()
+  );
+END;
+$function$
+"
+public,get_user_firm_id,"CREATE OR REPLACE FUNCTION public.get_user_firm_id()
+ RETURNS uuid
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  result uuid;
+BEGIN
+  -- Use SECURITY DEFINER to bypass RLS
+  SELECT firm_id INTO result
+  FROM public.users
+  WHERE id = auth.uid()
+  AND is_active = true
+  LIMIT 1;
+  
+  RETURN result;
+END;
+$function$
+"
+public,is_firm_admin,"CREATE OR REPLACE FUNCTION public.is_firm_admin()
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  -- Use SECURITY DEFINER to bypass RLS
+  RETURN EXISTS (
+    SELECT 1 FROM public.users
+    WHERE id = auth.uid()
+    AND role = 'firm_admin'
+    AND is_active = true
+  );
+END;
+$function$
+"
+public,handle_new_user,"CREATE OR REPLACE FUNCTION public.handle_new_user()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  -- Insert into public.users with basic info only
+  -- SignUp.tsx will handle invite-based role assignment later
+  INSERT INTO public.users (
+    id,
+    email,
+    full_name,
+    role,
+    is_active
+  )
+  VALUES (
+    NEW.id,
+    NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'full_name', 'User'),
+    'viewer',  -- Default role, SignUp.tsx will update with invite role
+    true
+  )
+  ON CONFLICT (id) DO UPDATE SET
+    email = EXCLUDED.email,
+    full_name = EXCLUDED.full_name;
+  
+  RETURN NEW;
+END;
+$function$
+"
+public,is_super_admin,"CREATE OR REPLACE FUNCTION public.is_super_admin()
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  -- Use SECURITY DEFINER to bypass RLS
+  RETURN EXISTS (
+    SELECT 1 FROM public.users
+    WHERE id = auth.uid()
+    AND role = 'super_admin'
+    AND is_active = true
+  );
+END;
+$function$
+"
+public,get_client_view_by_token,"CREATE OR REPLACE FUNCTION public.get_client_view_by_token(p_token text)
+ RETURNS json
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  cv record;
+  proj record;
+  out json;
+BEGIN
+  IF p_token IS NULL OR trim(p_token) = '' THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT * INTO cv FROM public.project_client_views WHERE token = trim(p_token) LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT id, name, client, deadline, created_at, status
+    INTO proj FROM public.projects WHERE id = cv.project_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  out := json_build_object(
+    'id', cv.id,
+    'project_id', cv.project_id,
+    'token', cv.token,
+    'label', cv.label,
+    'equipment_ids', cv.equipment_ids,
+    'show_full_qap', cv.show_full_qap,
+    'show_qap_visuals_only', cv.show_qap_visuals_only,
+    'show_progress_bar', cv.show_progress_bar,
+    'show_doc_code_1', cv.show_doc_code_1,
+    'show_doc_code_2', cv.show_doc_code_2,
+    'show_doc_code_3', cv.show_doc_code_3,
+    'show_doc_code_4', cv.show_doc_code_4,
+    'show_inspection_reports', cv.show_inspection_reports,
+    'show_audit_internal_docs', cv.show_audit_internal_docs,
+    'show_pre_production_checklist', cv.show_pre_production_checklist,
+    'show_project_panel', cv.show_project_panel,
+    'project', json_build_object(
+      'id', proj.id,
+      'name', proj.name,
+      'client', proj.client,
+      'deadline', proj.deadline,
+      'created_at', proj.created_at,
+      'status', proj.status
+    )
+  );
+  RETURN out;
+END;
+$function$
+"
+public,create_client_view,"CREATE OR REPLACE FUNCTION public.create_client_view(p_project_id uuid, p_label text DEFAULT NULL::text, p_equipment_ids uuid[] DEFAULT NULL::uuid[], p_show_full_qap boolean DEFAULT false, p_show_qap_visuals_only boolean DEFAULT true, p_show_progress_bar boolean DEFAULT true, p_show_doc_code_1 boolean DEFAULT true, p_show_doc_code_2 boolean DEFAULT true, p_show_doc_code_3 boolean DEFAULT true, p_show_doc_code_4 boolean DEFAULT true, p_show_inspection_reports boolean DEFAULT false, p_show_audit_internal_docs boolean DEFAULT false, p_show_pre_production_checklist boolean DEFAULT false, p_show_project_panel boolean DEFAULT true)
+ RETURNS json
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  new_token text;
+  new_id uuid;
+  proj_firm_id uuid;
+BEGIN
+  -- Ensure user can access this project (same firm or project member)
+  SELECT p.firm_id INTO proj_firm_id
+  FROM public.projects p
+  WHERE p.id = p_project_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Project not found';
+  END IF;
+  IF proj_firm_id IS NOT NULL AND proj_firm_id NOT IN (SELECT firm_id FROM public.users WHERE id = auth.uid()) THEN
+    IF NOT EXISTS (SELECT 1 FROM public.project_members WHERE project_id = p_project_id AND user_id = auth.uid()) THEN
+      RAISE EXCEPTION 'Not allowed to create client view for this project';
+    END IF;
+  END IF;
+
+  new_token := public.generate_client_view_token();
+  INSERT INTO public.project_client_views (
+    project_id, token, label, equipment_ids,
+    show_full_qap, show_qap_visuals_only, show_progress_bar,
+    show_doc_code_1, show_doc_code_2, show_doc_code_3, show_doc_code_4,
+    show_inspection_reports, show_audit_internal_docs, show_pre_production_checklist,
+    show_project_panel
+  ) VALUES (
+    p_project_id, new_token, p_label, p_equipment_ids,
+    p_show_full_qap, p_show_qap_visuals_only, p_show_progress_bar,
+    p_show_doc_code_1, p_show_doc_code_2, p_show_doc_code_3, p_show_doc_code_4,
+    p_show_inspection_reports, p_show_audit_internal_docs, p_show_pre_production_checklist,
+    p_show_project_panel
+  )
+  RETURNING id INTO new_id;
+
+  RETURN (SELECT to_json(r) FROM public.project_client_views r WHERE r.id = new_id);
+END;
+$function$
+"
+public,get_client_view_payload,"CREATE OR REPLACE FUNCTION public.get_client_view_payload(p_token text)
+ RETURNS json
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  cv record;
+  proj record;
+  metrics json;
+  eq_list jsonb := '[]'::jsonb;
+  eq_row record;
+  allowed_ids uuid[];
+
+  -- Latest milestone completion (QAP visuals)
+  qap_completion_id uuid;
+  qap_completed_on date;
+  qap_activity_name text;
+  qap_image_urls text[];
+  qap_image_count int;
+  qap_fallback_image_url text;
+BEGIN
+  IF p_token IS NULL OR trim(p_token) = '' THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT * INTO cv FROM public.project_client_views WHERE token = trim(p_token) LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT id, name, client, location, deadline, created_at, status
+    INTO proj FROM public.projects WHERE id = cv.project_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  -- Project card metrics (doc %, mfg %, inspection %)
+  SELECT (public.get_project_card_metrics(ARRAY[cv.project_id]::uuid[]))::json INTO metrics;
+  -- get_project_card_metrics returns json array; take first element
+  IF metrics IS NOT NULL AND jsonb_typeof(metrics::jsonb) = 'array' AND jsonb_array_length(metrics::jsonb) > 0 THEN
+    metrics := (metrics::jsonb->0)::json;
+  ELSE
+    metrics := '{}'::json;
+  END IF;
+
+  -- Equipment: filter by equipment_ids if set
+  IF cv.equipment_ids IS NOT NULL AND array_length(cv.equipment_ids, 1) > 0 THEN
+    allowed_ids := cv.equipment_ids;
+  ELSE
+    SELECT array_agg(id) INTO allowed_ids FROM public.equipment WHERE project_id = cv.project_id;
+    allowed_ids := COALESCE(allowed_ids, ARRAY[]::uuid[]);
+  END IF;
+
+  FOR eq_row IN
+    SELECT e.id, e.name, e.tag_number, e.job_number, e.manufacturing_serial,
+           e.progress, e.progress_phase, e.po_cdd, e.updated_at, e.status
+      FROM public.equipment e
+      WHERE e.project_id = cv.project_id
+      AND e.id = ANY(allowed_ids)
+      ORDER BY e.created_at DESC
+  LOOP
+    qap_completion_id := NULL;
+    qap_completed_on := NULL;
+    qap_activity_name := NULL;
+    qap_image_urls := ARRAY[]::text[];
+    qap_image_count := 0;
+    qap_fallback_image_url := NULL;
+
+    IF (cv.show_full_qap OR cv.show_qap_visuals_only) THEN
+      -- Latest milestone completion (by milestone sort order) that has at least one image.
+      SELECT
+        c.id,
+        c.completed_on,
+        a.activity_name,
+        COALESCE(c.image_count, 0),
+        c.image_url
+      INTO
+        qap_completion_id,
+        qap_completed_on,
+        qap_activity_name,
+        qap_image_count,
+        qap_fallback_image_url
+      FROM public.equipment_activities a
+      JOIN public.equipment_activity_completions c ON c.activity_id = a.id
+      WHERE a.equipment_id = eq_row.id
+        AND a.activity_type = 'milestone'
+        AND (
+          COALESCE(c.image_count, 0) >= 1
+          OR c.image_url IS NOT NULL
+          OR EXISTS (
+            SELECT 1
+            FROM public.equipment_activity_completion_images ci
+            WHERE ci.completion_id = c.id
+          )
+        )
+      ORDER BY a.sort_order DESC
+      LIMIT 1;
+
+      IF qap_completion_id IS NOT NULL THEN
+        SELECT array_agg(ci.image_url ORDER BY ci.sort_order)
+          INTO qap_image_urls
+        FROM public.equipment_activity_completion_images ci
+        WHERE ci.completion_id = qap_completion_id;
+
+        IF qap_image_urls IS NOT NULL AND array_length(qap_image_urls, 1) > 0 THEN
+          qap_image_count := COALESCE(array_length(qap_image_urls, 1), 0);
+        ELSE
+          -- Legacy single-image fallback (completion.image_url)
+          IF qap_fallback_image_url IS NOT NULL THEN
+            qap_image_urls := ARRAY[qap_fallback_image_url];
+            qap_image_count := 1;
+          ELSE
+            qap_image_urls := ARRAY[]::text[];
+            qap_image_count := 0;
+          END IF;
+        END IF;
+      END IF;
+    END IF;
+
+    eq_list := eq_list || jsonb_build_object(
+      'id', eq_row.id,
+      'name', eq_row.name,
+      'tag_number', eq_row.tag_number,
+      'job_number', eq_row.job_number,
+      'manufacturing_serial', eq_row.manufacturing_serial,
+      'progress', CASE WHEN cv.show_progress_bar THEN coalesce(eq_row.progress, 0) ELSE NULL END,
+      'progress_phase', eq_row.progress_phase,
+      'po_cdd', eq_row.po_cdd,
+      'updated_at', eq_row.updated_at,
+      'status', eq_row.status,
+
+      -- Latest QAP visuals
+      'qap_latest_activity_name', CASE WHEN (cv.show_full_qap OR cv.show_qap_visuals_only) THEN qap_activity_name ELSE NULL END,
+      'qap_latest_completed_on', CASE WHEN (cv.show_full_qap OR cv.show_qap_visuals_only) THEN qap_completed_on ELSE NULL END,
+      'qap_latest_image_count', CASE WHEN (cv.show_full_qap OR cv.show_qap_visuals_only) THEN qap_image_count ELSE 0 END,
+      'qap_latest_image_urls', CASE WHEN (cv.show_full_qap OR cv.show_qap_visuals_only) THEN COALESCE(qap_image_urls, ARRAY[]::text[]) ELSE ARRAY[]::text[] END
+    );
+  END LOOP;
+
+  RETURN json_build_object(
+    'settings', json_build_object(
+      'show_full_qap', cv.show_full_qap,
+      'show_qap_visuals_only', cv.show_qap_visuals_only,
+      'show_progress_bar', cv.show_progress_bar,
+      'show_doc_code_1', cv.show_doc_code_1,
+      'show_doc_code_2', cv.show_doc_code_2,
+      'show_doc_code_3', cv.show_doc_code_3,
+      'show_doc_code_4', cv.show_doc_code_4,
+      'show_inspection_reports', cv.show_inspection_reports,
+      'show_audit_internal_docs', cv.show_audit_internal_docs,
+      'show_pre_production_checklist', cv.show_pre_production_checklist,
+      'show_project_panel', cv.show_project_panel
+    ),
+    'project', json_build_object(
+      'id', proj.id,
+      'name', proj.name,
+      'client', proj.client,
+      'location', proj.location,
+      'deadline', proj.deadline,
+      'created_at', proj.created_at,
+      'status', proj.status
+    ),
+    'project_panel', json_build_object(
+      'metrics', metrics,
+      'days_since_start', CASE
+        WHEN proj.created_at IS NOT NULL THEN
+          (extract(epoch from (now() - proj.created_at)) / 86400)::int
+        ELSE NULL
+      END
+    ),
+    'equipment', eq_list
+  );
+END;
+$function$
+"
+public,is_assigned_to_project,"CREATE OR REPLACE FUNCTION public.is_assigned_to_project(project_id_param uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  -- Use SECURITY DEFINER to bypass RLS when checking project_members
+  -- This is necessary because this function is used in RLS policies for project_members itself
+  RETURN EXISTS (
+    SELECT 1 FROM public.project_members pm
+    WHERE pm.project_id = project_id_param
+    AND EXISTS (
+      SELECT 1 FROM public.users u
+      WHERE u.id = auth.uid()
+      AND LOWER(TRIM(pm.email)) = LOWER(TRIM(u.email))
+    )
+    AND pm.status = 'active'
+  );
+END;
+$function$
+"
+public,get_projects_by_firm,"CREATE OR REPLACE FUNCTION public.get_projects_by_firm(p_firm_id uuid, p_user_role text, p_user_email text DEFAULT NULL::text)
+ RETURNS json
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+  result json;
+BEGIN
+  WITH allowed AS (
+    SELECT p.*
+    FROM public.projects p
+    WHERE (p_user_role = 'super_admin')
+       OR (p_user_role = 'firm_admin' AND p.firm_id = p_firm_id)
+       OR (p_user_role IS NOT NULL AND p_user_role <> 'super_admin' AND p_user_role <> 'firm_admin'
+           AND p.firm_id = p_firm_id
+           AND trim(coalesce(p_user_email, '')) <> ''
+           AND p.id IN (
+             SELECT pm.project_id
+             FROM public.project_members pm
+             WHERE lower(trim(pm.email)) = lower(trim(p_user_email))
+           ))
+    ORDER BY p.created_at DESC
+  ),
+  proj_equip AS (
+    SELECT e.project_id,
+           coalesce(json_agg(to_jsonb(e) ORDER BY e.created_at DESC), '[]'::json) AS equipment
+    FROM public.equipment e
+    WHERE e.project_id IN (SELECT id FROM allowed)
+    GROUP BY e.project_id
+  ),
+  proj_breakdown AS (
+    SELECT project_id,
+           coalesce(json_object_agg(type, cnt), '{}'::json) AS equipment_breakdown
+    FROM (
+      SELECT e.project_id, coalesce(e.type, 'Unknown') AS type, count(*)::int AS cnt
+      FROM public.equipment e
+      WHERE e.project_id IN (SELECT id FROM allowed)
+      GROUP BY e.project_id, e.type
+    ) x
+    GROUP BY project_id
+  ),
+  doc_unpriced AS (
+    SELECT d.project_id,
+           coalesce(json_agg(to_jsonb(d) ORDER BY d.created_at DESC), '[]'::json) AS docs
+    FROM public.unpriced_po_documents d
+    WHERE d.project_id IN (SELECT id FROM allowed)
+    GROUP BY d.project_id
+  ),
+  doc_design AS (
+    SELECT d.project_id,
+           coalesce(json_agg(to_jsonb(d) ORDER BY d.created_at DESC), '[]'::json) AS docs
+    FROM public.design_inputs_documents d
+    WHERE d.project_id IN (SELECT id FROM allowed)
+    GROUP BY d.project_id
+  ),
+  doc_client AS (
+    SELECT d.project_id,
+           coalesce(json_agg(to_jsonb(d) ORDER BY d.created_at DESC), '[]'::json) AS docs
+    FROM public.client_reference_documents d
+    WHERE d.project_id IN (SELECT id FROM allowed)
+    GROUP BY d.project_id
+  ),
+  doc_other AS (
+    SELECT d.project_id,
+           coalesce(json_agg(to_jsonb(d) ORDER BY d.created_at DESC), '[]'::json) AS docs
+    FROM public.other_documents d
+    WHERE d.project_id IN (SELECT id FROM allowed)
+    GROUP BY d.project_id
+  ),
+  vdcr_doc_counts AS (
+    SELECT project_id,
+           count(*)::int AS doc_total,
+           count(*) FILTER (WHERE code_status = 'Code 1')::int AS doc_code1,
+           count(*) FILTER (WHERE code_status = 'Code 2')::int AS doc_code2,
+           count(*) FILTER (WHERE code_status = 'Code 3')::int AS doc_code3,
+           count(*) FILTER (WHERE code_status = 'Code 4')::int AS doc_code4
+    FROM public.vdcr_records
+    WHERE project_id IN (SELECT id FROM allowed)
+    GROUP BY project_id
+  )
+  SELECT coalesce(
+    json_agg(
+      (to_jsonb(p) || jsonb_build_object(
+        'equipment', coalesce(pe.equipment, '[]'::json),
+        'equipmentBreakdown', coalesce(pb.equipment_breakdown, '{}'::json),
+        'equipmentCount', json_array_length(coalesce(pe.equipment, '[]'::json)),
+        'unpriced_po_documents', coalesce(d1.docs, '[]'::json),
+        'design_inputs_documents', coalesce(d2.docs, '[]'::json),
+        'client_reference_documents', coalesce(d3.docs, '[]'::json),
+        'other_documents', coalesce(d4.docs, '[]'::json),
+        'doc_total', coalesce(vdc.doc_total, 0),
+        'doc_code1', coalesce(vdc.doc_code1, 0),
+        'doc_code2', coalesce(vdc.doc_code2, 0),
+        'doc_code3', coalesce(vdc.doc_code3, 0),
+        'doc_code4', coalesce(vdc.doc_code4, 0)
+      )) ORDER BY p.created_at DESC
+    ),
+    '[]'::json
+  ) INTO result
+  FROM allowed p
+  LEFT JOIN proj_equip pe ON pe.project_id = p.id
+  LEFT JOIN proj_breakdown pb ON pb.project_id = p.id
+  LEFT JOIN doc_unpriced d1 ON d1.project_id = p.id
+  LEFT JOIN doc_design d2 ON d2.project_id = p.id
+  LEFT JOIN doc_client d3 ON d3.project_id = p.id
+  LEFT JOIN doc_other d4 ON d4.project_id = p.id
+  LEFT JOIN vdcr_doc_counts vdc ON vdc.project_id = p.id;
+
+  RETURN result;
+END;
+$function$
+"
+public,get_project_card_metrics,"CREATE OR REPLACE FUNCTION public.get_project_card_metrics(p_project_ids uuid[])
+ RETURNS json
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  pid uuid;
+  mfg_pct numeric;
+  insp_pct numeric;
+  doc_total int; doc_c1 int; doc_c2 int; doc_c3 int; doc_c4 int;
+  insp_total bigint; insp_done bigint;
+  doc_pct numeric;
+  weight_count bigint;
+  mfg_weight_count bigint;
+  c1_factor numeric := 1.0;
+  c2_factor numeric := 0.8;
+  c3_factor numeric := 0.5;
+  c4_factor numeric := 0.0;
+  arr jsonb := '[]'::jsonb;
+BEGIN
+  IF p_project_ids IS NULL OR array_length(p_project_ids, 1) IS NULL THEN
+    RETURN '[]'::json;
+  END IF;
+
+  FOR pid IN SELECT unnest(p_project_ids)
+  LOOP
+    mfg_pct := 0;
+    insp_pct := 0;
+    doc_pct := 0;
+    weight_count := 0;
+    mfg_weight_count := 0;
+
+    c1_factor := 1.0;
+    c2_factor := 0.8;
+    c3_factor := 0.5;
+    c4_factor := 0.0;
+
+    SELECT
+      max(CASE WHEN code_status = 'Code 1' THEN completion_factor END),
+      max(CASE WHEN code_status = 'Code 2' THEN completion_factor END),
+      max(CASE WHEN code_status = 'Code 3' THEN completion_factor END),
+      max(CASE WHEN code_status = 'Code 4' THEN completion_factor END)
+    INTO c1_factor, c2_factor, c3_factor, c4_factor
+    FROM public.project_vdcr_code_completion_weights
+    WHERE project_id = pid;
+
+    c1_factor := COALESCE(c1_factor, 1.0);
+    c2_factor := COALESCE(c2_factor, 0.8);
+    c3_factor := COALESCE(c3_factor, 0.5);
+    c4_factor := COALESCE(c4_factor, 0.0);
+
+    SELECT count(*) FILTER (WHERE code_status = 'Code 1'), count(*) FILTER (WHERE code_status = 'Code 2'),
+           count(*) FILTER (WHERE code_status = 'Code 3'), count(*) FILTER (WHERE code_status = 'Code 4'),
+           count(*)
+      INTO doc_c1, doc_c2, doc_c3, doc_c4, doc_total
+      FROM public.vdcr_records
+      WHERE project_id = pid;
+
+    SELECT count(*) INTO weight_count
+      FROM public.project_vdcr_weights w
+      JOIN public.vdcr_records v ON v.id = w.vdcr_record_id
+      WHERE v.project_id = pid;
+
+    IF coalesce(weight_count, 0) > 0 THEN
+      SELECT coalesce(
+               sum(
+                 w.weight_pct * CASE v.code_status
+                   WHEN 'Code 1' THEN c1_factor
+                   WHEN 'Code 2' THEN c2_factor
+                   WHEN 'Code 3' THEN c3_factor
+                   WHEN 'Code 4' THEN c4_factor
+                   ELSE 0.0
+                 END
+               ),
+               0
+             )
+        INTO doc_pct
+        FROM public.project_vdcr_weights w
+        JOIN public.vdcr_records v ON v.id = w.vdcr_record_id
+        WHERE v.project_id = pid;
+    ELSIF coalesce(doc_total, 0) > 0 THEN
+      doc_pct :=
+        coalesce(doc_c1, 0) * (100.0 / doc_total) * c1_factor +
+        coalesce(doc_c2, 0) * (100.0 / doc_total) * c2_factor +
+        coalesce(doc_c3, 0) * (100.0 / doc_total) * c3_factor +
+        coalesce(doc_c4, 0) * (100.0 / doc_total) * c4_factor;
+    ELSE
+      doc_pct := 0;
+    END IF;
+
+    -- Manufacturing: use project_equipment_weights when present, else equal-weight average.
+    SELECT count(*) INTO mfg_weight_count
+      FROM public.project_equipment_weights
+      WHERE project_id = pid;
+
+    IF coalesce(mfg_weight_count, 0) > 0 THEN
+      -- Weighted: sum( (weight_pct/100) * progress ) = sum(weight_pct * progress) / 100. 0–100.
+      SELECT coalesce(
+               sum((w.weight_pct / 100.0) * coalesce(e.progress, 0)),
+               0
+             )
+        INTO mfg_pct
+        FROM public.equipment e
+        JOIN public.project_equipment_weights w ON w.equipment_id = e.id AND w.project_id = e.project_id
+        WHERE e.project_id = pid;
+    ELSE
+      SELECT coalesce(avg(coalesce(e.progress, 0)), 0) INTO mfg_pct
+        FROM public.equipment e
+        WHERE e.project_id = pid;
+    END IF;
+
+    SELECT count(a.id), count(c.id)
+      INTO insp_total, insp_done
+      FROM public.equipment e
+      JOIN public.equipment_activities a ON a.equipment_id = e.id AND a.inspection_tpi_involved = true
+      LEFT JOIN public.equipment_activity_completions c ON c.activity_id = a.id
+      WHERE e.project_id = pid;
+    IF insp_total > 0 THEN
+      insp_pct := (insp_done::numeric / insp_total) * 100;
+    END IF;
+
+    arr := arr || jsonb_build_object(
+      'project_id', pid,
+      'doc_total', coalesce(doc_total, 0),
+      'doc_code1', coalesce(doc_c1, 0),
+      'doc_code2', coalesce(doc_c2, 0),
+      'doc_code3', coalesce(doc_c3, 0),
+      'doc_code4', coalesce(doc_c4, 0),
+      'doc_progress_pct', round(coalesce(doc_pct, 0)::numeric, 1),
+      'manufacturing_progress_pct', round(coalesce(mfg_pct, 0)::numeric, 1),
+      'inspection_tpi_pct', round(insp_pct::numeric, 1),
+      'inspection_tpi_total', coalesce(insp_total, 0),
+      'inspection_tpi_done', coalesce(insp_done, 0)
+    );
+  END LOOP;
+
+  RETURN arr::json;
+END;
+$function$
+"
+public,generate_client_view_token,"CREATE OR REPLACE FUNCTION public.generate_client_view_token()
+ RETURNS text
+ LANGUAGE sql
+AS $function$
+  SELECT md5(random()::text || clock_timestamp()::text);
+$function$
+"
+public,can_user_manage_standalone_equipment_team,"CREATE OR REPLACE FUNCTION public.can_user_manage_standalone_equipment_team(equipment_id_param uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  current_user_role text;
+  current_user_firm_id uuid;
+  equipment_creator_firm_id uuid;
+BEGIN
+  -- Get current user's role and firm_id
+  SELECT role, firm_id INTO current_user_role, current_user_firm_id
+  FROM public.users
+  WHERE id = auth.uid() AND is_active = true;
+  
+  -- If user not found or not active, deny
+  IF current_user_role IS NULL THEN
+    RETURN false;
+  END IF;
+  
+  -- Super admin can always manage
+  IF current_user_role = 'super_admin' THEN
+    RETURN true;
+  END IF;
+  
+  -- Check if user created the equipment
+  IF EXISTS (
+    SELECT 1 FROM public.standalone_equipment se
+    WHERE se.id = equipment_id_param
+    AND se.created_by = auth.uid()
+  ) THEN
+    RETURN true;
+  END IF;
+
+  -- Check if user is assigned to the equipment (via team_positions)
+  IF EXISTS (
+    SELECT 1 FROM public.standalone_equipment_team_positions tp
+    JOIN public.users u ON LOWER(TRIM(tp.email)) = LOWER(TRIM(u.email))
+    WHERE tp.equipment_id = equipment_id_param
+    AND u.id = auth.uid()
+  ) THEN
+    RETURN true;
+  END IF;
+
+  -- Allow project_manager or vdcr_manager to add team members
+  -- Simplified: If user is active project_manager or vdcr_manager, allow them to add team members
+  -- This is permissive to ensure team management works - can be restricted by firm_id later if needed
+  IF current_user_role IN ('project_manager', 'vdcr_manager') THEN
+    -- Check if equipment exists (basic validation)
+    IF EXISTS (
+      SELECT 1 FROM public.standalone_equipment se
+      WHERE se.id = equipment_id_param
+    ) THEN
+      RETURN true;
+    END IF;
+  END IF;
+
+  -- Allow firm_admin from same firm
+  IF current_user_role = 'firm_admin' THEN
+    -- Get equipment creator's firm_id
+    SELECT u.firm_id INTO equipment_creator_firm_id
+    FROM public.standalone_equipment se
+    JOIN public.users u ON u.id = se.created_by
+    WHERE se.id = equipment_id_param;
+    
+    IF equipment_creator_firm_id IS NULL OR current_user_firm_id IS NULL THEN
+      RETURN true;
+    ELSIF equipment_creator_firm_id = current_user_firm_id THEN
+      RETURN true;
+    END IF;
+  END IF;
+
+  RETURN false;
+END;
+$function$
+"
+public,is_project_manager_for_standalone_equipment,"CREATE OR REPLACE FUNCTION public.is_project_manager_for_standalone_equipment(equipment_id_param uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  current_user_firm_id uuid;
+  equipment_creator_firm_id uuid;
+  current_user_role text;
+BEGIN
+  -- Get current user's role and firm_id (bypasses RLS with SECURITY DEFINER)
+  SELECT role, firm_id INTO current_user_role, current_user_firm_id
+  FROM public.users
+  WHERE id = auth.uid()
+  AND is_active = true
+  LIMIT 1;
+  
+  -- If user not found or not active, return false
+  IF current_user_role IS NULL THEN
+    RETURN false;
+  END IF;
+  
+  -- Check if user is project_manager or vdcr_manager
+  IF current_user_role NOT IN ('project_manager', 'vdcr_manager') THEN
+    RETURN false;
+  END IF;
+  
+  -- Get equipment creator's firm_id
+  SELECT u.firm_id INTO equipment_creator_firm_id
+  FROM public.standalone_equipment se
+  JOIN public.users u ON u.id = se.created_by
+  WHERE se.id = equipment_id_param
+  LIMIT 1;
+  
+  -- If equipment not found, return false
+  IF equipment_creator_firm_id IS NULL AND NOT EXISTS (
+    SELECT 1 FROM public.standalone_equipment WHERE id = equipment_id_param
+  ) THEN
+    RETURN false;
+  END IF;
+  
+  -- Check firm_id matching (both NULL or both same UUID)
+  IF current_user_firm_id IS NULL AND equipment_creator_firm_id IS NULL THEN
+    RETURN true;
+  END IF;
+  
+  IF current_user_firm_id IS NOT NULL AND equipment_creator_firm_id IS NOT NULL 
+     AND current_user_firm_id = equipment_creator_firm_id THEN
+    RETURN true;
+  END IF;
+  
+  RETURN false;
+END;
+$function$
+"
+public,is_user_assigned_to_standalone_equipment_for_insert,"CREATE OR REPLACE FUNCTION public.is_user_assigned_to_standalone_equipment_for_insert(equipment_id_param uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 FROM public.standalone_equipment_team_positions tp
+    JOIN public.users u ON LOWER(TRIM(tp.email)) = LOWER(TRIM(u.email))
+    WHERE tp.equipment_id = equipment_id_param
+    AND u.id = auth.uid()
+  );
+END;
+$function$
+"
+public,check_invites_email_single_role,"CREATE OR REPLACE FUNCTION public.check_invites_email_single_role()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.invites i
+    WHERE lower(trim(i.email)) = lower(trim(NEW.email))
+      AND (i.role IS DISTINCT FROM NEW.role)
+      AND (TG_OP <> 'UPDATE' OR i.id IS DISTINCT FROM NEW.id)
+  ) THEN
+    RAISE EXCEPTION 'This email already exists with a different role. Same email cannot have multiple roles.';
+  END IF;
+  RETURN NEW;
+END;
+$function$
+"
