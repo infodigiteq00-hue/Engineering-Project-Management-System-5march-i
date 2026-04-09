@@ -1159,7 +1159,7 @@ const Index = () => {
           }));
           setCache(cacheKey, lightweight, {
             ttl: 24 * 60 * 60 * 1000,
-            maxSize: 2 * 1024 * 1024,
+            maxSize: 4 * 1024 * 1024,
           });
           setStandaloneEquipment(first24);
           standaloneDataLoadedRef.current = true;
@@ -1296,7 +1296,7 @@ const Index = () => {
 
     const timeoutId = setTimeout(async () => {
       try {
-        const equipment = await fastAPI.getEquipmentByProject(firstProject.id);
+        const equipment = await fastAPI.getEquipmentByProject(firstProject.id, { progressImagesLatestOnly: true });
         if (equipment && Array.isArray(equipment) && equipment.length > 0) {
           const lightweight = equipment.map((eq: any) => ({
             ...eq,
@@ -1323,7 +1323,7 @@ const Index = () => {
           }));
           setCache(cacheKey, lightweight, {
             ttl: 10 * 60 * 1000,
-            maxSize: 2 * 1024 * 1024,
+            maxSize: 4 * 1024 * 1024,
           });
         }
       } catch (error) {
@@ -1730,20 +1730,7 @@ const Index = () => {
   const handleDeleteProject = async (projectId: string) => {
     if (window.confirm('Are you sure you want to delete this project? This action cannot be undone. This will also delete all associated equipment.')) {
       try {
-        
-        // First, delete all associated equipment
-        try {
-          const equipmentResponse = await fastAPI.getEquipmentByProject(projectId);
-          const equipmentArray = equipmentResponse as any[];
-          if (equipmentArray && equipmentArray.length > 0) {
-            for (const equipment of equipmentArray) {
-              await fastAPI.deleteEquipment(equipment.id);
-            }
-          }
-        } catch (equipmentError) {
-          console.warn('⚠️ Could not delete associated equipment:', equipmentError);
-        }
-        
+        // Project + equipment + related rows: single fastAPI.deleteProject (batched child deletes; no duplicate getEquipmentByProject + N deleteEquipment calls).
         // Get project name for logging before deletion
         const projectToDelete = projects.find(p => p.id === projectId);
         const projectName = projectToDelete?.name || 'Unknown Project';

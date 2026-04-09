@@ -267,6 +267,11 @@ const AddStandaloneEquipmentFormNew = ({ onClose, onSubmit, editData, isEditMode
 
   // Fetch all firm team members for dropdowns (prefetched from entire firm portfolio)
   useEffect(() => {
+    // Add mode should stay lightweight; detailed team prefetch is only needed in edit mode.
+    if (!isEditMode) {
+      return;
+    }
+
     const fetchFirmTeamMembers = async () => {
       try {
         const userData = JSON.parse(localStorage.getItem('userData') || '{}');
@@ -313,7 +318,7 @@ const AddStandaloneEquipmentFormNew = ({ onClose, onSubmit, editData, isEditMode
     };
 
     fetchFirmTeamMembers();
-  }, []);
+  }, [isEditMode]);
 
   // Fetch existing standalone equipment to populate suggestions
   useEffect(() => {
@@ -328,8 +333,11 @@ const AddStandaloneEquipmentFormNew = ({ onClose, onSubmit, editData, isEditMode
           return;
         }
 
-        // Fetch standalone equipment from Supabase
-        const existingEquipment = await fastAPI.getStandaloneEquipment();
+        // Add mode: fetch lightweight suggestion fields only.
+        // Edit mode keeps existing full fetch behavior for compatibility.
+        const existingEquipment = isEditMode
+          ? await fastAPI.getStandaloneEquipment()
+          : await fastAPI.getStandaloneEquipmentSuggestions(firmId);
         
         // console.log('📋 Fetched existing equipment:', {
         //   exists: !!existingEquipment,
@@ -381,7 +389,13 @@ const AddStandaloneEquipmentFormNew = ({ onClose, onSubmit, editData, isEditMode
           
           // console.log('✅ Set initial equipmentManager options from equipment_manager field:', uniqueEquipmentManagersFromEquipment.length);
           
-          // Fetch equipment managers from multiple sources (will update state with combined results)
+          // In add mode, stop here to avoid extra background calls.
+          // Equipment managers are already prefetched via getAllFirmTeamMembers effect.
+          if (!isEditMode) {
+            return;
+          }
+
+          // Edit mode: keep existing multi-source manager enrichment flow.
           // console.log('🔍 Starting to fetch equipment managers from multiple sources...');
           try {
             const { createClient } = await import('@supabase/supabase-js');
@@ -573,7 +587,7 @@ const AddStandaloneEquipmentFormNew = ({ onClose, onSubmit, editData, isEditMode
               equipmentManager: uniqueEquipmentManagersFromEquipment
             }));
           }
-        } else {
+        } else if (isEditMode) {
           // console.log('📋 No existing equipment found, fetching project managers from users table');
           // No existing equipment, but still try to fetch project managers from users table
           try {

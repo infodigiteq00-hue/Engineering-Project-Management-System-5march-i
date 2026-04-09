@@ -29,10 +29,327 @@ const api = axios.create({
   timeout: 30000 // 30 seconds timeout
 });
 
+/** PostgREST: total row count from Content-Range (e.g. 0-0/42 → 42) when Prefer: count=exact */
+function parseTotalFromContentRange(res: { headers?: Record<string, unknown> }): number | null {
+  const h = res.headers || {};
+  const cr = (h['content-range'] ?? h['Content-Range']) as string | undefined;
+  if (typeof cr !== 'string') return null;
+  const m = cr.match(/\/(\d+)\s*$/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 // Cache for session token to avoid repeated getSession() calls
 let cachedSessionToken: string | null = null;
 let sessionCacheTime = 0;
 const SESSION_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+// Deduplicate concurrent standalone equipment loads (same params/options) to prevent request storms.
+const standaloneEquipmentInFlight = new Map<string, Promise<any[]>>();
+// Deduplicate immediate sequential standalone loads from rapid UI re-triggers.
+const standaloneEquipmentRecent = new Map<string, { at: number; data: any[] }>();
+const STANDALONE_RECENT_TTL_MS = 2000;
+/** Deduplicate concurrent getEquipmentByProject(projectId, options) (refresh + pre-cache were doubling RPC + bundle work). */
+const equipmentByProjectInFlight = new Map<string, Promise<any[]>>();
+/** Dedupe concurrent identical batch fetches (Strict Mode double effects, overlapping effects). */
+const equipmentActivitiesBatchInFlight = new Map<string, Promise<Record<string, any[]>>>();
+const standaloneEquipmentActivitiesBatchInFlight = new Map<string, Promise<Record<string, any[]>>>();
+const latestProgressImageUrlsBatchInFlight = new Map<string, Promise<Record<string, string | null>>>();
+const productionChecklistTasksBatchInFlight = new Map<string, Promise<Record<string, any[]>>>();
+
+function batchDedupeKey(ids: string[]): string {
+  return ids.length === 0 ? '' : [...ids].sort().join(',');
+}
+
+/**
+ * Split UUIDs for PostgREST `in.(...)` so the comma-joined id segment stays under ~5KB.
+ * Fewer chunks than a fixed "100 ids" cap when ids are short; avoids 414/proxy limits when packing more per request.
+ * Request count for activities/checklists scales with ceil(totalActivities / avgIdsPerChunk), not only equipment count.
+ */
+function chunkIdsForInClause(ids: string[]): string[][] {
+  const MAX_JOINED_LEN = 5000;
+  if (!ids.length) return [];
+  const out: string[][] = [];
+  let cur: string[] = [];
+  let curLen = 0;
+  for (const id of ids) {
+    const sep = cur.length ? 1 : 0;
+    const need = id.length + sep;
+    if (cur.length > 0 && curLen + need > MAX_JOINED_LEN) {
+      out.push(cur);
+      cur = [id];
+      curLen = id.length;
+    } else {
+      cur.push(id);
+      curLen += need;
+    }
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+/** Batch-delete child rows before removing equipment rows (replaces N per-equipment DELETEs when deleting a project). */
+async function deleteEquipmentChildrenByProjectBatches(equipmentIds: string[]): Promise<void> {
+  if (!equipmentIds.length) return;
+  const tables = [
+    'equipment_progress_entries',
+    'equipment_progress_images',
+    'equipment_documents',
+    'equipment_team_positions',
+    'equipment_activity_logs',
+  ] as const;
+  for (const table of tables) {
+    for (const chunk of chunkIdsForInClause(equipmentIds)) {
+      try {
+        await api.delete(`/${table}?equipment_id=in.(${chunk.join(',')})`);
+      } catch {
+        /* ignore missing / empty */
+      }
+    }
+  }
+}
+
+/** Populated when getStandaloneEquipment uses RPC get_standalone_equipment_bundle; consumed once by EquipmentGrid (standalone). */
+type StandaloneBundleExtras = {
+  documentsByEquipment: Record<string, any[]>;
+  activitiesByEquipment: Record<string, any[]>;
+  productionChecklistByEquipment: Record<string, any[]>;
+  teamPositionsByEquipment: Record<string, any[]>;
+};
+
+let standaloneBundleExtras: StandaloneBundleExtras | null = null;
+
+export function takeStandaloneEquipmentBundleExtras(): StandaloneBundleExtras | null {
+  const x = standaloneBundleExtras;
+  standaloneBundleExtras = null;
+  return x;
+}
+
+/** True when standalone RPC bundle extras are waiting (grid loadDocuments can run before Index fetch completes). */
+export function hasStandaloneEquipmentBundleExtras(): boolean {
+  return standaloneBundleExtras != null;
+}
+
+/** Populated when getEquipmentByProject uses RPC get_project_equipment_bundle; consumed once by EquipmentGrid (project). */
+export type ProjectEquipmentBundleExtras = StandaloneBundleExtras & {
+  vdcrRecords: any[];
+  /** Prevents concurrent getEquipmentByProject calls from wiping or mixing bundle data across projects. */
+  bundleProjectId: string;
+};
+
+let projectEquipmentBundleExtras: ProjectEquipmentBundleExtras | null = null;
+
+/** True when RPC has populated bundle extras for this project (loadDocuments may run before refresh finishes). */
+export function hasProjectEquipmentBundleExtras(forProjectId: string): boolean {
+  return !!(
+    projectEquipmentBundleExtras &&
+    projectEquipmentBundleExtras.bundleProjectId === forProjectId
+  );
+}
+
+/**
+ * Returns a snapshot of bundle extras for this project (deep clone).
+ * Does not clear the module cache — refresh + loadDocuments both call this; clearing after the first
+ * call forced a second getEquipmentByProject and doubled RPC + REST work.
+ * Cache is replaced on the next successful get_project_equipment_bundle response or cleared on legacy fallback / other project.
+ */
+export function takeProjectEquipmentBundleExtras(forProjectId: string): ProjectEquipmentBundleExtras | null {
+  const x = projectEquipmentBundleExtras;
+  if (!x || x.bundleProjectId !== forProjectId) {
+    return null;
+  }
+  try {
+    return JSON.parse(JSON.stringify(x)) as ProjectEquipmentBundleExtras;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonbStringMap(val: unknown): Record<string, string> {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    if (v != null && v !== '') out[k] = String(v);
+  }
+  return out;
+}
+
+function mergeProjectEquipmentBundlePayload(
+  raw: any,
+  progressImagesLatestOnly: boolean,
+  projectId: string
+): {
+  equipment: any[];
+  extras: ProjectEquipmentBundleExtras | null;
+} {
+  const base = mergeStandaloneEquipmentBundlePayload(raw, progressImagesLatestOnly);
+  if (!base.extras) {
+    return { equipment: base.equipment, extras: null };
+  }
+  let equipment = base.equipment;
+  if (progressImagesLatestOnly) {
+    const latestUrls = parseJsonbStringMap(raw?.latest_progress_image_urls);
+    if (Object.keys(latestUrls).length > 0) {
+      equipment = equipment.map((eq: any) => {
+        const u = latestUrls[eq.id];
+        if (!u) return eq;
+        return { ...eq, progress_images: [u] };
+      });
+    }
+  }
+  return {
+    equipment,
+    extras: {
+      ...base.extras,
+      vdcrRecords: parseJsonbArray(raw?.vdcr_records),
+      bundleProjectId: projectId,
+    },
+  };
+}
+
+function parseJsonbArray(val: unknown): any[] {
+  if (Array.isArray(val)) return val;
+  return [];
+}
+
+function buildUsersMapFromBundle(users: any[]): Record<string, { full_name?: string; email?: string }> {
+  const m: Record<string, { full_name?: string; email?: string }> = {};
+  for (const u of users) {
+    if (u?.id) m[u.id] = { full_name: u.full_name, email: u.email };
+  }
+  return m;
+}
+
+/** Maps RPC JSON to the same shapes as legacy REST + batch helpers. */
+function mergeStandaloneEquipmentBundlePayload(raw: any, progressImagesLatestOnly: boolean): {
+  equipment: any[];
+  extras: StandaloneBundleExtras | null;
+} {
+  const equipmentRows = parseJsonbArray(raw?.equipment);
+  if (equipmentRows.length === 0) {
+    return { equipment: [], extras: null };
+  }
+  const allProgressImages = parseJsonbArray(raw?.progress_images);
+  const allProgressEntries = parseJsonbArray(raw?.progress_entries);
+  const usersMap = buildUsersMapFromBundle(parseJsonbArray(raw?.users));
+  const progressEntriesEnriched = allProgressEntries.map((entry: any) => ({
+    ...entry,
+    users:
+      entry.created_by && usersMap[entry.created_by]
+        ? {
+            full_name: usersMap[entry.created_by].full_name,
+            email: usersMap[entry.created_by].email,
+          }
+        : null,
+    created_by_user: entry.created_by ? usersMap[entry.created_by] || null : null,
+  }));
+  const equipmentWithProgressData = equipmentRows.map((eq: any) => {
+    const progressImages = allProgressImages.filter((img: any) => img.equipment_id === eq.id);
+    const progressEntries = progressEntriesEnriched.filter((entry: any) => entry.equipment_id === eq.id);
+    return {
+      ...eq,
+      progress_images: progressImagesLatestOnly ? [] : progressImages.map((img: any) => img.image_url),
+      progress_images_metadata: progressImages,
+      progress_entries: progressEntries,
+      technical_sections: eq.technical_sections || [],
+      custom_fields: eq.custom_fields || [],
+      team_custom_fields: eq.team_custom_fields || [],
+    };
+  });
+
+  const equipmentIds = equipmentRows.map((e: any) => e.id).filter(Boolean);
+
+  const documents = parseJsonbArray(raw?.documents).map((d: any) => ({
+    ...d,
+    uploaded_by_user:
+      d.uploaded_by && usersMap[d.uploaded_by]
+        ? { full_name: usersMap[d.uploaded_by].full_name, email: usersMap[d.uploaded_by].email }
+        : null,
+  }));
+  const documentsByEquipment: Record<string, any[]> = {};
+  for (const id of equipmentIds) documentsByEquipment[id] = [];
+  for (const d of documents) {
+    if (d.equipment_id) {
+      (documentsByEquipment[d.equipment_id] = documentsByEquipment[d.equipment_id] || []).push(d);
+    }
+  }
+
+  const activities = parseJsonbArray(raw?.activities);
+  const actCompletions = parseJsonbArray(raw?.activity_completions);
+  for (const c of actCompletions) {
+    if (c.updated_by && usersMap[c.updated_by]) {
+      c.updated_by_user = { full_name: usersMap[c.updated_by].full_name };
+    }
+  }
+  const completionByActivityId: Record<string, any> = {};
+  for (const c of actCompletions) {
+    if (c.activity_id) completionByActivityId[c.activity_id] = c;
+  }
+  const activitiesWithComp = activities.map((a: any) => ({
+    ...a,
+    completion: completionByActivityId[a.id] || null,
+  }));
+  const activitiesByEquipment: Record<string, any[]> = {};
+  for (const id of equipmentIds) activitiesByEquipment[id] = [];
+  for (const a of activitiesWithComp) {
+    if (a.equipment_id) {
+      (activitiesByEquipment[a.equipment_id] = activitiesByEquipment[a.equipment_id] || []).push(a);
+    }
+  }
+
+  const checklistTasks = parseJsonbArray(raw?.checklist_tasks).map((t: any) => ({
+    ...t,
+    created_by_user:
+      t.created_by && usersMap[t.created_by]
+        ? { full_name: usersMap[t.created_by].full_name, email: usersMap[t.created_by].email }
+        : null,
+  }));
+  const checklistCompletions = parseJsonbArray(raw?.checklist_completions);
+  const completionByTaskId: Record<string, any> = {};
+  for (const c of checklistCompletions) {
+    if (c.task_id) completionByTaskId[c.task_id] = c;
+  }
+  const checklistWithComp = checklistTasks.map((t: any) => ({
+    ...t,
+    completion: completionByTaskId[t.id] || null,
+  }));
+  const productionChecklistByEquipment: Record<string, any[]> = {};
+  for (const id of equipmentIds) productionChecklistByEquipment[id] = [];
+  for (const t of checklistWithComp) {
+    if (t.equipment_id) {
+      (productionChecklistByEquipment[t.equipment_id] = productionChecklistByEquipment[t.equipment_id] || []).push(t);
+    }
+  }
+
+  const teamRows = parseJsonbArray(raw?.team_positions);
+  const teamPositionsByEquipment: Record<string, any[]> = {};
+  for (const id of equipmentIds) teamPositionsByEquipment[id] = [];
+  for (const row of teamRows) {
+    if (row.equipment_id) {
+      (teamPositionsByEquipment[row.equipment_id] = teamPositionsByEquipment[row.equipment_id] || []).push(row);
+    }
+  }
+
+  return {
+    equipment: equipmentWithProgressData,
+    extras: {
+      documentsByEquipment,
+      activitiesByEquipment,
+      productionChecklistByEquipment,
+      teamPositionsByEquipment,
+    },
+  };
+}
+
+function isBundleRpcUnavailable(err: any): boolean {
+  const code = err?.response?.status;
+  const msg = String(err?.response?.data?.message || err?.message || '');
+  return (
+    code === 404 ||
+    code === 406 ||
+    msg.includes('PGRST202') ||
+    msg.includes('Could not find the function') ||
+    msg.includes('does not exist')
+  );
+}
 
 // Helper function to get session token with fallbacks
 async function getSessionToken(): Promise<string | null> {
@@ -114,6 +431,49 @@ api.interceptors.response.use(
 );
 
 // Fast API functions
+/** Compare DB row vs merge payload; skip redundant PATCH during bulk merge. */
+function normalizeProductionChecklistMergeTaskRow(row: any) {
+  return {
+    task_title: row.task_title,
+    task_detail: row.task_detail ?? null,
+    department: row.department ?? null,
+    assigned_to: row.assigned_to ?? null,
+    reference_document_url: row.reference_document_url ?? null,
+    reference_document_name: row.reference_document_name ?? null,
+    reference_image_url: row.reference_image_url ?? null,
+    sort_order: Number(row.sort_order ?? 0),
+    created_by: row.created_by ?? null,
+  };
+}
+
+function productionChecklistMergeTaskUnchanged(
+  prev: any,
+  body: {
+    task_title: string;
+    task_detail?: string | null;
+    department?: string | null;
+    assigned_to?: string | null;
+    reference_document_url?: string | null;
+    reference_document_name?: string | null;
+    reference_image_url?: string | null;
+    sort_order: number;
+    created_by?: string | null;
+  }
+) {
+  const normalized = {
+    task_title: body.task_title,
+    task_detail: body.task_detail ?? null,
+    department: body.department ?? null,
+    assigned_to: body.assigned_to ?? null,
+    reference_document_url: body.reference_document_url ?? null,
+    reference_document_name: body.reference_document_name ?? null,
+    reference_image_url: body.reference_image_url ?? null,
+    sort_order: Number(body.sort_order ?? 0),
+    created_by: body.created_by ?? null,
+  };
+  return JSON.stringify(normalizeProductionChecklistMergeTaskRow(prev)) === JSON.stringify(normalized);
+}
+
 export const fastAPI = {
   // Fetch all companies with user count
   async getCompanies() {
@@ -150,16 +510,29 @@ export const fastAPI = {
       const projectIds = (projectsRes.data as any[])?.map((p: any) => p.id).filter(Boolean) || [];
       const userIds = (usersRes.data as any[])?.map((u: any) => u.id).filter(Boolean) || [];
 
-      let projectEquipmentCount = 0;
-      let standaloneCount = 0;
-      if (projectIds.length > 0) {
-        const eqRes = await api.get(`/equipment?project_id=in.(${projectIds.join(',')})&select=id`);
-        projectEquipmentCount = Array.isArray(eqRes.data) ? eqRes.data.length : 0;
-      }
-      if (userIds.length > 0) {
-        const standRes = await api.get(`/standalone_equipment?created_by=in.(${userIds.join(',')})&select=id`);
-        standaloneCount = Array.isArray(standRes.data) ? standRes.data.length : 0;
-      }
+      const countRowsExact = async (path: string): Promise<number> => {
+        try {
+          const res = await api.get(path, {
+            headers: { Prefer: 'count=exact', Range: '0-0' },
+          });
+          const total = parseTotalFromContentRange(res);
+          if (total != null) return total;
+        } catch {
+          /* fall back */
+        }
+        const res = await api.get(path);
+        const data = res.data;
+        return Array.isArray(data) ? data.length : 0;
+      };
+
+      const [projectEquipmentCount, standaloneCount] = await Promise.all([
+        projectIds.length > 0
+          ? countRowsExact(`/equipment?project_id=in.(${projectIds.join(',')})&select=id`)
+          : Promise.resolve(0),
+        userIds.length > 0
+          ? countRowsExact(`/standalone_equipment?created_by=in.(${userIds.join(',')})&select=id`)
+          : Promise.resolve(0),
+      ]);
       return projectEquipmentCount + standaloneCount;
     } catch (error) {
       console.error('❌ Error fetching equipment count by firm:', error);
@@ -664,6 +1037,19 @@ export const fastAPI = {
     }
   },
 
+  // Fetch lightweight project fields by ID (single request, no document-table fan-out)
+  async getProjectSummaryById(projectId: string) {
+    if (projectId === 'standalone') return null;
+    try {
+      const response = await api.get(`/projects?id=eq.${projectId}&select=id,sales_order_date,vdcr_cycle_time_rev_00,vdcr_cycle_time_rev_01_plus`);
+      const row = Array.isArray(response.data) ? response.data[0] : null;
+      return row || null;
+    } catch (error) {
+      console.error('❌ Error fetching project summary by ID:', error);
+      return null;
+    }
+  },
+
   // Create new project
   async createProject(projectData: any) {
     try {
@@ -699,26 +1085,8 @@ export const fastAPI = {
       // // console.log('🗑️ Getting equipment for project...');
       const equipmentResponse = await api.get(`/equipment?project_id=eq.${id}&select=id`);
       const equipment = equipmentResponse.data || [];
-      
-      // Delete equipment documents first (they reference equipment)
-      // // console.log('🗑️ Deleting equipment documents...');
-      for (const eq of (equipment as any[])) {
-        try {
-          await api.delete(`/equipment_documents?equipment_id=eq.${eq.id}`);
-        } catch (error) {
-          // console.log('⚠️ No equipment documents to delete for equipment:', eq.id);
-        }
-      }
-      
-      // Delete equipment progress images
-      // // console.log('🗑️ Deleting equipment progress images...');
-      for (const eq of (equipment as any[])) {
-        try {
-          await api.delete(`/equipment_progress_images?equipment_id=eq.${eq.id}`);
-        } catch (error) {
-          // console.log('⚠️ No progress images to delete for equipment:', eq.id);
-        }
-      }
+      const equipmentIds = ((equipment as any[]) || []).map((eq) => eq.id).filter(Boolean);
+      await deleteEquipmentChildrenByProjectBatches(equipmentIds);
       
       // Now delete equipment
       // // console.log('🗑️ Deleting related equipment...');
@@ -823,7 +1191,52 @@ export const fastAPI = {
   // PERFORMANCE: Added timeout handling and batch processing to prevent statement timeouts
   // Optional: progressImagesLatestOnly = true returns metadata only (no image_url) and progress_images: [] for on-demand loading
   async getEquipmentByProject(projectId: string, options?: { progressImagesLatestOnly?: boolean }) {
+    const dedupeKey = JSON.stringify({
+      projectId,
+      lio: options?.progressImagesLatestOnly === true,
+    });
+    const inflight = equipmentByProjectInFlight.get(dedupeKey);
+    if (inflight) return await inflight;
+
+    const loadPromise = (async (): Promise<any[]> => {
     try {
+      // Do NOT clear bundle extras on every call — concurrent getEquipmentByProject calls would wipe data
+      // before EquipmentGrid runs takeProjectEquipmentBundleExtras (falls back to many REST calls).
+      if (
+        projectEquipmentBundleExtras &&
+        projectEquipmentBundleExtras.bundleProjectId !== projectId
+      ) {
+        projectEquipmentBundleExtras = null;
+      }
+      const progressImagesLatestOnly = options?.progressImagesLatestOnly === true;
+      try {
+        const rpcRes = await api.post(
+          '/rpc/get_project_equipment_bundle',
+          { p_project_id: projectId, p_progress_images_latest_only: progressImagesLatestOnly },
+          { timeout: 120000 }
+        );
+        let raw: any = rpcRes.data;
+        if (typeof raw === 'string') {
+          try {
+            raw = JSON.parse(raw);
+          } catch {
+            raw = null;
+          }
+        }
+        if (raw && typeof raw === 'object' && Array.isArray((raw as any).equipment)) {
+          const merged = mergeProjectEquipmentBundlePayload(raw, progressImagesLatestOnly, projectId);
+          if (merged.extras) projectEquipmentBundleExtras = merged.extras;
+          return merged.equipment;
+        }
+      } catch (bundleErr: any) {
+        if (!isBundleRpcUnavailable(bundleErr)) {
+          console.warn('⚠️ get_project_equipment_bundle failed, using legacy REST:', bundleErr?.message || bundleErr);
+        }
+        projectEquipmentBundleExtras = null;
+      }
+
+      projectEquipmentBundleExtras = null;
+
       // Fetch all equipment first with timeout handling
       let response;
       try {
@@ -845,8 +1258,6 @@ export const fastAPI = {
 
       // Get all equipment IDs for batch fetching
       const equipmentIds = (equipment as any[]).map(eq => eq.id);
-      
-      const progressImagesLatestOnly = options?.progressImagesLatestOnly === true;
       
       // PERFORMANCE: Fetch progress images and entries in batches (30 = fewer round-trips, still safe for timeouts)
       const batchSize = 30;
@@ -956,11 +1367,20 @@ export const fastAPI = {
       console.error('❌ Error fetching equipment:', error);
       return []; // Return empty array on any error to prevent UI crashes
     }
+    })();
+
+    equipmentByProjectInFlight.set(dedupeKey, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      equipmentByProjectInFlight.delete(dedupeKey);
+    }
   },
 
   // Fetch standalone equipment (not connected to any project) - filtered by created_by (only equipment added by current user)
   // Optional: progressImagesLatestOnly = true returns metadata only (no image_url) and progress_images: [] for on-demand loading
   async getStandaloneEquipment(firmId?: string, userId?: string, options?: { progressImagesLatestOnly?: boolean }) {
+    let inFlightKey = '';
     try {
       // Get user data if not provided
       if (!userId || !firmId) {
@@ -978,7 +1398,43 @@ export const fastAPI = {
       const userData = JSON.parse(localStorage.getItem('userData') || '{}');
       const userRole = userData.role || localStorage.getItem('userRole') || '';
       const userEmail = userData.email || localStorage.getItem('userEmail') || '';
-  
+
+      inFlightKey = JSON.stringify({
+        firmId: firmId || '',
+        userId: userId || '',
+        userRole: userRole || '',
+        userEmail: (userEmail || '').toLowerCase().trim(),
+        progressImagesLatestOnly: options?.progressImagesLatestOnly === true,
+      });
+      const existing = standaloneEquipmentInFlight.get(inFlightKey);
+      if (existing) return await existing;
+      const recent = standaloneEquipmentRecent.get(inFlightKey);
+      if (recent && Date.now() - recent.at < STANDALONE_RECENT_TTL_MS) {
+        return recent.data;
+      }
+
+      const loadPromise = (async (): Promise<any[]> => {
+      standaloneBundleExtras = null;
+      const progressImagesLatestOnly = options?.progressImagesLatestOnly === true;
+      try {
+        const rpcRes = await api.post(
+          '/rpc/get_standalone_equipment_bundle',
+          { p_firm_id: firmId ?? null, p_progress_images_latest_only: progressImagesLatestOnly },
+          { timeout: 120000 }
+        );
+        const raw = rpcRes.data;
+        if (raw && typeof raw === 'object' && Array.isArray((raw as any).equipment)) {
+          const merged = mergeStandaloneEquipmentBundlePayload(raw, progressImagesLatestOnly);
+          if (merged.extras) standaloneBundleExtras = merged.extras;
+          return merged.equipment;
+        }
+      } catch (bundleErr: any) {
+        if (!isBundleRpcUnavailable(bundleErr)) {
+          console.warn('⚠️ get_standalone_equipment_bundle failed, using legacy REST:', bundleErr?.message || bundleErr);
+        }
+        standaloneBundleExtras = null;
+      }
+
       let equipment: any[] = [];
   
       // Super Admin sees all equipment
@@ -1046,88 +1502,53 @@ export const fastAPI = {
       // Get all equipment IDs for batch fetching
       const equipmentIds = (equipment as any[]).map(eq => eq.id);
       
-      const progressImagesLatestOnly = options?.progressImagesLatestOnly === true;
       const standaloneProgressImagesSelect = progressImagesLatestOnly
         ? 'id,equipment_id,description,uploaded_by,upload_date,created_at'
         : 'id,equipment_id,image_url,description,uploaded_by,upload_date,created_at,audio_data,audio_duration';
       
-      // PERFORMANCE: Batch fetch progress images and entries in smaller batches to prevent timeouts
-      // CRITICAL FIX: Reduced batch size from 20 to 15 and limits from 1000 to 250 for faster queries
-      const batchSize = 15; // Reduced from 20 to prevent timeouts
+      // PERFORMANCE: Use larger batches, then split only failing batches.
+      // This reduces total API calls significantly while preserving timeout resilience.
+      const batchSize = 60;
       const standaloneProgressImages: any[] = [];
       const standaloneProgressEntries: any[] = [];
       
       // Progress entries: metadata only - image loaded on preview click (used in batch and fallback)
       const standaloneProgressEntriesSelect = 'id,equipment_id,entry_text,entry_type,created_by,created_at,image_description,audio_duration';
-      // Process batches sequentially to avoid overwhelming the database
+      const fetchStandaloneProgressBatch = async (ids: string[], depth = 0): Promise<void> => {
+        if (!ids.length) return;
+        try {
+          const [progressImagesResponse, progressEntriesResponse] = await Promise.all([
+            api.get(
+              `/standalone_equipment_progress_images?equipment_id=in.(${ids.join(',')})&select=${standaloneProgressImagesSelect}&order=created_at.desc&limit=250`,
+              { timeout: 20000 }
+            ),
+            api.get(
+              `/standalone_equipment_progress_entries?equipment_id=in.(${ids.join(',')})&select=${standaloneProgressEntriesSelect}&order=created_at.desc&limit=250`,
+              { timeout: 20000 }
+            ),
+          ]);
+          standaloneProgressImages.push(...(Array.isArray(progressImagesResponse.data) ? progressImagesResponse.data : []));
+          standaloneProgressEntries.push(...(Array.isArray(progressEntriesResponse.data) ? progressEntriesResponse.data : []));
+        } catch (error: any) {
+          const isTimeout = error?.code === 'ECONNABORTED' || error?.response?.data?.code === '57014';
+          // IMPORTANT: Cap split recursion to avoid request explosion when DB is slow.
+          // If a small batch still times out, skip that batch (non-fatal) instead of splitting endlessly.
+          const minBatchSizeForSplit = 12;
+          const maxSplitDepth = 3;
+          if (isTimeout && ids.length > minBatchSizeForSplit && depth < maxSplitDepth) {
+            const mid = Math.ceil(ids.length / 2);
+            await fetchStandaloneProgressBatch(ids.slice(0, mid), depth + 1);
+            await fetchStandaloneProgressBatch(ids.slice(mid), depth + 1);
+            return;
+          }
+          console.warn(`⚠️ Error fetching standalone progress data for batch size ${ids.length} (non-fatal):`, error);
+        }
+      };
+
+      // Process top-level batches sequentially to avoid overwhelming the database.
       for (let i = 0; i < equipmentIds.length; i += batchSize) {
         const batch = equipmentIds.slice(i, i + batchSize);
-        
-        // Retry logic for timeout errors
-        let retries = 0;
-        const maxRetries = 2;
-        let batchSuccess = false;
-        
-        while (retries <= maxRetries && !batchSuccess) {
-          try {
-            // PERFORMANCE: Process sequentially instead of Promise.all to reduce database load
-            // Fetch progress images first
-            const progressImagesResponse = await api.get(
-              `/standalone_equipment_progress_images?equipment_id=in.(${batch.join(',')})&select=${standaloneProgressImagesSelect}&order=created_at.desc&limit=250`, 
-              { timeout: 20000 }
-            );
-            
-            // Then fetch progress entries (metadata only)
-            const progressEntriesResponse = await api.get(
-              `/standalone_equipment_progress_entries?equipment_id=in.(${batch.join(',')})&select=${standaloneProgressEntriesSelect}&order=created_at.desc&limit=250`, 
-              { timeout: 20000 }
-            );
-            
-            standaloneProgressImages.push(...(Array.isArray(progressImagesResponse.data) ? progressImagesResponse.data : []));
-            standaloneProgressEntries.push(...(Array.isArray(progressEntriesResponse.data) ? progressEntriesResponse.data : []));
-            batchSuccess = true;
-          } catch (error: any) {
-            // Check if it's a timeout error
-            if (error?.code === 'ECONNABORTED' || error?.response?.data?.code === '57014') {
-              retries++;
-              if (retries > maxRetries) {
-                console.warn(`⚠️ Timeout fetching standalone progress data for batch ${i / batchSize + 1} after ${maxRetries} retries (non-fatal):`, error);
-                // Try fetching individually as fallback for this batch
-                try {
-                  for (const eqId of batch as string[]) {
-                    try {
-                      // Fetch sequentially for individual equipment (reduced limits from 1000 to 250)
-                      const imgRes = await api.get(
-                        `/standalone_equipment_progress_images?equipment_id=eq.${eqId}&select=${standaloneProgressImagesSelect}&order=created_at.desc&limit=250`, 
-                        { timeout: 10000 }
-                      ).catch(() => ({ data: [] }));
-                      
-                      const entryRes = await api.get(
-                        `/standalone_equipment_progress_entries?equipment_id=eq.${eqId}&select=${standaloneProgressEntriesSelect}&order=created_at.desc&limit=250`, 
-                        { timeout: 10000 }
-                      ).catch(() => ({ data: [] }));
-                      standaloneProgressImages.push(...(imgRes.data || []));
-                      standaloneProgressEntries.push(...(entryRes.data || []));
-                    } catch (indError) {
-                      console.warn(`⚠️ Error fetching progress data for equipment ${eqId} individually:`, indError);
-                    }
-                  }
-                } catch (fallbackError) {
-                  console.warn(`⚠️ Fallback individual fetch also failed for batch ${i / batchSize + 1}:`, fallbackError);
-                }
-                break; // Exit retry loop
-              } else {
-                // Wait before retry (exponential backoff)
-                await new Promise(resolve => setTimeout(resolve, 1000 * retries));
-                continue; // Retry
-              }
-            } else {
-              // Non-timeout error, log and continue
-              console.warn(`⚠️ Error fetching standalone progress data for batch ${i / batchSize + 1} (non-fatal):`, error);
-              break; // Exit retry loop for non-timeout errors
-            }
-          }
-        }
+        await fetchStandaloneProgressBatch(batch);
       }
       
       const progressImagesResponse = { data: standaloneProgressImages };
@@ -1142,7 +1563,7 @@ export const fastAPI = {
       
       if (userIds.length > 0) {
         try {
-          const batchSize = 25;
+          const batchSize = 100;
           const userChunks: string[][] = [];
           for (let i = 0; i < userIds.length; i += batchSize) {
             userChunks.push(userIds.slice(i, i + batchSize));
@@ -1193,9 +1614,72 @@ export const fastAPI = {
       });
       
       return equipmentWithProgressData;
+      })();
+
+      standaloneEquipmentInFlight.set(inFlightKey, loadPromise);
+      try {
+        const result = await loadPromise;
+        standaloneEquipmentRecent.set(inFlightKey, { at: Date.now(), data: result });
+        return result;
+      } finally {
+        standaloneEquipmentInFlight.delete(inFlightKey);
+      }
     } catch (error) {
       console.error('❌ Error fetching standalone equipment:', error);
       throw error;
+    }
+  },
+
+  // Lightweight suggestions fetch used by Add Standalone Equipment form.
+  // Unlike getStandaloneEquipment, this intentionally avoids progress/images joins.
+  async getStandaloneEquipmentSuggestions(firmId?: string, userId?: string) {
+    try {
+      if (!userId || !firmId) {
+        const userData = JSON.parse(localStorage.getItem('userData') || '{}');
+        userId = userId || userData.id || localStorage.getItem('userId') || '';
+        firmId = firmId || userData.firm_id;
+      }
+
+      if (!userId) return [];
+
+      const userData = JSON.parse(localStorage.getItem('userData') || '{}');
+      const userRole = userData.role || localStorage.getItem('userRole') || '';
+      const userEmail = (userData.email || localStorage.getItem('userEmail') || '').toLowerCase().trim();
+
+      const selectFields = 'id,client_name,plant_location,client_industry,consultant,tpi_agency,equipment_manager,created_by';
+      let equipment: any[] = [];
+
+      if (userRole === 'super_admin') {
+        const response = await api.get(`/standalone_equipment?select=${selectFields}&order=created_at.desc`);
+        equipment = (response.data as any[]) || [];
+      } else if (userRole === 'firm_admin' && firmId) {
+        const firmUsersResponse = await api.get(`/users?firm_id=eq.${firmId}&select=id`);
+        const firmUserIds = (firmUsersResponse.data as any[]).map((u: any) => u.id).filter(Boolean);
+        if (!firmUserIds.length) return [];
+        const response = await api.get(
+          `/standalone_equipment?created_by=in.(${firmUserIds.join(',')})&select=${selectFields}&order=created_at.desc`
+        );
+        equipment = (response.data as any[]) || [];
+      } else {
+        if (!userEmail) return [];
+        const teamPositionsResponse = await api.get(
+          `/standalone_equipment_team_positions?email=ilike.${encodeURIComponent(userEmail)}&select=equipment_id`
+        );
+        const equipmentIds = (teamPositionsResponse.data as any[])
+          .map((tp: any) => tp.equipment_id)
+          .filter(Boolean);
+        const uniqueEquipmentIds = [...new Set(equipmentIds)];
+        if (!uniqueEquipmentIds.length) return [];
+        const response = await api.get(
+          `/standalone_equipment?id=in.(${uniqueEquipmentIds.join(',')})&select=${selectFields}&order=created_at.desc`
+        );
+        equipment = (response.data as any[]) || [];
+      }
+
+      return Array.isArray(equipment) ? equipment : [];
+    } catch (error) {
+      console.error('❌ Error fetching standalone equipment suggestions:', error);
+      return [];
     }
   },
 
@@ -1249,17 +1733,34 @@ export const fastAPI = {
     try {
       const projectId = equipmentData.project_id;
       if (projectId) {
-        const projectRes = await api.get(`/projects?id=eq.${projectId}&select=firm_id`);
-        const project = (projectRes.data as any[])?.[0];
-        const firmId = project?.firm_id;
-        if (firmId) {
-          const firm = await fastAPI.getFirmById(firmId);
-          const limit = firm?.max_equipment_limit;
-          if (limit != null && typeof limit === 'number') {
-            const count = await fastAPI.getEquipmentCountByFirm(firmId);
-            if (count >= limit) {
-              throw new Error(`Equipment limit reached (${count}/${limit}). Your company cannot add more equipment. Contact your super admin to increase the limit.`);
-            }
+        let firmId: string | null | undefined;
+        let limit: number | null | undefined;
+        try {
+          const projectRes = await api.get(
+            `/projects?id=eq.${projectId}&select=firm_id,firms(max_equipment_limit)`
+          );
+          const project = (projectRes.data as any[])?.[0];
+          firmId = project?.firm_id;
+          const fr = project?.firms;
+          const firmRow = fr != null ? (Array.isArray(fr) ? fr[0] : fr) : null;
+          limit = firmRow?.max_equipment_limit;
+        } catch {
+          const projectRes = await api.get(`/projects?id=eq.${projectId}&select=firm_id`);
+          const project = (projectRes.data as any[])?.[0];
+          firmId = project?.firm_id;
+          if (firmId) {
+            const firmRes = await api.get(`/firms?id=eq.${firmId}&select=max_equipment_limit`);
+            limit = (firmRes.data as any[])?.[0]?.max_equipment_limit;
+          }
+        }
+        if (firmId != null && limit === undefined) {
+          const firmRes = await api.get(`/firms?id=eq.${firmId}&select=max_equipment_limit`);
+          limit = (firmRes.data as any[])?.[0]?.max_equipment_limit;
+        }
+        if (firmId && limit != null && typeof limit === 'number') {
+          const count = await fastAPI.getEquipmentCountByFirm(firmId);
+          if (count >= limit) {
+            throw new Error(`Equipment limit reached (${count}/${limit}). Your company cannot add more equipment. Contact your super admin to increase the limit.`);
           }
         }
       }
@@ -1376,32 +1877,45 @@ export const fastAPI = {
    */
   async getLatestProgressImageUrlsBatch(equipmentIds: string[], isStandalone: boolean = false): Promise<Record<string, string | null>> {
     if (!equipmentIds?.length) return {};
-    if (import.meta.env.DEV) {
-      console.log(`[Batch] Latest progress image URLs: 1 request for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
-    }
-    try {
-      const table = isStandalone ? 'standalone_equipment_progress_images' : 'equipment_progress_images';
-      const limit = Math.max(500, equipmentIds.length * 2);
-      const res = await api.get(
-        `/${table}?equipment_id=in.(${equipmentIds.join(',')})&select=equipment_id,image_url,created_at&order=created_at.desc&limit=${limit}`,
-        { timeout: 15000 }
-      );
-      const rows: any[] = Array.isArray(res.data) ? res.data : [];
-      const result: Record<string, string | null> = {};
-      for (const id of equipmentIds) result[id] = null;
-      const placeholder = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMSIgaGVpZ2h0PSIxIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjwvc3ZnPg==';
-      const isPlaceholder = (url: string | null) => !url || url === placeholder || (url.startsWith('data:image/svg') && url.length < 200);
-      for (const row of rows) {
-        if (!row.equipment_id) continue;
-        const url = row.image_url ?? null;
-        const current = result[row.equipment_id];
-        if (current == null) result[row.equipment_id] = url;
-        else if (isPlaceholder(current) && !isPlaceholder(url)) result[row.equipment_id] = url; // prefer latest non-placeholder
+    const dedupeKey = `${isStandalone ? 's' : 'p'}:${batchDedupeKey(equipmentIds)}`;
+    const inflight = latestProgressImageUrlsBatchInFlight.get(dedupeKey);
+    if (inflight) return await inflight;
+
+    const loadPromise = (async (): Promise<Record<string, string | null>> => {
+      if (import.meta.env.DEV) {
+        console.log(`[Batch] Latest progress image URLs: 1 request for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
       }
-      return result;
-    } catch (error) {
-      console.warn('⚠️ getLatestProgressImageUrlsBatch failed (non-fatal):', error);
-      return Object.fromEntries(equipmentIds.map((id) => [id, null]));
+      try {
+        const table = isStandalone ? 'standalone_equipment_progress_images' : 'equipment_progress_images';
+        const limit = Math.max(500, equipmentIds.length * 2);
+        const res = await api.get(
+          `/${table}?equipment_id=in.(${equipmentIds.join(',')})&select=equipment_id,image_url,created_at&order=created_at.desc&limit=${limit}`,
+          { timeout: 15000 }
+        );
+        const rows: any[] = Array.isArray(res.data) ? res.data : [];
+        const result: Record<string, string | null> = {};
+        for (const id of equipmentIds) result[id] = null;
+        const placeholder = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMSIgaGVpZ2h0PSIxIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjwvc3ZnPg==';
+        const isPlaceholder = (url: string | null) => !url || url === placeholder || (url.startsWith('data:image/svg') && url.length < 200);
+        for (const row of rows) {
+          if (!row.equipment_id) continue;
+          const url = row.image_url ?? null;
+          const current = result[row.equipment_id];
+          if (current == null) result[row.equipment_id] = url;
+          else if (isPlaceholder(current) && !isPlaceholder(url)) result[row.equipment_id] = url; // prefer latest non-placeholder
+        }
+        return result;
+      } catch (error) {
+        console.warn('⚠️ getLatestProgressImageUrlsBatch failed (non-fatal):', error);
+        return Object.fromEntries(equipmentIds.map((id) => [id, null]));
+      }
+    })();
+
+    latestProgressImageUrlsBatchInFlight.set(dedupeKey, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      latestProgressImageUrlsBatchInFlight.delete(dedupeKey);
     }
   },
 
@@ -1506,7 +2020,9 @@ export const fastAPI = {
     created_by?: string
   }) {
     try {
-      const response = await api.post('/equipment_progress_entries', entryData);
+      const response = await api.post('/equipment_progress_entries', entryData, {
+        headers: { Prefer: 'return=representation' },
+      });
       return response.data;
     } catch (error) {
       console.error('❌ Error creating progress entry:', error);
@@ -1541,7 +2057,9 @@ export const fastAPI = {
     created_by?: string
   }) {
     try {
-      const response = await api.post('/standalone_equipment_progress_entries', entryData);
+      const response = await api.post('/standalone_equipment_progress_entries', entryData, {
+        headers: { Prefer: 'return=representation' },
+      });
       return response.data;
     } catch (error) {
       console.error('❌ Error creating standalone progress entry:', error);
@@ -1595,79 +2113,111 @@ export const fastAPI = {
 
   // Project equipment: get activities (with completion if any). Completions: metadata only (no image_url) for fast load.
   async getEquipmentActivities(equipmentId: string) {
+    const completionsSelect =
+      'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
+    const mapEmbedToActivities = (rows: any[]): any[] =>
+      rows.map((a: any) => {
+        const nested = a.equipment_activity_completions;
+        const compArr = Array.isArray(nested) ? nested : nested ? [nested] : [];
+        const completion = compArr[0] || null;
+        const { equipment_activity_completions, ...rest } = a;
+        return { ...rest, completion };
+      });
     try {
-      const activitiesRes = await api.get(`/equipment_activities?equipment_id=eq.${equipmentId}&select=*&order=sort_order.asc,sr_no.asc`);
+      // Prefer: one request (activities + completions embed) instead of two round-trips.
+      const activitiesRes = await api.get(
+        `/equipment_activities?equipment_id=eq.${equipmentId}&select=*,equipment_activity_completions(${completionsSelect})&order=sort_order.asc,sr_no.asc`
+      );
       const activities: any[] = Array.isArray(activitiesRes.data) ? activitiesRes.data : [];
       if (activities.length === 0) return [];
-      const activityIds = activities.map((a: any) => a.id).join(',');
-      const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
-      const completionsRes = await api.get(`/equipment_activity_completions?activity_id=in.(${activityIds})&select=${completionsSelect}`);
-      const completions: any[] = Array.isArray(completionsRes.data) ? completionsRes.data : [];
-      const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
-        acc[c.activity_id] = c;
-        return acc;
-      }, {});
-      return activities.map((a: any) => ({
-        ...a,
-        completion: completionByActivityId[a.id] || null
-      }));
-    } catch (error) {
-      console.error('❌ Error fetching equipment activities:', error);
-      throw error;
+      return mapEmbedToActivities(activities);
+    } catch (embedErr: any) {
+      console.warn('⚠️ getEquipmentActivities embed failed, falling back to two requests:', embedErr?.message || embedErr);
+      try {
+        const activitiesRes = await api.get(`/equipment_activities?equipment_id=eq.${equipmentId}&select=*&order=sort_order.asc,sr_no.asc`);
+        const activities: any[] = Array.isArray(activitiesRes.data) ? activitiesRes.data : [];
+        if (activities.length === 0) return [];
+        const activityIds = activities.map((a: any) => a.id).join(',');
+        const completionsRes = await api.get(`/equipment_activity_completions?activity_id=in.(${activityIds})&select=${completionsSelect}`);
+        const completions: any[] = Array.isArray(completionsRes.data) ? completionsRes.data : [];
+        const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
+          acc[c.activity_id] = c;
+          return acc;
+        }, {});
+        return activities.map((a: any) => ({
+          ...a,
+          completion: completionByActivityId[a.id] || null
+        }));
+      } catch (error) {
+        console.error('❌ Error fetching equipment activities:', error);
+        throw error;
+      }
     }
   },
 
   /** Batch fetch equipment activities for many equipment IDs. Returns Record<equipmentId, activities[]>. */
   async getEquipmentActivitiesBatch(equipmentIds: string[]): Promise<Record<string, any[]>> {
     if (!equipmentIds?.length) return {};
-    if (import.meta.env.DEV) {
-      console.log(`[Batch] Project activities: 1 batch for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
-    }
-    try {
-      const BATCH_CHUNK = 40;
-      const allActivities: any[] = [];
-      for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
-        const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
-        const res = await api.get(
-          `/equipment_activities?equipment_id=in.(${chunk.join(',')})&select=*&order=sort_order.asc,sr_no.asc`,
-          { timeout: 15000 }
-        );
-        const rows = Array.isArray(res.data) ? res.data : [];
-        allActivities.push(...rows);
+    const dedupeKey = batchDedupeKey(equipmentIds);
+    const inflight = equipmentActivitiesBatchInFlight.get(dedupeKey);
+    if (inflight) return await inflight;
+
+    const loadPromise = (async (): Promise<Record<string, any[]>> => {
+      if (import.meta.env.DEV) {
+        console.log(`[Batch] Project activities: 1 batch for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
       }
-      if (allActivities.length === 0) {
+      try {
+        const BATCH_CHUNK = 40;
+        const allActivities: any[] = [];
+        for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
+          const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
+          const res = await api.get(
+            `/equipment_activities?equipment_id=in.(${chunk.join(',')})&select=*&order=sort_order.asc,sr_no.asc`,
+            { timeout: 15000 }
+          );
+          const rows = Array.isArray(res.data) ? res.data : [];
+          allActivities.push(...rows);
+        }
+        if (allActivities.length === 0) {
+          return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+        }
+        const activityIds = [...new Set(allActivities.map((a: any) => a.id))];
+        const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
+        let completions: any[] = [];
+        for (const idChunk of chunkIdsForInClause(activityIds)) {
+          const compRes = await api.get(
+            `/equipment_activity_completions?activity_id=in.(${idChunk.join(',')})&select=${completionsSelect}`,
+            { timeout: 10000 }
+          );
+          completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
+        }
+        const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
+          acc[c.activity_id] = c;
+          return acc;
+        }, {});
+        const withCompletion = allActivities.map((a: any) => ({
+          ...a,
+          completion: completionByActivityId[a.id] || null
+        }));
+        const result: Record<string, any[]> = {};
+        for (const id of equipmentIds) result[id] = [];
+        for (const a of withCompletion) {
+          if (a.equipment_id) {
+            (result[a.equipment_id] = result[a.equipment_id] || []).push(a);
+          }
+        }
+        return result;
+      } catch (error: any) {
+        console.error('❌ Error fetching equipment activities batch:', error);
         return Object.fromEntries(equipmentIds.map((id) => [id, []]));
       }
-      const activityIds = [...new Set(allActivities.map((a: any) => a.id))];
-      const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
-      let completions: any[] = [];
-      for (let i = 0; i < activityIds.length; i += 100) {
-        const idChunk = activityIds.slice(i, i + 100);
-        const compRes = await api.get(
-          `/equipment_activity_completions?activity_id=in.(${idChunk.join(',')})&select=${completionsSelect}`,
-          { timeout: 10000 }
-        );
-        completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
-      }
-      const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
-        acc[c.activity_id] = c;
-        return acc;
-      }, {});
-      const withCompletion = allActivities.map((a: any) => ({
-        ...a,
-        completion: completionByActivityId[a.id] || null
-      }));
-      const result: Record<string, any[]> = {};
-      for (const id of equipmentIds) result[id] = [];
-      for (const a of withCompletion) {
-        if (a.equipment_id) {
-          (result[a.equipment_id] = result[a.equipment_id] || []).push(a);
-        }
-      }
-      return result;
-    } catch (error: any) {
-      console.error('❌ Error fetching equipment activities batch:', error);
-      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+    })();
+
+    equipmentActivitiesBatchInFlight.set(dedupeKey, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      equipmentActivitiesBatchInFlight.delete(dedupeKey);
     }
   },
 
@@ -1722,59 +2272,133 @@ export const fastAPI = {
   },
 
   // Project equipment: merge activities (edit modal / checklist) – PATCH existing, POST new, DELETE removed; preserves completions
-  async updateEquipmentActivitiesMerge(equipmentId: string, payload: {
-    commencement_date?: string | null;
-    activities: Array<{
-      id?: string;
-      sr_no: number;
-      activity_name: string;
-      activity_type: 'regular_update' | 'milestone';
-      target_relative?: string;
-      target_date?: string;
-      sort_order: number;
-      activity_detail?: string | null;
-      department?: string | null;
-      reference_document_url?: string | null;
-      reference_document_name?: string | null;
-      reference_image_url?: string | null;
-      created_by?: string | null;
-      inspection_tpi_involved?: boolean;
-      progress_weight?: number | null;
-    }>;
-  }) {
+  async updateEquipmentActivitiesMerge(
+    equipmentId: string,
+    payload: {
+      commencement_date?: string | null;
+      activities: Array<{
+        id?: string;
+        sr_no: number;
+        activity_name: string;
+        activity_type: 'regular_update' | 'milestone';
+        target_relative?: string;
+        target_date?: string;
+        sort_order: number;
+        activity_detail?: string | null;
+        department?: string | null;
+        reference_document_url?: string | null;
+        reference_document_name?: string | null;
+        reference_image_url?: string | null;
+        created_by?: string | null;
+        inspection_tpi_involved?: boolean;
+        progress_weight?: number | null;
+      }>;
+    },
+    options?: { previousActivities?: any[] }
+  ) {
+    const prevList = options?.previousActivities;
+    const useClientSnapshot = Array.isArray(prevList) && prevList.length > 0;
+    const completionById: Record<string, any> = {};
+    if (useClientSnapshot) {
+      for (const a of prevList!) {
+        if (a?.id) completionById[a.id] = a.completion ?? null;
+      }
+    }
+
+    const normMerge = (v: unknown): string | null => {
+      if (v == null || v === '') return null;
+      const s = String(v).trim();
+      return s || null;
+    };
+    const mergeRowUnchanged = (prev: any, body: any): boolean => {
+      if (!prev?.id) return false;
+      const n = (x: unknown, y: unknown) => normMerge(x) === normMerge(y);
+      const pwEq =
+        (prev.progress_weight == null && body.progress_weight == null) ||
+        Number(prev.progress_weight) === Number(body.progress_weight);
+      return (
+        Number(prev.sr_no) === Number(body.sr_no) &&
+        Number(prev.sort_order) === Number(body.sort_order) &&
+        (prev.activity_name || '') === (body.activity_name || '') &&
+        prev.activity_type === body.activity_type &&
+        n(prev.target_relative, body.target_relative) &&
+        n(prev.target_date, body.target_date) &&
+        !!prev.inspection_tpi_involved === !!body.inspection_tpi_involved &&
+        pwEq
+      );
+    };
+
+    const buildBody = (a: (typeof payload.activities)[0]) => ({
+      sr_no: a.sr_no,
+      activity_name: a.activity_name,
+      activity_type: a.activity_type,
+      target_relative: a.target_relative ?? null,
+      target_date: a.target_date ?? null,
+      sort_order: a.sort_order,
+      activity_detail: a.activity_detail ?? null,
+      department: a.department ?? null,
+      reference_document_url: a.reference_document_url ?? null,
+      reference_document_name: a.reference_document_name ?? null,
+      reference_image_url: a.reference_image_url ?? null,
+      created_by: a.created_by ?? null,
+      inspection_tpi_involved: a.inspection_tpi_involved ?? false,
+      progress_weight: a.progress_weight ?? null,
+    });
+
     try {
       if (payload.commencement_date !== undefined) {
         await api.patch(`/equipment?id=eq.${equipmentId}`, { commencement_date: payload.commencement_date || null });
       }
-      const currentRes = await api.get(`/equipment_activities?equipment_id=eq.${equipmentId}&select=id`);
-      const current: any[] = Array.isArray(currentRes.data) ? currentRes.data : [];
       const draftExistingIds = (payload.activities || [])
-        .filter(a => a.id && !String(a.id).startsWith('new-'))
-        .map(a => a.id as string);
-      for (const a of payload.activities || []) {
-        const body = {
-          sr_no: a.sr_no,
-          activity_name: a.activity_name,
-          activity_type: a.activity_type,
-          target_relative: a.target_relative ?? null,
-          target_date: a.target_date ?? null,
-          sort_order: a.sort_order,
-          activity_detail: a.activity_detail ?? null,
-          department: a.department ?? null,
-          reference_document_url: a.reference_document_url ?? null,
-          reference_document_name: a.reference_document_name ?? null,
-          reference_image_url: a.reference_image_url ?? null,
-          created_by: a.created_by ?? null,
-          inspection_tpi_involved: a.inspection_tpi_involved ?? false,
-          progress_weight: a.progress_weight ?? null,
-        };
+        .filter((a) => a.id && !String(a.id).startsWith('new-'))
+        .map((a) => a.id as string);
+
+      let toDelete: string[];
+      if (useClientSnapshot) {
+        const previousIds = prevList!.map((a: any) => a.id).filter(Boolean);
+        toDelete = previousIds.filter((id: string) => !draftExistingIds.includes(id));
+      } else {
+        const currentRes = await api.get(`/equipment_activities?equipment_id=eq.${equipmentId}&select=id`);
+        const current: any[] = Array.isArray(currentRes.data) ? currentRes.data : [];
+        toDelete = current.filter((c: any) => !draftExistingIds.includes(c.id)).map((c: any) => c.id);
+      }
+
+      const activities = payload.activities || [];
+      const rep = { Prefer: 'return=representation' };
+
+      if (useClientSnapshot) {
+        const mergedRows = await Promise.all(
+          activities.map(async (a) => {
+            const body = buildBody(a);
+            if (a.id && !String(a.id).startsWith('new-')) {
+              const prevRow = prevList!.find((p: any) => p.id === a.id);
+              if (prevRow && mergeRowUnchanged(prevRow, body)) {
+                return { ...prevRow, completion: completionById[a.id as string] ?? null };
+              }
+              const res = await api.patch(`/equipment_activities?id=eq.${a.id}`, body, { headers: rep });
+              const row = Array.isArray(res.data) ? res.data[0] : res.data;
+              return { ...row, completion: completionById[a.id as string] ?? null };
+            }
+            const res = await api.post('/equipment_activities', { equipment_id: equipmentId, ...body }, { headers: rep });
+            const row = Array.isArray(res.data) ? res.data[0] : res.data;
+            return { ...row, completion: null };
+          })
+        );
+        if (toDelete.length > 0) {
+          await Promise.all(toDelete.map((id) => api.delete(`/equipment_activities?id=eq.${id}`)));
+        }
+        mergedRows.sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+        return mergedRows;
+      }
+
+      for (const a of activities) {
+        const body = buildBody(a);
         if (a.id && !String(a.id).startsWith('new-')) {
           await api.patch(`/equipment_activities?id=eq.${a.id}`, body);
         } else {
-          await api.post('/equipment_activities', { equipment_id: equipmentId, ...body }, { headers: { Prefer: 'return=representation' } });
+          await api.post('/equipment_activities', { equipment_id: equipmentId, ...body }, { headers: rep });
         }
       }
-      const toDelete = current.filter((c: any) => !draftExistingIds.includes(c.id)).map((c: any) => c.id);
       for (const id of toDelete) {
         await api.delete(`/equipment_activities?id=eq.${id}`);
       }
@@ -1819,22 +2443,43 @@ export const fastAPI = {
       const created = Array.isArray(response.data) ? response.data[0] : response.data;
       const completionId = created?.id;
       if (completionId && imageCount > 0) {
-        for (let i = 0; i < imageUrls.length; i++) {
-          await api.post('/equipment_activity_completion_images', {
-            completion_id: completionId,
-            sort_order: i,
-            image_url: imageUrls[i] ?? null
-          });
+        const bulkImages = imageUrls.map((url, i) => ({
+          completion_id: completionId,
+          sort_order: i,
+          image_url: url ?? null
+        }));
+        try {
+          await api.post('/equipment_activity_completion_images', bulkImages);
+        } catch (bulkImgErr: any) {
+          console.warn('⚠️ Bulk insert completion images failed, falling back to one-by-one:', bulkImgErr?.message || bulkImgErr);
+          for (let i = 0; i < imageUrls.length; i++) {
+            await api.post('/equipment_activity_completion_images', {
+              completion_id: completionId,
+              sort_order: i,
+              image_url: imageUrls[i] ?? null
+            });
+          }
         }
       }
       if (completionId && reportCount > 0) {
-        for (let i = 0; i < reportUrls.length; i++) {
-          await api.post('/equipment_activity_completion_inspection_reports', {
-            completion_id: completionId,
-            sort_order: i,
-            report_url: reportUrls[i] ?? null,
-            file_name: reportNames[i] ?? null
-          });
+        const bulkReports = reportUrls.map((url, i) => ({
+          completion_id: completionId,
+          sort_order: i,
+          report_url: url ?? null,
+          file_name: reportNames[i] ?? null
+        }));
+        try {
+          await api.post('/equipment_activity_completion_inspection_reports', bulkReports);
+        } catch (bulkRepErr: any) {
+          console.warn('⚠️ Bulk insert inspection reports failed, falling back to one-by-one:', bulkRepErr?.message || bulkRepErr);
+          for (let i = 0; i < reportUrls.length; i++) {
+            await api.post('/equipment_activity_completion_inspection_reports', {
+              completion_id: completionId,
+              sort_order: i,
+              report_url: reportUrls[i] ?? null,
+              file_name: reportNames[i] ?? null
+            });
+          }
         }
       }
       return response.data;
@@ -1872,6 +2517,34 @@ export const fastAPI = {
     }
   },
 
+  /** Batch fetch image counts for many completion IDs. Returns Record<completionId, count>. */
+  async getEquipmentActivityCompletionImageCountBatch(
+    completionIds: string[],
+    isStandalone: boolean = false
+  ): Promise<Record<string, number>> {
+    if (!completionIds?.length) return {};
+    try {
+      const table = isStandalone ? 'standalone_equipment_activity_completion_images' : 'equipment_activity_completion_images';
+      const uniqueIds = [...new Set(completionIds.filter(Boolean))];
+      const counts: Record<string, number> = Object.fromEntries(uniqueIds.map((id) => [id, 0]));
+      const CHUNK = 120;
+      for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+        const chunk = uniqueIds.slice(i, i + CHUNK);
+        const res = await api.get(`/${table}?completion_id=in.(${chunk.join(',')})&select=completion_id`);
+        const rows = Array.isArray(res.data) ? res.data : [];
+        for (const row of rows as any[]) {
+          const id = row?.completion_id;
+          if (!id) continue;
+          counts[id] = (counts[id] || 0) + 1;
+        }
+      }
+      return counts;
+    } catch (err) {
+      console.warn('⚠️ getEquipmentActivityCompletionImageCountBatch failed:', err);
+      return {};
+    }
+  },
+
   /** Fetch one completion image URL by completion id and index (0-based). Uses completion_images table; falls back to completion.image_url for index 0 (legacy). */
   async getEquipmentActivityCompletionImageUrl(completionId: string, index: number, isStandalone: boolean = false): Promise<string | null> {
     try {
@@ -1894,82 +2567,184 @@ export const fastAPI = {
     }
   },
 
+  /** Batch fetch completion image URLs by (completionId, index). Falls back to completion.image_url for index 0 when needed. */
+  async getEquipmentActivityCompletionImageUrlBatch(
+    requests: Array<{ completionId: string; index: number }>,
+    isStandalone: boolean = false
+  ): Promise<Record<string, string | null>> {
+    if (!requests?.length) return {};
+    try {
+      const table = isStandalone ? 'standalone_equipment_activity_completion_images' : 'equipment_activity_completion_images';
+      const compTable = isStandalone ? 'standalone_equipment_activity_completions' : 'equipment_activity_completions';
+      const uniqueIds = [...new Set(requests.map((r) => r.completionId).filter(Boolean))];
+      const result: Record<string, string | null> = {};
+
+      // Initialize all requested keys as null
+      for (const req of requests) {
+        result[`${req.completionId}_${req.index}`] = null;
+      }
+
+      // Fetch all image rows for requested completion IDs (chunked)
+      const rows: any[] = [];
+      const CHUNK = 120;
+      for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+        const chunk = uniqueIds.slice(i, i + CHUNK);
+        const res = await api.get(
+          `/${table}?completion_id=in.(${chunk.join(',')})&select=completion_id,sort_order,image_url&order=sort_order.asc`
+        );
+        rows.push(...(Array.isArray(res.data) ? res.data : []));
+      }
+
+      // Group rows by completion_id and map requested index
+      const grouped: Record<string, Array<{ sort_order: number; image_url: string | null }>> = {};
+      for (const row of rows) {
+        const id = row?.completion_id;
+        if (!id) continue;
+        if (!grouped[id]) grouped[id] = [];
+        grouped[id].push({ sort_order: Number(row.sort_order ?? 0), image_url: row.image_url ?? null });
+      }
+
+      const fallbackZeroIds = new Set<string>();
+      for (const req of requests) {
+        const key = `${req.completionId}_${req.index}`;
+        const list = grouped[req.completionId] || [];
+        const picked = list[req.index];
+        if (picked?.image_url) {
+          result[key] = picked.image_url;
+        } else if (req.index === 0) {
+          fallbackZeroIds.add(req.completionId);
+        }
+      }
+
+      // Legacy fallback for index 0
+      if (fallbackZeroIds.size > 0) {
+        const ids = [...fallbackZeroIds];
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const chunk = ids.slice(i, i + CHUNK);
+          const res = await api.get(`/${compTable}?id=in.(${chunk.join(',')})&select=id,image_url`);
+          const compRows = Array.isArray(res.data) ? res.data : [];
+          for (const c of compRows) {
+            const id = c?.id;
+            if (!id) continue;
+            result[`${id}_0`] = c?.image_url ?? null;
+          }
+        }
+      }
+
+      return result;
+    } catch (err) {
+      console.warn('⚠️ getEquipmentActivityCompletionImageUrlBatch failed:', err);
+      return {};
+    }
+  },
+
   // Standalone equipment: get activities (with completion if any)
   // Standalone equipment: get activities (completions metadata only, no image_url) for fast load.
   async getStandaloneEquipmentActivities(equipmentId: string) {
+    const completionsSelect =
+      'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
+    const mapEmbedToActivities = (rows: any[]): any[] =>
+      rows.map((a: any) => {
+        const nested = a.standalone_equipment_activity_completions;
+        const compArr = Array.isArray(nested) ? nested : nested ? [nested] : [];
+        const completion = compArr[0] || null;
+        const { standalone_equipment_activity_completions, ...rest } = a;
+        return { ...rest, completion };
+      });
     try {
-      const activitiesRes = await api.get(`/standalone_equipment_activities?equipment_id=eq.${equipmentId}&select=*&order=sort_order.asc,sr_no.asc`);
+      const activitiesRes = await api.get(
+        `/standalone_equipment_activities?equipment_id=eq.${equipmentId}&select=*,standalone_equipment_activity_completions(${completionsSelect})&order=sort_order.asc,sr_no.asc`
+      );
       const activities: any[] = Array.isArray(activitiesRes.data) ? activitiesRes.data : [];
       if (activities.length === 0) return [];
-      const activityIds = activities.map((a: any) => a.id).join(',');
-      const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
-      const completionsRes = await api.get(`/standalone_equipment_activity_completions?activity_id=in.(${activityIds})&select=${completionsSelect}`);
-      const completions: any[] = Array.isArray(completionsRes.data) ? completionsRes.data : [];
-      const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
-        acc[c.activity_id] = c;
-        return acc;
-      }, {});
-      return activities.map((a: any) => ({
-        ...a,
-        completion: completionByActivityId[a.id] || null
-      }));
-    } catch (error) {
-      console.error('❌ Error fetching standalone equipment activities:', error);
-      throw error;
+      return mapEmbedToActivities(activities);
+    } catch (embedErr: any) {
+      console.warn('⚠️ getStandaloneEquipmentActivities embed failed, falling back to two requests:', embedErr?.message || embedErr);
+      try {
+        const activitiesRes = await api.get(`/standalone_equipment_activities?equipment_id=eq.${equipmentId}&select=*&order=sort_order.asc,sr_no.asc`);
+        const activities: any[] = Array.isArray(activitiesRes.data) ? activitiesRes.data : [];
+        if (activities.length === 0) return [];
+        const activityIds = activities.map((a: any) => a.id).join(',');
+        const completionsRes = await api.get(`/standalone_equipment_activity_completions?activity_id=in.(${activityIds})&select=${completionsSelect}`);
+        const completions: any[] = Array.isArray(completionsRes.data) ? completionsRes.data : [];
+        const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
+          acc[c.activity_id] = c;
+          return acc;
+        }, {});
+        return activities.map((a: any) => ({
+          ...a,
+          completion: completionByActivityId[a.id] || null
+        }));
+      } catch (error) {
+        console.error('❌ Error fetching standalone equipment activities:', error);
+        throw error;
+      }
     }
   },
 
   /** Batch fetch standalone equipment activities for many equipment IDs. Returns Record<equipmentId, activities[]>. */
   async getStandaloneEquipmentActivitiesBatch(equipmentIds: string[]): Promise<Record<string, any[]>> {
     if (!equipmentIds?.length) return {};
-    if (import.meta.env.DEV) {
-      console.log(`[Batch] Standalone activities: 1 batch for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
-    }
-    try {
-      const BATCH_CHUNK = 40;
-      const allActivities: any[] = [];
-      for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
-        const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
-        const res = await api.get(
-          `/standalone_equipment_activities?equipment_id=in.(${chunk.join(',')})&select=*&order=sort_order.asc,sr_no.asc`,
-          { timeout: 15000 }
-        );
-        const rows = Array.isArray(res.data) ? res.data : [];
-        allActivities.push(...rows);
+    const dedupeKey = batchDedupeKey(equipmentIds);
+    const inflight = standaloneEquipmentActivitiesBatchInFlight.get(dedupeKey);
+    if (inflight) return await inflight;
+
+    const loadPromise = (async (): Promise<Record<string, any[]>> => {
+      if (import.meta.env.DEV) {
+        console.log(`[Batch] Standalone activities: 1 batch for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
       }
-      if (allActivities.length === 0) {
+      try {
+        const BATCH_CHUNK = 40;
+        const allActivities: any[] = [];
+        for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
+          const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
+          const res = await api.get(
+            `/standalone_equipment_activities?equipment_id=in.(${chunk.join(',')})&select=*&order=sort_order.asc,sr_no.asc`,
+            { timeout: 15000 }
+          );
+          const rows = Array.isArray(res.data) ? res.data : [];
+          allActivities.push(...rows);
+        }
+        if (allActivities.length === 0) {
+          return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+        }
+        const activityIds = [...new Set(allActivities.map((a: any) => a.id))];
+        const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
+        let completions: any[] = [];
+        for (const idChunk of chunkIdsForInClause(activityIds)) {
+          const compRes = await api.get(
+            `/standalone_equipment_activity_completions?activity_id=in.(${idChunk.join(',')})&select=${completionsSelect}`,
+            { timeout: 10000 }
+          );
+          completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
+        }
+        const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
+          acc[c.activity_id] = c;
+          return acc;
+        }, {});
+        const withCompletion = allActivities.map((a: any) => ({
+          ...a,
+          completion: completionByActivityId[a.id] || null
+        }));
+        const result: Record<string, any[]> = {};
+        for (const id of equipmentIds) result[id] = [];
+        for (const a of withCompletion) {
+          if (a.equipment_id) {
+            (result[a.equipment_id] = result[a.equipment_id] || []).push(a);
+          }
+        }
+        return result;
+      } catch (error: any) {
+        console.error('❌ Error fetching standalone equipment activities batch:', error);
         return Object.fromEntries(equipmentIds.map((id) => [id, []]));
       }
-      const activityIds = [...new Set(allActivities.map((a: any) => a.id))];
-      const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name),image_count,inspection_report_count,department';
-      let completions: any[] = [];
-      for (let i = 0; i < activityIds.length; i += 100) {
-        const idChunk = activityIds.slice(i, i + 100);
-        const compRes = await api.get(
-          `/standalone_equipment_activity_completions?activity_id=in.(${idChunk.join(',')})&select=${completionsSelect}`,
-          { timeout: 10000 }
-        );
-        completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
-      }
-      const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
-        acc[c.activity_id] = c;
-        return acc;
-      }, {});
-      const withCompletion = allActivities.map((a: any) => ({
-        ...a,
-        completion: completionByActivityId[a.id] || null
-      }));
-      const result: Record<string, any[]> = {};
-      for (const id of equipmentIds) result[id] = [];
-      for (const a of withCompletion) {
-        if (a.equipment_id) {
-          (result[a.equipment_id] = result[a.equipment_id] || []).push(a);
-        }
-      }
-      return result;
-    } catch (error: any) {
-      console.error('❌ Error fetching standalone equipment activities batch:', error);
-      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+    })();
+
+    standaloneEquipmentActivitiesBatchInFlight.set(dedupeKey, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      standaloneEquipmentActivitiesBatchInFlight.delete(dedupeKey);
     }
   },
 
@@ -2024,59 +2799,133 @@ export const fastAPI = {
   },
 
   // Standalone equipment: merge activities (edit modal / checklist) – PATCH existing, POST new, DELETE removed; preserves completions
-  async updateStandaloneEquipmentActivitiesMerge(equipmentId: string, payload: {
-    commencement_date?: string | null;
-    activities: Array<{
-      id?: string;
-      sr_no: number;
-      activity_name: string;
-      activity_type: 'regular_update' | 'milestone';
-      target_relative?: string;
-      target_date?: string;
-      sort_order: number;
-      activity_detail?: string | null;
-      department?: string | null;
-      reference_document_url?: string | null;
-      reference_document_name?: string | null;
-      reference_image_url?: string | null;
-      created_by?: string | null;
-      inspection_tpi_involved?: boolean;
-      progress_weight?: number | null;
-    }>;
-  }) {
+  async updateStandaloneEquipmentActivitiesMerge(
+    equipmentId: string,
+    payload: {
+      commencement_date?: string | null;
+      activities: Array<{
+        id?: string;
+        sr_no: number;
+        activity_name: string;
+        activity_type: 'regular_update' | 'milestone';
+        target_relative?: string;
+        target_date?: string;
+        sort_order: number;
+        activity_detail?: string | null;
+        department?: string | null;
+        reference_document_url?: string | null;
+        reference_document_name?: string | null;
+        reference_image_url?: string | null;
+        created_by?: string | null;
+        inspection_tpi_involved?: boolean;
+        progress_weight?: number | null;
+      }>;
+    },
+    options?: { previousActivities?: any[] }
+  ) {
+    const prevList = options?.previousActivities;
+    const useClientSnapshot = Array.isArray(prevList) && prevList.length > 0;
+    const completionById: Record<string, any> = {};
+    if (useClientSnapshot) {
+      for (const a of prevList!) {
+        if (a?.id) completionById[a.id] = a.completion ?? null;
+      }
+    }
+
+    const normMergeSa = (v: unknown): string | null => {
+      if (v == null || v === '') return null;
+      const s = String(v).trim();
+      return s || null;
+    };
+    const mergeRowUnchangedSa = (prev: any, body: any): boolean => {
+      if (!prev?.id) return false;
+      const n = (x: unknown, y: unknown) => normMergeSa(x) === normMergeSa(y);
+      const pwEq =
+        (prev.progress_weight == null && body.progress_weight == null) ||
+        Number(prev.progress_weight) === Number(body.progress_weight);
+      return (
+        Number(prev.sr_no) === Number(body.sr_no) &&
+        Number(prev.sort_order) === Number(body.sort_order) &&
+        (prev.activity_name || '') === (body.activity_name || '') &&
+        prev.activity_type === body.activity_type &&
+        n(prev.target_relative, body.target_relative) &&
+        n(prev.target_date, body.target_date) &&
+        !!prev.inspection_tpi_involved === !!body.inspection_tpi_involved &&
+        pwEq
+      );
+    };
+
+    const buildBody = (a: (typeof payload.activities)[0]) => ({
+      sr_no: a.sr_no,
+      activity_name: a.activity_name,
+      activity_type: a.activity_type,
+      target_relative: a.target_relative ?? null,
+      target_date: a.target_date ?? null,
+      sort_order: a.sort_order,
+      activity_detail: a.activity_detail ?? null,
+      department: a.department ?? null,
+      reference_document_url: a.reference_document_url ?? null,
+      reference_document_name: a.reference_document_name ?? null,
+      reference_image_url: a.reference_image_url ?? null,
+      created_by: a.created_by ?? null,
+      inspection_tpi_involved: a.inspection_tpi_involved ?? false,
+      progress_weight: a.progress_weight ?? null,
+    });
+
     try {
       if (payload.commencement_date !== undefined) {
         await api.patch(`/standalone_equipment?id=eq.${equipmentId}`, { commencement_date: payload.commencement_date || null });
       }
-      const currentRes = await api.get(`/standalone_equipment_activities?equipment_id=eq.${equipmentId}&select=id`);
-      const current: any[] = Array.isArray(currentRes.data) ? currentRes.data : [];
       const draftExistingIds = (payload.activities || [])
-        .filter(a => a.id && !String(a.id).startsWith('new-'))
-        .map(a => a.id as string);
-      for (const a of payload.activities || []) {
-        const body = {
-          sr_no: a.sr_no,
-          activity_name: a.activity_name,
-          activity_type: a.activity_type,
-          target_relative: a.target_relative ?? null,
-          target_date: a.target_date ?? null,
-          sort_order: a.sort_order,
-          activity_detail: a.activity_detail ?? null,
-          department: a.department ?? null,
-          reference_document_url: a.reference_document_url ?? null,
-          reference_document_name: a.reference_document_name ?? null,
-          reference_image_url: a.reference_image_url ?? null,
-          created_by: a.created_by ?? null,
-          inspection_tpi_involved: a.inspection_tpi_involved ?? false,
-          progress_weight: a.progress_weight ?? null,
-        };
+        .filter((a) => a.id && !String(a.id).startsWith('new-'))
+        .map((a) => a.id as string);
+
+      let toDelete: string[];
+      if (useClientSnapshot) {
+        const previousIds = prevList!.map((a: any) => a.id).filter(Boolean);
+        toDelete = previousIds.filter((id: string) => !draftExistingIds.includes(id));
+      } else {
+        const currentRes = await api.get(`/standalone_equipment_activities?equipment_id=eq.${equipmentId}&select=id`);
+        const current: any[] = Array.isArray(currentRes.data) ? currentRes.data : [];
+        toDelete = current.filter((c: any) => !draftExistingIds.includes(c.id)).map((c: any) => c.id);
+      }
+
+      const activities = payload.activities || [];
+      const rep = { Prefer: 'return=representation' };
+
+      if (useClientSnapshot) {
+        const mergedRows = await Promise.all(
+          activities.map(async (a) => {
+            const body = buildBody(a);
+            if (a.id && !String(a.id).startsWith('new-')) {
+              const prevRow = prevList!.find((p: any) => p.id === a.id);
+              if (prevRow && mergeRowUnchangedSa(prevRow, body)) {
+                return { ...prevRow, completion: completionById[a.id as string] ?? null };
+              }
+              const res = await api.patch(`/standalone_equipment_activities?id=eq.${a.id}`, body, { headers: rep });
+              const row = Array.isArray(res.data) ? res.data[0] : res.data;
+              return { ...row, completion: completionById[a.id as string] ?? null };
+            }
+            const res = await api.post('/standalone_equipment_activities', { equipment_id: equipmentId, ...body }, { headers: rep });
+            const row = Array.isArray(res.data) ? res.data[0] : res.data;
+            return { ...row, completion: null };
+          })
+        );
+        if (toDelete.length > 0) {
+          await Promise.all(toDelete.map((id) => api.delete(`/standalone_equipment_activities?id=eq.${id}`)));
+        }
+        mergedRows.sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+        return mergedRows;
+      }
+
+      for (const a of activities) {
+        const body = buildBody(a);
         if (a.id && !String(a.id).startsWith('new-')) {
           await api.patch(`/standalone_equipment_activities?id=eq.${a.id}`, body);
         } else {
-          await api.post('/standalone_equipment_activities', { equipment_id: equipmentId, ...body }, { headers: { Prefer: 'return=representation' } });
+          await api.post('/standalone_equipment_activities', { equipment_id: equipmentId, ...body }, { headers: rep });
         }
       }
-      const toDelete = current.filter((c: any) => !draftExistingIds.includes(c.id)).map((c: any) => c.id);
       for (const id of toDelete) {
         await api.delete(`/standalone_equipment_activities?id=eq.${id}`);
       }
@@ -2121,22 +2970,43 @@ export const fastAPI = {
       const created = Array.isArray(response.data) ? response.data[0] : response.data;
       const completionId = created?.id;
       if (completionId && imageCount > 0) {
-        for (let i = 0; i < imageUrls.length; i++) {
-          await api.post('/standalone_equipment_activity_completion_images', {
-            completion_id: completionId,
-            sort_order: i,
-            image_url: imageUrls[i] ?? null
-          });
+        const bulkImages = imageUrls.map((url, i) => ({
+          completion_id: completionId,
+          sort_order: i,
+          image_url: url ?? null
+        }));
+        try {
+          await api.post('/standalone_equipment_activity_completion_images', bulkImages);
+        } catch (bulkImgErr: any) {
+          console.warn('⚠️ Bulk insert standalone completion images failed, falling back:', bulkImgErr?.message || bulkImgErr);
+          for (let i = 0; i < imageUrls.length; i++) {
+            await api.post('/standalone_equipment_activity_completion_images', {
+              completion_id: completionId,
+              sort_order: i,
+              image_url: imageUrls[i] ?? null
+            });
+          }
         }
       }
       if (completionId && reportCount > 0) {
-        for (let i = 0; i < reportUrls.length; i++) {
-          await api.post('/standalone_equipment_activity_completion_inspection_reports', {
-            completion_id: completionId,
-            sort_order: i,
-            report_url: reportUrls[i] ?? null,
-            file_name: reportNames[i] ?? null
-          });
+        const bulkReports = reportUrls.map((url, i) => ({
+          completion_id: completionId,
+          sort_order: i,
+          report_url: url ?? null,
+          file_name: reportNames[i] ?? null
+        }));
+        try {
+          await api.post('/standalone_equipment_activity_completion_inspection_reports', bulkReports);
+        } catch (bulkRepErr: any) {
+          console.warn('⚠️ Bulk insert standalone inspection reports failed, falling back:', bulkRepErr?.message || bulkRepErr);
+          for (let i = 0; i < reportUrls.length; i++) {
+            await api.post('/standalone_equipment_activity_completion_inspection_reports', {
+              completion_id: completionId,
+              sort_order: i,
+              report_url: reportUrls[i] ?? null,
+              file_name: reportNames[i] ?? null
+            });
+          }
         }
       }
       return response.data;
@@ -2150,7 +3020,24 @@ export const fastAPI = {
   async updateEquipment(id: string, equipmentData: any, currentUserId?: string) {
   try {
     // // console.log('🔧 updateEquipment called with:', { id, equipmentData, currentUserId });
-    
+    // QAP "mark complete" only updates progress — skip prefetch GET + audit logging (saves 1 API call per submit).
+    const dataKeys = Object.keys(equipmentData || {});
+    if (
+      dataKeys.length === 1 &&
+      dataKeys[0] === 'progress' &&
+      typeof equipmentData.progress === 'number'
+    ) {
+      const updateData = {
+        progress: equipmentData.progress,
+        updated_at: new Date().toISOString(),
+        ...(currentUserId && { updated_by: currentUserId })
+      };
+      const response = await api.patch(`/equipment?id=eq.${id}`, updateData, {
+        headers: { Prefer: 'return=representation' }
+      });
+      return response.data;
+    }
+
     // Get current equipment data to track changes
     const currentEquipmentResponse = await api.get(`/equipment?id=eq.${id}&select=*`);
     const currentEquipment = currentEquipmentResponse.data?.[0];
@@ -2351,11 +3238,23 @@ export const fastAPI = {
 },
 
   // Delete equipment (with manual cascade for related records)
-  async deleteEquipment(id: string) {
+  async deleteEquipment(
+    id: string,
+    meta?: { projectId?: string | null; type?: string | null; tagNumber?: string | null }
+  ) {
     try {
-      // Get equipment details before deletion for logging
-      const equipmentResponse = await api.get(`/equipment?id=eq.${id}&select=project_id,type,tag_number`);
-      const equipment = Array.isArray(equipmentResponse.data) ? equipmentResponse.data[0] : equipmentResponse.data?.[0];
+      // Prefer caller-provided metadata to avoid an extra fetch during delete.
+      let equipment: any = null;
+      if (meta?.projectId || meta?.type || meta?.tagNumber) {
+        equipment = {
+          project_id: meta?.projectId ?? null,
+          type: meta?.type ?? null,
+          tag_number: meta?.tagNumber ?? null,
+        };
+      } else {
+        const equipmentResponse = await api.get(`/equipment?id=eq.${id}&select=project_id,type,tag_number`);
+        equipment = Array.isArray(equipmentResponse.data) ? equipmentResponse.data[0] : equipmentResponse.data?.[0];
+      }
 
       // Manually delete dependent records to satisfy foreign key constraints
       // 1. Progress entries
@@ -2427,8 +3326,8 @@ export const fastAPI = {
       equipmentData.created_by = userId;
 
       if (firmId) {
-        const firm = await fastAPI.getFirmById(firmId);
-        const limit = firm?.max_equipment_limit;
+        const firmRes = await api.get(`/firms?id=eq.${firmId}&select=max_equipment_limit`);
+        const limit = (firmRes.data as any[])?.[0]?.max_equipment_limit;
         if (limit != null && typeof limit === 'number') {
           const count = await fastAPI.getEquipmentCountByFirm(firmId);
           if (count >= limit) {
@@ -2479,6 +3378,26 @@ export const fastAPI = {
 
   async updateStandaloneEquipment(id: string, equipmentData: any, currentUserId?: string) {
     try {
+      const dataKeys = Object.keys(equipmentData || {});
+      if (
+        dataKeys.length === 1 &&
+        dataKeys[0] === 'progress' &&
+        typeof equipmentData.progress === 'number'
+      ) {
+        const updateData = {
+          progress: equipmentData.progress,
+          updated_at: new Date().toISOString(),
+          ...(currentUserId && { updated_by: currentUserId })
+        };
+        const response = await api.patch(`/standalone_equipment?id=eq.${id}`, updateData, {
+          headers: { Prefer: 'return=representation' }
+        });
+        if (!response.data || !Array.isArray(response.data) || response.data.length === 0) {
+          throw new Error('Update failed: No rows were updated. This may be due to insufficient permissions or the record not existing.');
+        }
+        return response.data;
+      }
+
       // Get current equipment data to track changes
       const currentEquipmentResponse = await api.get(`/standalone_equipment?id=eq.${id}&select=*`);
       const currentEquipment = currentEquipmentResponse.data?.[0];
@@ -2616,11 +3535,81 @@ export const fastAPI = {
     }
   },
 
-  async deleteStandaloneEquipment(id: string) {
+  async getStandaloneEquipmentById(id: string, options?: { progressImagesLatestOnly?: boolean }) {
     try {
-      // Get equipment details before deletion for logging
-      const equipmentResponse = await api.get(`/standalone_equipment?id=eq.${id}&select=type,tag_number`);
-      const equipment = equipmentResponse.data?.[0];
+      const progressImagesLatestOnly = !!options?.progressImagesLatestOnly;
+      const eqRes = await api.get(`/standalone_equipment?id=eq.${id}&select=*`);
+      const equipment = Array.isArray(eqRes.data) ? eqRes.data[0] : eqRes.data;
+      if (!equipment) return null;
+
+      const standaloneProgressImagesSelect = progressImagesLatestOnly
+        ? 'id,equipment_id,image_url,description,uploaded_by,created_at'
+        : '*';
+      const standaloneProgressEntriesSelect = 'id,equipment_id,entry_text,entry_type,created_by,created_at,image_description,audio_duration';
+
+      const [progressImagesResponse, progressEntriesResponse] = await Promise.all([
+        api.get(`/standalone_equipment_progress_images?equipment_id=eq.${id}&select=${standaloneProgressImagesSelect}&order=created_at.desc&limit=250`),
+        api.get(`/standalone_equipment_progress_entries?equipment_id=eq.${id}&select=${standaloneProgressEntriesSelect}&order=created_at.desc&limit=250`),
+      ]);
+
+      const allProgressImages = Array.isArray(progressImagesResponse.data) ? progressImagesResponse.data : [];
+      const allProgressEntries = Array.isArray(progressEntriesResponse.data) ? progressEntriesResponse.data : [];
+
+      const createdByIds = Array.from(
+        new Set(
+          allProgressEntries
+            .map((entry: any) => entry?.created_by)
+            .filter((v: any) => !!v && typeof v === 'string')
+        )
+      );
+
+      let usersMap: Record<string, any> = {};
+      if (createdByIds.length > 0) {
+        try {
+          const userIdsString = createdByIds.join(',');
+          const usersResponse = await api.get(`/users?id=in.(${userIdsString})&select=id,full_name,email`);
+          const users = Array.isArray(usersResponse.data) ? usersResponse.data : [];
+          usersMap = users.reduce((acc: Record<string, any>, u: any) => {
+            acc[u.id] = u;
+            return acc;
+          }, {});
+        } catch (userError) {
+          console.warn('⚠️ Could not fetch user data for standalone progress entries (non-fatal):', (userError as any)?.message || userError);
+        }
+      }
+
+      const entriesWithUsers = allProgressEntries.map((entry: any) => ({
+        ...entry,
+        users: entry.created_by ? usersMap[entry.created_by] || null : null,
+      }));
+
+      return {
+        ...equipment,
+        progress_images: allProgressImages,
+        progress_entries: entriesWithUsers,
+      };
+    } catch (error) {
+      console.error('❌ Error fetching standalone equipment by id:', error);
+      throw error;
+    }
+  },
+
+  async deleteStandaloneEquipment(
+    id: string,
+    meta?: { type?: string | null; tagNumber?: string | null }
+  ) {
+    try {
+      // Prefer caller-provided metadata to avoid an extra fetch during delete.
+      let equipment: any = null;
+      if (meta?.type || meta?.tagNumber) {
+        equipment = {
+          type: meta?.type ?? null,
+          tag_number: meta?.tagNumber ?? null,
+        };
+      } else {
+        const equipmentResponse = await api.get(`/standalone_equipment?id=eq.${id}&select=type,tag_number`);
+        equipment = equipmentResponse.data?.[0];
+      }
 
       // Manually delete dependent records to satisfy foreign key constraints
       const dependentTables = [
@@ -2710,6 +3699,18 @@ export const fastAPI = {
       return response.data;
     } catch (error: any) {
       console.error('❌ Error creating team position:', error);
+      throw error;
+    }
+  },
+
+  // Create project equipment team positions in one bulk request
+  async createTeamPositionsBulk(teamPositionsData: any[]) {
+    if (!Array.isArray(teamPositionsData) || teamPositionsData.length === 0) return [];
+    try {
+      const response = await api.post('/equipment_team_positions', teamPositionsData);
+      return response.data;
+    } catch (error: any) {
+      console.error('❌ Error bulk creating team positions:', error);
       throw error;
     }
   },
@@ -4122,6 +5123,44 @@ export const fastAPI = {
     }
   },
 
+  /**
+   * Documentation tab Excel bulk upload: one RPC replaces N POST /vdcr_records + N syncVDCRToEquipment.
+   * Returns { records: any[], count: number } (same row shape as vdcr_records). Requires migration `bulk_upload_vdcr_documentation`.
+   * Falls back to per-row create in ProjectsVDCR if RPC is not deployed (404).
+   */
+  async bulkUploadVdcrDocumentation(rows: any[]): Promise<{ records: any[]; count: number }> {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return { records: [], count: 0 };
+    }
+    try {
+      const response = await api.post('/rpc/bulk_upload_vdcr_documentation', { p_rows: rows }, { timeout: 120000 });
+      const data = response.data;
+      if (data == null) {
+        return { records: [], count: 0 };
+      }
+      if (typeof data === 'object' && data !== null && 'records' in data) {
+        const rec = (data as any).records;
+        const recordsArr = Array.isArray(rec)
+          ? rec
+          : typeof rec === 'string'
+            ? (() => {
+                try {
+                  return JSON.parse(rec);
+                } catch {
+                  return [];
+                }
+              })()
+            : [];
+        const count = typeof (data as any).count === 'number' ? (data as any).count : recordsArr.length;
+        return { records: recordsArr, count };
+      }
+      return { records: [], count: 0 };
+    } catch (error: any) {
+      console.error('❌ Error bulkUploadVdcrDocumentation:', error);
+      throw error;
+    }
+  },
+
   // Get VDCR records by project
   async getVDCRRecordsByProject(projectId: string) {
     try {
@@ -4148,6 +5187,28 @@ export const fastAPI = {
       return Array.from(set).sort();
     } catch (err) {
       console.warn('⚠️ getProjectDepartments failed:', err);
+      return [];
+    }
+  },
+
+  /** Get unique department names for a firm (from project_members across all firm projects). */
+  async getFirmDepartments(firmId: string): Promise<string[]> {
+    if (!firmId) return [];
+    try {
+      const projectsResponse = await api.get(`/projects?firm_id=eq.${firmId}&select=id`);
+      const projectIds = (Array.isArray(projectsResponse.data) ? projectsResponse.data : []).map((p: any) => p.id).filter(Boolean);
+      if (projectIds.length === 0) return [];
+
+      const membersResponse = await api.get(`/project_members?project_id=in.(${projectIds.join(',')})&select=department`);
+      const members = Array.isArray(membersResponse.data) ? membersResponse.data : [];
+      const set = new Set<string>();
+      for (const m of members) {
+        const d = (m as { department?: string | null }).department;
+        if (d != null && String(d).trim()) set.add(String(d).trim());
+      }
+      return Array.from(set).sort();
+    } catch (err) {
+      console.warn('⚠️ getFirmDepartments failed:', err);
       return [];
     }
   },
@@ -4232,41 +5293,53 @@ export const fastAPI = {
   /** Batch fetch checklist tasks for many equipment IDs. Returns Record<equipmentId, tasksWithCompletion[]>. */
   async getEquipmentProductionChecklistTasksBatch(equipmentIds: string[], isStandalone: boolean): Promise<Record<string, any[]>> {
     if (!equipmentIds?.length) return {};
-    const table = isStandalone ? 'standalone_equipment_production_checklist_tasks' : 'equipment_production_checklist_tasks';
-    const compTable = isStandalone ? 'standalone_equipment_production_checklist_task_completions' : 'equipment_production_checklist_task_completions';
-    try {
-      const all: any[] = [];
-      const BATCH = 40;
-      const taskSelect = '*,created_by_user:created_by(full_name,email)';
-      for (let i = 0; i < equipmentIds.length; i += BATCH) {
-        const chunk = equipmentIds.slice(i, i + BATCH);
-        const res = await api.get(`/${table}?equipment_id=in.(${chunk.join(',')})&select=${taskSelect}&order=sort_order.asc,created_at.asc`);
-        const rows = Array.isArray(res.data) ? res.data : [];
-        all.push(...rows);
-      }
-      if (all.length === 0) {
+    const dedupeKey = `${isStandalone ? 's' : 'p'}:${batchDedupeKey(equipmentIds)}`;
+    const inflight = productionChecklistTasksBatchInFlight.get(dedupeKey);
+    if (inflight) return await inflight;
+
+    const loadPromise = (async (): Promise<Record<string, any[]>> => {
+      const table = isStandalone ? 'standalone_equipment_production_checklist_tasks' : 'equipment_production_checklist_tasks';
+      const compTable = isStandalone ? 'standalone_equipment_production_checklist_task_completions' : 'equipment_production_checklist_task_completions';
+      try {
+        const all: any[] = [];
+        const BATCH = 40;
+        const taskSelect = '*,created_by_user:created_by(full_name,email)';
+        for (let i = 0; i < equipmentIds.length; i += BATCH) {
+          const chunk = equipmentIds.slice(i, i + BATCH);
+          const res = await api.get(`/${table}?equipment_id=in.(${chunk.join(',')})&select=${taskSelect}&order=sort_order.asc,created_at.asc`);
+          const rows = Array.isArray(res.data) ? res.data : [];
+          all.push(...rows);
+        }
+        if (all.length === 0) {
+          return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+        }
+        const taskIds = [...new Set(all.map((t: any) => t.id))];
+        const compSelect = 'id,task_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,image_count,inspection_report_count,department';
+        let completions: any[] = [];
+        for (const idChunk of chunkIdsForInClause(taskIds)) {
+          const compRes = await api.get(`/${compTable}?task_id=in.(${idChunk.join(',')})&select=${compSelect}`);
+          completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
+        }
+        const byTaskId: Record<string, any> = {};
+        completions.forEach((c) => { byTaskId[c.task_id] = c; });
+        const withComp = all.map((t: any) => ({ ...t, completion: byTaskId[t.id] || null }));
+        const result: Record<string, any[]> = {};
+        equipmentIds.forEach((id) => { result[id] = []; });
+        withComp.forEach((t: any) => {
+          if (t.equipment_id) (result[t.equipment_id] = result[t.equipment_id] || []).push(t);
+        });
+        return result;
+      } catch (err) {
+        console.warn('⚠️ getEquipmentProductionChecklistTasksBatch failed:', err);
         return Object.fromEntries(equipmentIds.map((id) => [id, []]));
       }
-      const taskIds = [...new Set(all.map((t: any) => t.id))];
-      const compSelect = 'id,task_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,image_count,inspection_report_count,department';
-      let completions: any[] = [];
-      for (let j = 0; j < taskIds.length; j += 100) {
-        const idChunk = taskIds.slice(j, j + 100);
-        const compRes = await api.get(`/${compTable}?task_id=in.(${idChunk.join(',')})&select=${compSelect}`);
-        completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
-      }
-      const byTaskId: Record<string, any> = {};
-      completions.forEach((c) => { byTaskId[c.task_id] = c; });
-      const withComp = all.map((t: any) => ({ ...t, completion: byTaskId[t.id] || null }));
-      const result: Record<string, any[]> = {};
-      equipmentIds.forEach((id) => { result[id] = []; });
-      withComp.forEach((t: any) => {
-        if (t.equipment_id) (result[t.equipment_id] = result[t.equipment_id] || []).push(t);
-      });
-      return result;
-    } catch (err) {
-      console.warn('⚠️ getEquipmentProductionChecklistTasksBatch failed:', err);
-      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+    })();
+
+    productionChecklistTasksBatchInFlight.set(dedupeKey, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      productionChecklistTasksBatchInFlight.delete(dedupeKey);
     }
   },
 
@@ -4371,8 +5444,13 @@ export const fastAPI = {
     sort_order: number;
     created_by?: string | null;
   }>) {
-    const currentRes = await api.get(`/equipment_production_checklist_tasks?equipment_id=eq.${equipmentId}&select=id`);
+    const selectFields = 'id,task_title,task_detail,department,assigned_to,reference_document_url,reference_document_name,reference_image_url,sort_order,created_by';
+    const currentRes = await api.get(`/equipment_production_checklist_tasks?equipment_id=eq.${equipmentId}&select=${selectFields}`);
     const current: any[] = Array.isArray(currentRes.data) ? currentRes.data : [];
+    const currentById: Record<string, any> = {};
+    current.forEach((c) => {
+      currentById[c.id] = c;
+    });
     const keepIds = (tasks || []).filter((t) => t.id && !String(t.id).startsWith('new-')).map((t) => t.id as string);
     for (const t of tasks || []) {
       const body = {
@@ -4387,6 +5465,10 @@ export const fastAPI = {
         created_by: t.created_by ?? null,
       };
       if (t.id && !String(t.id).startsWith('new-')) {
+        const prev = currentById[t.id];
+        if (prev && productionChecklistMergeTaskUnchanged(prev, body)) {
+          continue;
+        }
         await api.patch(`/equipment_production_checklist_tasks?id=eq.${t.id}`, body);
       } else {
         await api.post('/equipment_production_checklist_tasks', { equipment_id: equipmentId, ...body }, { headers: { Prefer: 'return=representation' } });
@@ -4410,8 +5492,13 @@ export const fastAPI = {
     sort_order: number;
     created_by?: string | null;
   }>) {
-    const currentRes = await api.get(`/standalone_equipment_production_checklist_tasks?equipment_id=eq.${equipmentId}&select=id`);
+    const selectFields = 'id,task_title,task_detail,department,assigned_to,reference_document_url,reference_document_name,reference_image_url,sort_order,created_by';
+    const currentRes = await api.get(`/standalone_equipment_production_checklist_tasks?equipment_id=eq.${equipmentId}&select=${selectFields}`);
     const current: any[] = Array.isArray(currentRes.data) ? currentRes.data : [];
+    const currentById: Record<string, any> = {};
+    current.forEach((c) => {
+      currentById[c.id] = c;
+    });
     const keepIds = (tasks || []).filter((t) => t.id && !String(t.id).startsWith('new-')).map((t) => t.id as string);
     for (const t of tasks || []) {
       const body = {
@@ -4426,6 +5513,10 @@ export const fastAPI = {
         created_by: t.created_by ?? null,
       };
       if (t.id && !String(t.id).startsWith('new-')) {
+        const prev = currentById[t.id];
+        if (prev && productionChecklistMergeTaskUnchanged(prev, body)) {
+          continue;
+        }
         await api.patch(`/standalone_equipment_production_checklist_tasks?id=eq.${t.id}`, body);
       } else {
         await api.post('/standalone_equipment_production_checklist_tasks', { equipment_id: equipmentId, ...body }, { headers: { Prefer: 'return=representation' } });
@@ -4479,6 +5570,25 @@ export const fastAPI = {
       }
     }
     return res.data;
+  },
+
+  /** All completion images in one query (replaces N× getEquipmentProductionChecklistCompletionImageUrl). */
+  async getEquipmentProductionChecklistCompletionImageUrls(completionId: string, isStandalone: boolean): Promise<string[]> {
+    try {
+      const imgTable = isStandalone ? 'standalone_equipment_production_checklist_completion_images' : 'equipment_production_checklist_completion_images';
+      const res = await api.get(`/${imgTable}?completion_id=eq.${completionId}&order=sort_order.asc&select=image_url`);
+      const rows = Array.isArray(res.data) ? res.data : [];
+      const urls = rows.map((r: any) => r.image_url).filter((u: unknown) => u != null && String(u).trim() !== '');
+      if (urls.length > 0) return urls as string[];
+      const compTable = isStandalone ? 'standalone_equipment_production_checklist_task_completions' : 'equipment_production_checklist_task_completions';
+      const compRes = await api.get(`/${compTable}?id=eq.${completionId}&select=image_url`);
+      const comp = Array.isArray(compRes.data) ? compRes.data[0] : compRes.data;
+      if (comp?.image_url) return [comp.image_url];
+      return [];
+    } catch (err) {
+      console.warn('⚠️ getEquipmentProductionChecklistCompletionImageUrls failed:', err);
+      return [];
+    }
   },
 
   async getEquipmentProductionChecklistCompletionImageUrl(completionId: string, index: number, isStandalone: boolean): Promise<string | null> {
@@ -5384,53 +6494,35 @@ export const fastAPI = {
   async getInviteByEmail(email: string) {
     try {
       const normalizedEmail = email.toLowerCase().trim();
-      // console.log('🔍 Checking for pending invite (case-insensitive):', normalizedEmail);
-      
-      // First try exact match with pending status
-      let response = await api.get(`/invites?status=eq.pending&order=created_at.desc&limit=100`);
-      
-      if (response.data && Array.isArray(response.data)) {
-        // Find invite with case-insensitive email match
-        const invite = response.data.find((inv: any) => 
-          inv.email && inv.email.toLowerCase().trim() === normalizedEmail
-        );
-        
-        if (invite) {
-          // Check if invite has expired
-          if (invite.expires_at) {
-            const expiresAt = new Date(invite.expires_at);
-            const now = new Date();
-            
-            if (expiresAt < now) {
-              // console.log('⚠️ Invite found but expired');
-              // Update status to expired
-              await this.updateInviteStatus(invite.id, 'expired');
-              return null;
-            }
+      if (!normalizedEmail) return null;
+
+      // Single targeted query (replaces two limit=100 scans) — fewer login API calls.
+      const enc = encodeURIComponent(normalizedEmail);
+      // One HTTP request: targeted rows only (not limit=100 table scans).
+      const response = await api.get(
+        `/invites?email=ilike.${enc}&status=in.(pending,accepted)&order=created_at.desc&limit=10`
+      );
+
+      const rows: any[] = Array.isArray(response.data) ? response.data : [];
+
+      const sameEmail = (inv: any) =>
+        inv?.email && inv.email.toLowerCase().trim() === normalizedEmail;
+
+      const pending = rows.find((inv: any) => inv.status === 'pending' && sameEmail(inv));
+      if (pending) {
+        if (pending.expires_at) {
+          const expiresAt = new Date(pending.expires_at);
+          if (expiresAt < new Date()) {
+            await this.updateInviteStatus(pending.id, 'expired');
+            const accepted = rows.find((inv: any) => inv.status === 'accepted' && sameEmail(inv));
+            return accepted || null;
           }
-          
-          // console.log('✅ Valid pending invite found:', invite);
-          return invite;
         }
+        return pending;
       }
-      
-      // If no pending invite found, check for accepted invites (in case signup failed but invite was marked accepted)
-      // console.log('🔍 No pending invite found, checking accepted invites...');
-      response = await api.get(`/invites?status=eq.accepted&order=created_at.desc&limit=100`);
-      
-      if (response.data && Array.isArray(response.data)) {
-        const invite = response.data.find((inv: any) => 
-          inv.email && inv.email.toLowerCase().trim() === normalizedEmail
-        );
-        
-        if (invite) {
-          // console.log('✅ Found accepted invite (user might not have been created):', invite);
-          return invite; // Return it so role can be used
-        }
-      }
-      
-      // console.log('ℹ️ No invite found for:', normalizedEmail);
-      return null;
+
+      const accepted = rows.find((inv: any) => inv.status === 'accepted' && sameEmail(inv));
+      return accepted || null;
     } catch (error: any) {
       console.error('❌ Error fetching invite:', error);
       console.error('❌ Error details:', error.response?.data || error.message);
@@ -5906,6 +6998,294 @@ export const uploadEquipmentDocument = async (equipmentId: string, documentData:
   }
 };
 
+type ProjectDocBatchItem = {
+  name: string;
+  url: string;
+  uploadedBy: string;
+  size: number;
+  mimeType: string;
+};
+
+/** Bulk insert into unpriced_po_documents (one HTTP request). Falls back to per-row upload on failure. */
+export const batchInsertUnpricedPODocuments = async (projectId: string, items: ProjectDocBatchItem[]) => {
+  if (items.length === 0) return [];
+  const body = items.map((d) => ({
+    project_id: projectId,
+    document_name: d.name,
+    file_url: d.url,
+    uploaded_by: d.uploadedBy,
+    file_size: d.size,
+    mime_type: d.mimeType,
+  }));
+  try {
+    const response = await api.post('/unpriced_po_documents', body, {
+      headers: { Prefer: 'return=representation' },
+    });
+    return Array.isArray(response.data) ? response.data : [response.data];
+  } catch {
+    const out: any[] = [];
+    for (const d of items) {
+      const r = await uploadUnpricedPODocument(projectId, {
+        name: d.name,
+        url: d.url,
+        uploadedBy: d.uploadedBy,
+        size: d.size,
+        mimeType: d.mimeType,
+      });
+      out.push(Array.isArray(r) ? r[0] : r);
+    }
+    return out;
+  }
+};
+
+/** Bulk insert into design_inputs_documents (one HTTP request). Falls back to per-row upload on failure. */
+export const batchInsertDesignInputsDocuments = async (projectId: string, items: ProjectDocBatchItem[]) => {
+  if (items.length === 0) return [];
+  const body = items.map((d) => ({
+    project_id: projectId,
+    document_name: d.name,
+    file_url: d.url,
+    uploaded_by: d.uploadedBy,
+    file_size: d.size,
+    mime_type: d.mimeType,
+  }));
+  try {
+    const response = await api.post('/design_inputs_documents', body, {
+      headers: { Prefer: 'return=representation' },
+    });
+    return Array.isArray(response.data) ? response.data : [response.data];
+  } catch {
+    const out: any[] = [];
+    for (const d of items) {
+      const r = await uploadDesignInputsDocument(projectId, {
+        name: d.name,
+        url: d.url,
+        uploadedBy: d.uploadedBy,
+        size: d.size,
+        mimeType: d.mimeType,
+      });
+      out.push(Array.isArray(r) ? r[0] : r);
+    }
+    return out;
+  }
+};
+
+/** Bulk insert into client_reference_documents (one HTTP request). Falls back to per-row upload on failure. */
+export const batchInsertClientReferenceDocuments = async (projectId: string, items: ProjectDocBatchItem[]) => {
+  if (items.length === 0) return [];
+  const body = items.map((d) => ({
+    project_id: projectId,
+    document_name: d.name,
+    file_url: d.url,
+    uploaded_by: d.uploadedBy,
+    file_size: d.size,
+    mime_type: d.mimeType,
+  }));
+  try {
+    const response = await api.post('/client_reference_documents', body, {
+      headers: { Prefer: 'return=representation' },
+    });
+    return Array.isArray(response.data) ? response.data : [response.data];
+  } catch {
+    const out: any[] = [];
+    for (const d of items) {
+      const r = await uploadClientReferenceDocument(projectId, {
+        name: d.name,
+        url: d.url,
+        uploadedBy: d.uploadedBy,
+        size: d.size,
+        mimeType: d.mimeType,
+      });
+      out.push(Array.isArray(r) ? r[0] : r);
+    }
+    return out;
+  }
+};
+
+/** Bulk insert into other_documents (one HTTP request). Falls back to per-row upload on failure. */
+export const batchInsertOtherDocuments = async (projectId: string, items: ProjectDocBatchItem[]) => {
+  if (items.length === 0) return [];
+  const body = items.map((d) => ({
+    project_id: projectId,
+    document_name: d.name,
+    file_url: d.url,
+    uploaded_by: d.uploadedBy,
+    file_size: d.size,
+    mime_type: d.mimeType,
+  }));
+  try {
+    const response = await api.post('/other_documents', body, {
+      headers: { Prefer: 'return=representation' },
+    });
+    return Array.isArray(response.data) ? response.data : [response.data];
+  } catch {
+    const out: any[] = [];
+    for (const d of items) {
+      const r = await uploadOtherDocument(projectId, {
+        name: d.name,
+        url: d.url,
+        uploadedBy: d.uploadedBy,
+        size: d.size,
+        mimeType: d.mimeType,
+      });
+      out.push(Array.isArray(r) ? r[0] : r);
+    }
+    return out;
+  }
+};
+
+export type EquipmentDocBatchRow = {
+  equipmentId: string;
+  name: string;
+  url: string;
+  uploadedBy: string;
+  size: number;
+  mimeType: string;
+  equipmentType: string;
+  equipmentTagNumber: string;
+};
+
+/** Bulk insert into equipment_documents (one HTTP request). Falls back to per-row upload on failure. */
+export const batchInsertEquipmentDocuments = async (rows: EquipmentDocBatchRow[]) => {
+  if (rows.length === 0) return [];
+  const body = rows.map((r) => ({
+    equipment_id: r.equipmentId,
+    document_name: r.name,
+    document_url: r.url,
+    document_type: r.equipmentType,
+    file_size: r.size,
+    uploaded_by: r.uploadedBy || null,
+  }));
+  try {
+    const response = await api.post('/equipment_documents', body, {
+      headers: { Prefer: 'return=representation' },
+    });
+    return Array.isArray(response.data) ? response.data : [response.data];
+  } catch {
+    const out: any[] = [];
+    for (const r of rows) {
+      const uploaded = await uploadEquipmentDocument(r.equipmentId, {
+        name: r.name,
+        url: r.url,
+        uploadedBy: r.uploadedBy,
+        size: r.size,
+        mimeType: r.mimeType,
+        equipmentType: r.equipmentType,
+        equipmentTagNumber: r.equipmentTagNumber,
+      });
+      out.push(Array.isArray(uploaded) ? uploaded[0] : uploaded);
+    }
+    return out;
+  }
+};
+
+type NewProjectEquipmentRow = {
+  type: string;
+  tag_number: string;
+  job_number: string;
+  manufacturing_serial: string;
+  size?: string;
+  material?: string;
+  design_code?: string;
+  status?: string;
+  progress?: number;
+  progress_phase?: string;
+};
+
+/**
+ * Create project equipment in bulk with one-time limit + uniqueness checks.
+ * This avoids N calls to createEquipment() for new project creation.
+ */
+export const createProjectEquipmentBatch = async (
+  projectId: string,
+  rows: NewProjectEquipmentRow[]
+): Promise<{ created: any[]; failures: Array<{ tag: string; message: string }> }> => {
+  if (!projectId || rows.length === 0) return { created: [], failures: [] };
+
+  const failures: Array<{ tag: string; message: string }> = [];
+  try {
+    // One-time firm and limit checks (instead of per-equipment checks)
+    const projectRes = await api.get(`/projects?id=eq.${projectId}&select=firm_id`);
+    const firmId = (projectRes.data as any[])?.[0]?.firm_id;
+    if (firmId) {
+      const firm = await fastAPI.getFirmById(firmId);
+      const limit = firm?.max_equipment_limit;
+      if (limit != null && typeof limit === 'number') {
+        const count = await fastAPI.getEquipmentCountByFirm(firmId);
+        if (count + rows.length > limit) {
+          return {
+            created: [],
+            failures: rows.map((r) => ({
+              tag: r.tag_number || r.type || '—',
+              message: `Equipment limit reached (${count}/${limit}).`,
+            })),
+          };
+        }
+      }
+    }
+
+    // One-time global uniqueness check for job numbers across both tables
+    const jobNumbers = [...new Set(rows.map((r) => (r.job_number || '').trim()).filter((j) => !!j && j !== 'TBD'))];
+    const conflictingJobs = new Set<string>();
+    if (jobNumbers.length > 0) {
+      const encoded = jobNumbers.map((j) => encodeURIComponent(j)).join(',');
+      const [projEq, standaloneEq] = await Promise.all([
+        api.get(`/equipment?job_number=in.(${encoded})&select=job_number`).catch(() => ({ data: [] })),
+        api.get(`/standalone_equipment?job_number=in.(${encoded})&select=job_number`).catch(() => ({ data: [] })),
+      ]);
+      (Array.isArray(projEq.data) ? projEq.data : []).forEach((r: any) => {
+        if (r?.job_number) conflictingJobs.add(String(r.job_number).trim());
+      });
+      (Array.isArray(standaloneEq.data) ? standaloneEq.data : []).forEach((r: any) => {
+        if (r?.job_number) conflictingJobs.add(String(r.job_number).trim());
+      });
+    }
+
+    const creatable = rows
+      .map((r) => ({ ...r, _job: (r.job_number || '').trim() }))
+      .filter((r) => {
+        if (r._job && r._job !== 'TBD' && conflictingJobs.has(r._job)) {
+          failures.push({
+            tag: r.tag_number || r.type || '—',
+            message: `Job Number "${r.job_number}" already exists`,
+          });
+          return false;
+        }
+        return true;
+      })
+      .map((r) => ({
+        project_id: projectId,
+        type: r.type,
+        tag_number: r.tag_number || 'TBD',
+        job_number: r.job_number || 'TBD',
+        manufacturing_serial: r.manufacturing_serial || 'TBD',
+        size: r.size || '',
+        material: r.material || '',
+        design_code: r.design_code || '',
+        status: r.status || 'pending',
+        progress: typeof r.progress === 'number' ? r.progress : 0,
+        progress_phase: r.progress_phase || 'documentation',
+      }));
+
+    if (creatable.length === 0) return { created: [], failures };
+
+    const response = await api.post('/equipment', creatable, {
+      headers: { Prefer: 'return=representation' },
+    });
+    const created = Array.isArray(response.data) ? response.data : [response.data];
+    return { created, failures };
+  } catch (error: any) {
+    console.error('❌ Error in createProjectEquipmentBatch:', error);
+    return {
+      created: [],
+      failures: rows.map((r) => ({
+        tag: r.tag_number || r.type || '—',
+        message: error?.response?.data?.message || error?.message || 'Failed to create equipment',
+      })),
+    };
+  }
+};
+
 /** Get VDCR record IDs linked to this equipment (via equipment_documents.vdcr_record_id). Used to fetch VDCR activity for recent activity. */
 export const getEquipmentVdcrRecordIds = async (equipmentId: string): Promise<string[]> => {
   try {
@@ -6028,6 +7408,107 @@ export const getDocumentUrlById = async (documentId: string, isStandalone: boole
   }
 };
 
+const DOCUMENT_URL_BATCH_CHUNK = 80;
+
+/** Batch-fetch document_url rows by id (one or few HTTP calls vs N × getDocumentUrlById). Used by dossier export/preload. */
+export const getDocumentUrlsByIds = async (
+  documentIds: string[],
+  isStandalone: boolean
+): Promise<Record<string, { id: string; document_url: string; document_name?: string; upload_date?: string; uploaded_by?: string }>> => {
+  const ids = [...new Set(documentIds.map((id) => String(id).trim()).filter(Boolean))];
+  if (!ids.length) return {};
+  const table = isStandalone ? 'standalone_equipment_documents' : 'equipment_documents';
+  const out: Record<string, { id: string; document_url: string; document_name?: string; upload_date?: string; uploaded_by?: string }> = {};
+  try {
+    for (let i = 0; i < ids.length; i += DOCUMENT_URL_BATCH_CHUNK) {
+      const chunk = ids.slice(i, i + DOCUMENT_URL_BATCH_CHUNK);
+      const response = await api.get(`/${table}`, {
+        params: {
+          id: `in.(${chunk.join(',')})`,
+          select: 'id,document_url,document_name,upload_date,uploaded_by',
+        },
+      });
+      const rows = Array.isArray(response.data) ? response.data : [];
+      for (const row of rows) {
+        if (row?.id && row?.document_url) {
+          out[String(row.id)] = {
+            id: String(row.id),
+            document_url: row.document_url,
+            document_name: row.document_name,
+            upload_date: row.upload_date,
+            uploaded_by: row.uploaded_by,
+          };
+        }
+      }
+    }
+  } catch (error: any) {
+    console.warn('⚠️ getDocumentUrlsByIds failed (non-fatal):', error);
+  }
+  return out;
+};
+
+const EQUIPMENT_DOCS_BY_IDS_CHUNK = 50;
+
+/**
+ * Load equipment_documents for many equipment IDs in one (or few) requests, with the same user merge as getDocumentsByEquipment.
+ * Replaces N per-equipment calls when opening project edit form.
+ */
+export const getEquipmentDocumentsForEquipmentIds = async (equipmentIds: string[]): Promise<Record<string, any[]>> => {
+  const ids = [...new Set((equipmentIds || []).map((id) => String(id).trim()).filter(Boolean))];
+  if (!ids.length) return {};
+  const allDocs: any[] = [];
+  try {
+    for (let i = 0; i < ids.length; i += EQUIPMENT_DOCS_BY_IDS_CHUNK) {
+      const chunk = ids.slice(i, i + EQUIPMENT_DOCS_BY_IDS_CHUNK);
+      const response = await api.get('/equipment_documents', {
+        params: {
+          equipment_id: `in.(${chunk.join(',')})`,
+          select: '*',
+          order: 'upload_date.desc',
+        },
+      });
+      allDocs.push(...(Array.isArray(response.data) ? response.data : []));
+    }
+  } catch (error: any) {
+    console.error('❌ getEquipmentDocumentsForEquipmentIds:', error);
+    return Object.fromEntries(ids.map((id) => [id, []]));
+  }
+
+  const userIds = [
+    ...new Set(
+      allDocs.map((doc: any) => doc.uploaded_by).filter((id: any) => id && typeof id === 'string' && id.length === 36)
+    ),
+  ];
+  let usersMap: Record<string, any> = {};
+  if (userIds.length > 0) {
+    try {
+      const usersResponse = await api.get(`/users?id=in.(${userIds.join(',')})&select=id,full_name,email`);
+      const users = Array.isArray(usersResponse.data) ? usersResponse.data : [];
+      usersMap = users.reduce((acc: any, user: any) => {
+        acc[user.id] = { full_name: user.full_name, email: user.email };
+        return acc;
+      }, {});
+    } catch (userError) {
+      console.warn('⚠️ Could not fetch user data for getEquipmentDocumentsForEquipmentIds:', userError);
+    }
+  }
+
+  const merged = allDocs.map((doc: any) => ({
+    ...doc,
+    uploaded_by_user: doc.uploaded_by ? usersMap[doc.uploaded_by] : null,
+  }));
+
+  const result: Record<string, any[]> = {};
+  for (const id of ids) result[id] = [];
+  for (const doc of merged) {
+    const eqId = doc.equipment_id;
+    if (eqId && result[eqId]) {
+      result[eqId].push(doc);
+    }
+  }
+  return result;
+};
+
 // Get equipment documents for an equipment
 export const getEquipmentDocuments = async (equipmentId: string) => {
   try {
@@ -6134,6 +7615,30 @@ export const uploadStandaloneEquipmentDocument = async (equipmentId: string, doc
     console.error('❌ Error response:', error.response?.data);
     console.error('❌ Error status:', error.response?.status);
     throw new Error(error.response?.data?.message || 'Failed to upload standalone equipment document');
+  }
+};
+
+// Bulk insert standalone equipment documents to reduce per-file POST calls.
+export const uploadStandaloneEquipmentDocumentsBulk = async (equipmentId: string, documents: any[]) => {
+  try {
+    if (!equipmentId || !Array.isArray(documents) || documents.length === 0) {
+      return [];
+    }
+
+    const rows = documents.map((documentData: any) => ({
+      equipment_id: equipmentId,
+      document_name: documentData.name,
+      document_url: documentData.url,
+      document_type: documentData.equipmentType,
+      file_size: documentData.size,
+      uploaded_by: documentData.uploadedBy || null
+    }));
+
+    const response = await api.post('/standalone_equipment_documents', rows);
+    return response.data;
+  } catch (error: any) {
+    console.error('❌ Error bulk uploading standalone equipment documents:', error);
+    throw new Error(error.response?.data?.message || 'Failed to upload standalone equipment documents');
   }
 };
 

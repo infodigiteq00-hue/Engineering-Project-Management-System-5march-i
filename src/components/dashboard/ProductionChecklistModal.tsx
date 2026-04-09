@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,7 +20,8 @@ export interface ProductionChecklistModalProps {
   currentUserId: string | null;
   currentUserDisplayName: string | null;
   onClose: () => void;
-  onRefresh: () => Promise<void>;
+  /** Pass `prefetchedTasks` after create/update/merge/delete to avoid an extra checklist GET. */
+  onRefresh: (prefetchedTasks?: any[]) => Promise<void>;
 }
 
 function formatDateOnly(iso: string | null | undefined): string {
@@ -102,6 +103,7 @@ export function ProductionChecklistModal({
   const [expandedOpenId, setExpandedOpenId] = useState<string | null>(null);
   const [expandedClosedId, setExpandedClosedId] = useState<string | null>(null);
   const [completionDetails, setCompletionDetails] = useState<Record<string, { imageUrls: string[]; reportRows: { report_url: string; file_name: string | null }[] }>>({});
+  const completionLoadInFlight = useRef<Set<string>>(new Set());
 
   // Mark-complete (checklist only; not QAP)
   const [markCompleteTask, setMarkCompleteTask] = useState<any | null>(null);
@@ -280,7 +282,10 @@ export function ProductionChecklistModal({
         } else {
           await fastAPI.updateEquipmentProductionChecklistTask(editingTask.id, payload);
         }
-        await onRefresh();
+        const listAfterEdit = isStandalone
+          ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(equipmentId)
+          : await fastAPI.getEquipmentProductionChecklistTasks(equipmentId);
+        await onRefresh(listAfterEdit);
         closeAddTaskForm();
         toast({ title: "Success", description: "Task updated." });
       } else {
@@ -310,7 +315,10 @@ export function ProductionChecklistModal({
             created_by: currentUserId || null,
           });
         }
-        await onRefresh();
+        const listAfterCreate = isStandalone
+          ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(equipmentId)
+          : await fastAPI.getEquipmentProductionChecklistTasks(equipmentId);
+        await onRefresh(listAfterCreate);
         closeAddTaskForm();
         toast({ title: "Success", description: "Task added." });
       }
@@ -366,12 +374,10 @@ export function ProductionChecklistModal({
           created_by: currentUserId || null,
         }));
         const payload = [...existing, ...newTasks];
-        if (isStandalone) {
-          await fastAPI.updateStandaloneEquipmentProductionChecklistTasksMerge(equipmentId, payload);
-        } else {
-          await fastAPI.updateEquipmentProductionChecklistTasksMerge(equipmentId, payload);
-        }
-        await onRefresh();
+        const listAfterBulk = isStandalone
+          ? await fastAPI.updateStandaloneEquipmentProductionChecklistTasksMerge(equipmentId, payload)
+          : await fastAPI.updateEquipmentProductionChecklistTasksMerge(equipmentId, payload);
+        await onRefresh(listAfterBulk);
         toast({ title: "Success", description: `${newTasks.length} task(s) added.` });
       } catch (err: any) {
         toast({ title: "Error", description: err?.message || "Failed to upload.", variant: "destructive" });
@@ -403,17 +409,11 @@ export function ProductionChecklistModal({
   const loadCompletionDetails = useCallback(
     async (completionId: string) => {
       if (completionDetails[completionId]) return;
+      if (completionLoadInFlight.current.has(completionId)) return;
+      completionLoadInFlight.current.add(completionId);
       try {
         const [imageUrls, reportRows] = await Promise.all([
-          (async () => {
-            const urls: string[] = [];
-            for (let i = 0; i < 20; i++) {
-              const url = await fastAPI.getEquipmentProductionChecklistCompletionImageUrl(completionId, i, isStandalone);
-              if (!url) break;
-              urls.push(url);
-            }
-            return urls;
-          })(),
+          fastAPI.getEquipmentProductionChecklistCompletionImageUrls(completionId, isStandalone),
           fastAPI.getEquipmentProductionChecklistCompletionReports(completionId, isStandalone).then((rows) =>
             rows.map((r: any) => ({ report_url: r.report_url || "", file_name: r.file_name ?? null }))
           ),
@@ -421,6 +421,8 @@ export function ProductionChecklistModal({
         setCompletionDetails((prev) => ({ ...prev, [completionId]: { imageUrls, reportRows } }));
       } catch {
         setCompletionDetails((prev) => ({ ...prev, [completionId]: { imageUrls: [], reportRows: [] } }));
+      } finally {
+        completionLoadInFlight.current.delete(completionId);
       }
     },
     [isStandalone, completionDetails]
@@ -459,13 +461,16 @@ export function ProductionChecklistModal({
         } else {
           await fastAPI.deleteEquipmentProductionChecklistTask(task.id);
         }
-        await onRefresh();
+        const listAfterDelete = isStandalone
+          ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(equipmentId)
+          : await fastAPI.getEquipmentProductionChecklistTasks(equipmentId);
+        await onRefresh(listAfterDelete);
         toast({ title: "Deleted", description: "Task deleted." });
       } catch (err: any) {
         toast({ title: "Error", description: err?.message || "Failed to delete task.", variant: "destructive" });
       }
     },
-    [isStandalone, onRefresh, toast]
+    [isStandalone, equipmentId, onRefresh, toast]
   );
 
   const submitMarkComplete = useCallback(async () => {
@@ -517,7 +522,10 @@ export function ProductionChecklistModal({
         },
         isStandalone
       );
-      await onRefresh();
+      const listAfterComplete = isStandalone
+        ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(equipmentId)
+        : await fastAPI.getEquipmentProductionChecklistTasks(equipmentId);
+      await onRefresh(listAfterComplete);
       setMarkCompleteTask(null);
       toast({ title: "Success", description: "Task marked complete." });
     } catch (err: any) {
@@ -525,7 +533,7 @@ export function ProductionChecklistModal({
     } finally {
       setMarkCompleteSubmitting(false);
     }
-  }, [markCompleteTask, markCompleteCompletedOn, markCompleteCompletedBySelectValue, markCompleteNotes, markCompleteDepartment, markCompleteImageFiles, markCompleteReportFiles, firmMembers, currentUserId, currentUserDisplayName, isStandalone, onRefresh, toast]);
+  }, [markCompleteTask, markCompleteCompletedOn, markCompleteCompletedBySelectValue, markCompleteNotes, markCompleteDepartment, markCompleteImageFiles, markCompleteReportFiles, firmMembers, currentUserId, currentUserDisplayName, isStandalone, equipmentId, onRefresh, toast]);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-2 sm:p-4" onClick={onClose}>
@@ -782,9 +790,13 @@ export function ProductionChecklistModal({
                             {t.reference_image_url && (
                               <div>
                                 <p className="text-xs font-medium text-gray-600 mb-1">Reference image</p>
-                                <a href={t.reference_image_url} target="_blank" rel="noopener noreferrer" className="block">
+                                <button
+                                  type="button"
+                                  onClick={() => openDocumentUrl(t.reference_image_url)}
+                                  className="block text-left"
+                                >
                                   <img src={t.reference_image_url} alt="" className="max-h-48 w-auto rounded border object-contain" />
-                                </a>
+                                </button>
                               </div>
                             )}
                             {t.reference_document_url && (
@@ -844,47 +856,91 @@ export function ProductionChecklistModal({
                             {comp.notes && (
                               <p className="text-sm text-gray-700"><span className="font-medium">Remarks:</span> {comp.notes}</p>
                             )}
-                            {(() => {
-                              const details = completionDetails[compId];
-                              if (!details) {
-                                loadCompletionDetails(compId);
-                                return <p className="text-xs text-gray-500">Loading…</p>;
-                              }
-                              return (
-                                <>
-                                  {details.imageUrls.length > 0 && (
-                                    <div>
-                                      <p className="text-xs font-medium text-gray-600 mb-1">Images</p>
-                                      <div className="flex flex-wrap gap-2">
-                                        {details.imageUrls.map((url, i) => (
-                                          <a key={i} href={url} target="_blank" rel="noopener noreferrer" className="block">
-                                            <img src={url} alt="" className="h-20 w-auto rounded border object-cover" />
-                                          </a>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  )}
-                                  {details.reportRows.length > 0 && (
-                                    <div>
-                                      <p className="text-xs font-medium text-gray-600 mb-1">Documents</p>
-                                      <ul className="text-sm space-y-1">
-                                        {details.reportRows.map((r, i) => (
-                                          <li key={i}>
-                                            <button
-                                              type="button"
-                                              onClick={() => openDocumentUrl(r.report_url || "")}
-                                              className="text-blue-600 hover:underline text-left"
-                                            >
-                                              {r.file_name || `Document ${i + 1}`}
-                                            </button>
-                                          </li>
-                                        ))}
-                                      </ul>
-                                    </div>
-                                  )}
-                                </>
-                              );
-                            })()}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <div className="space-y-3">
+                                <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Reference</p>
+                                {t.reference_image_url && (
+                                  <div>
+                                    <p className="text-xs font-medium text-gray-600 mb-1">Image</p>
+                                    <button
+                                      type="button"
+                                      onClick={() => openDocumentUrl(t.reference_image_url)}
+                                      className="block text-left"
+                                    >
+                                      <img src={t.reference_image_url} alt="" className="h-20 w-auto rounded border object-cover" />
+                                    </button>
+                                  </div>
+                                )}
+                                {t.reference_document_url && (
+                                  <div>
+                                    <p className="text-xs font-medium text-gray-600 mb-1">Document</p>
+                                    <button
+                                      type="button"
+                                      onClick={() => openDocumentUrl(t.reference_document_url)}
+                                      className="text-sm text-blue-600 hover:underline text-left"
+                                    >
+                                      {t.reference_document_name || "View document"}
+                                    </button>
+                                  </div>
+                                )}
+                                {!t.reference_image_url && !t.reference_document_url && (
+                                  <p className="text-xs text-gray-500">No reference attachments.</p>
+                                )}
+                              </div>
+
+                              <div className="space-y-3">
+                                <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Completion</p>
+                                {(() => {
+                                  const details = completionDetails[compId];
+                                  if (!details) {
+                                    loadCompletionDetails(compId);
+                                    return <p className="text-xs text-gray-500">Loading…</p>;
+                                  }
+                                  return (
+                                    <>
+                                      {details.imageUrls.length > 0 && (
+                                        <div>
+                                          <p className="text-xs font-medium text-gray-600 mb-1">Images</p>
+                                          <div className="flex flex-wrap gap-2">
+                                            {details.imageUrls.map((url, i) => (
+                                              <button
+                                                key={i}
+                                                type="button"
+                                                onClick={() => openDocumentUrl(url)}
+                                                className="block text-left"
+                                              >
+                                                <img src={url} alt="" className="h-20 w-auto rounded border object-cover" />
+                                              </button>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )}
+                                      {details.reportRows.length > 0 && (
+                                        <div>
+                                          <p className="text-xs font-medium text-gray-600 mb-1">Documents</p>
+                                          <ul className="text-sm space-y-1">
+                                            {details.reportRows.map((r, i) => (
+                                              <li key={i}>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => openDocumentUrl(r.report_url || "")}
+                                                  className="text-blue-600 hover:underline text-left"
+                                                >
+                                                  {r.file_name || `Document ${i + 1}`}
+                                                </button>
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+                                      {details.imageUrls.length === 0 && details.reportRows.length === 0 && (
+                                        <p className="text-xs text-gray-500">No completion attachments.</p>
+                                      )}
+                                    </>
+                                  );
+                                })()}
+                              </div>
+                            </div>
                           </div>
                         )}
                       </li>

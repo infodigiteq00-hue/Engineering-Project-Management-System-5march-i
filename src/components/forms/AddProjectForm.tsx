@@ -8,7 +8,18 @@ import { Card } from "@/components/ui/card";
 import { X, Save, Upload, Users, FileText, Settings, Building2, Plus, CheckCircle, ChevronRight, ChevronLeft, ChevronDown, ChevronUp, Pencil, UserPlus, Loader2, FileSpreadsheet, Download } from "lucide-react";
 import * as XLSX from "xlsx-js-style";
 import { designSystem } from "@/lib/design-system";
-import { fastAPI, uploadUnpricedPODocument, uploadDesignInputsDocument, uploadClientReferenceDocument, uploadOtherDocument, uploadEquipmentDocument, updateProjectDocumentLinks, deleteProjectDocument } from "@/lib/api";
+import {
+  fastAPI,
+  updateProjectDocumentLinks,
+  deleteProjectDocument,
+  batchInsertUnpricedPODocuments,
+  batchInsertDesignInputsDocuments,
+  batchInsertClientReferenceDocuments,
+  batchInsertOtherDocuments,
+  batchInsertEquipmentDocuments,
+  createProjectEquipmentBatch,
+  getEquipmentDocumentsForEquipmentIds,
+} from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import AssignRoleForm from "./AssignRoleForm";
 import { sendProjectTeamNotifications, getDashboardUrl } from "@/lib/notifications";
@@ -333,25 +344,32 @@ const AddProjectForm = ({ onClose, onSubmit, editData, isEditMode }: AddProjectF
             setCustomEquipmentType(customTypes);
           }
           
-          // Load documents for each equipment
+          // Load documents for all equipment in one batched API (same data as N × getDocumentsByEquipment)
+          const allEquipmentIds: string[] = [];
           for (const equipmentType in equipmentData) {
             const equipmentList = equipmentData[equipmentType];
             for (const equipment of equipmentList) {
-              if (equipment.id) {
-                try {
-                  // Fetch existing documents for this equipment
-                  const documents = await fastAPI.getDocumentsByEquipment(equipment.id);
-                  const documentsArray = Array.isArray(documents) ? documents : [];
-                  documentsMap[equipment.id] = documentsArray;
-                  // console.log(`✅ Loaded ${documentsArray.length} documents for equipment ${equipment.id}`);
-                } catch (error) {
-                  // console.error(`❌ Error loading documents for equipment ${equipment.id}:`, error);
-                  documentsMap[equipment.id] = [];
+              if (equipment?.id) allEquipmentIds.push(equipment.id);
+            }
+          }
+          try {
+            const batchMap = await getEquipmentDocumentsForEquipmentIds(allEquipmentIds);
+            for (const equipmentType in equipmentData) {
+              const equipmentList = equipmentData[equipmentType];
+              for (const equipment of equipmentList) {
+                if (equipment?.id) {
+                  const arr = batchMap[equipment.id];
+                  documentsMap[equipment.id] = Array.isArray(arr) ? arr : [];
                 }
               }
             }
+          } catch (error) {
+            console.error('❌ Batched equipment documents load failed:', error);
+            for (const id of allEquipmentIds) {
+              documentsMap[id] = [];
+            }
           }
-          
+
           setExistingEquipmentDocuments(documentsMap);
         } catch (error) {
           console.error('❌ Error loading existing equipment documents:', error);
@@ -1612,10 +1630,9 @@ Industry: Petrochemical`;
         };
       });
       
-      // Save to database - update all projects that have this old value
-        // console.log('💾 Saving to database - updating projects with old value:', oldValue, 'to new value:', newValue);
-        
-        // Map field names to database column names
+      // Persist edited suggestion values only in edit mode.
+      // In create mode, avoid background API traffic while user fills the form.
+      if (isEditMode && editData && (editData as any).id) {
         const fieldMapping: Record<string, string> = {
           clientName: 'client',
           plantLocation: 'location',
@@ -1629,61 +1646,20 @@ Industry: Petrochemical`;
         
         const dbField = fieldMapping[field];
         if (dbField) {
-        // console.log('💾 🎯 Database field mapping:', field, '->', dbField);
-        // console.log('💾 🎯 Updating projects where', dbField, '=', oldValue, 'to', newValue);
-        
-        // Direct database update without connection test
-        // console.log('💾 🎯 About to start database update...');
-        // console.log('💾 🎯 Supabase client:', supabase);
-        // console.log('💾 🎯 Update query:', {
-        //   table: 'projects',
-        //   update: { [dbField]: newValue },
-        //   where: { [dbField]: oldValue }
-        // });
-        
-        // Direct database update without timeout
-        // console.log('💾 🎯 Starting direct database update...');
-        
-        // Use async/await for better error handling
-        (async () => {
-          try {
-            // console.log('💾 🎯 Executing database update...');
-            const updateData: Record<string, string> = { [dbField]: newValue };
-            // @ts-ignore - Supabase type inference issue with dynamic field names
-            const { data, error } = await supabase
-              .from('projects')
-              .update(updateData)
-              .eq(dbField, oldValue)
-              .select();
-            
-            // console.log('💾 🎯 Database update promise resolved');
-            if (error) {
-              // console.error('❌ 🎯 Database update failed:', error);
-              console.error('❌ 🎯 Error details:', error.message, error.details, error.hint);
-              // console.error('❌ 🎯 Error code:', error.code);
-            } else {
-              console.log('✅ 🎯 Database update successful:', data);
-              // console.log('✅ 🎯 Updated', data?.length || 0, 'projects');
-              // console.log('✅ 🎯 Updated projects:', data);
+          (async () => {
+            try {
+              const updateData: Record<string, string> = { [dbField]: newValue };
+              // @ts-ignore - Supabase type inference issue with dynamic field names
+              await supabase
+                .from('projects')
+                .update(updateData)
+                .eq(dbField, oldValue)
+                .select();
+            } catch (dbError: any) {
+              console.error('❌ Error persisting edited suggestion:', dbError?.message || dbError);
             }
-          } catch (dbError) {
-            console.error('❌ 🎯 Database query error:', dbError);
-            console.error('❌ 🎯 Error stack:', dbError.stack);
-          }
-        })();
-        
-        // console.log('💾 🎯 Database update started in background');
-        //     toast({
-        //       title: "Success",
-        //   description: "Changes saved successfully!",
-        //     });
-        } else {
-          // console.error('❌ No database field mapping found for:', field);
-          toast({
-            title: "Error",
-            description: `No database field mapping found for ${field}`,
-          variant: "destructive",
-        });
+          })();
+        }
       }
       
       setEditingEntries(prev => ({ ...prev, [field]: null }));
@@ -2193,7 +2169,8 @@ Industry: Petrochemical`;
     }
     
     // Update database - set all projects with this value to empty or null
-    try {
+    // Only do this while editing an existing project; skip in create flow.
+    if (isEditMode && editData && (editData as any).id) try {
       // console.log('🗑️ Updating database - removing value:', deletedValue, 'from field:', field);
       
       // Map field names to database column names
@@ -2798,205 +2775,156 @@ Industry: Petrochemical`;
       const clientReferenceDocuments = [];
       const otherDocuments = [];
       
-      // Upload Unpriced PO Files (multiple)
+      const projectIdForDocs = createdProject[0].id;
+
+      const uploadProjectFileToStorage = async (folderSegment: string, file: File, index: number) => {
+        const fileName = `${formData.projectTitle}/${folderSegment}/${Date.now()}_${index}_${file.name}`;
+        const formDataUpload = new FormData();
+        formDataUpload.append('file', file);
+        const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
+          headers: {
+            'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+            'apikey': SUPABASE_ANON_KEY,
+            'Content-Type': 'multipart/form-data'
+          }
+        });
+        if (response.status !== 200) return null;
+        return `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
+      };
+
+      // Unpriced PO: one storage request per file, then one batch insert for metadata
       const unpricedPOFiles = formData.unpricedPOFile && formData.unpricedPOFile.length > 0 ? formData.unpricedPOFile : [];
+      const unpricedPrepared: Array<{ file: File; publicUrl: string; item: { name: string; url: string; uploadedBy: string; size: number; mimeType: string } }> = [];
       for (let i = 0; i < unpricedPOFiles.length; i++) {
         const file = unpricedPOFiles[i];
         try {
-          const fileName = `${formData.projectTitle}/Unpriced PO File/${Date.now()}_${file.name}`;
-          const formDataUpload = new FormData();
-          formDataUpload.append('file', file);
-          const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
-            headers: {
-              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-              'apikey': SUPABASE_ANON_KEY,
-              'Content-Type': 'multipart/form-data'
-            }
+          const publicUrl = await uploadProjectFileToStorage('Unpriced PO File', file, i);
+          if (!publicUrl) continue;
+          unpricedPrepared.push({
+            file,
+            publicUrl,
+            item: { name: file.name, url: publicUrl, uploadedBy: user.id, size: file.size, mimeType: file.type }
           });
-          if (response.status === 200) {
-            const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
-            const documentData = {
-              name: file.name,
-              url: publicUrl,
-              uploadedBy: user.id,
-              size: file.size,
-              mimeType: file.type
-            };
-            const uploadedDoc = await uploadUnpricedPODocument(createdProject[0].id, documentData);
-            unpricedPODocuments.push({
-              id: uploadedDoc[0].id,
-              name: file.name,
-              url: publicUrl,
-              uploaded_by: user.id,
-              created_at: uploadedDoc[0].created_at,
-              file_size: file.size,
-              mime_type: file.type
-            });
-          }
         } catch (docError) {
           console.error('❌ Error processing Unpriced PO File:', file.name, docError);
         }
       }
-      
-      // Upload Design Inputs/PID Files (multiple)
+      if (unpricedPrepared.length > 0) {
+        const inserted = await batchInsertUnpricedPODocuments(projectIdForDocs, unpricedPrepared.map((p) => p.item));
+        for (let j = 0; j < inserted.length; j++) {
+          const uploadedRow = inserted[j] as any;
+          const { file, publicUrl } = unpricedPrepared[j];
+          unpricedPODocuments.push({
+            id: uploadedRow.id,
+            name: uploadedRow.document_name || file.name,
+            url: uploadedRow.file_url || publicUrl,
+            uploaded_by: uploadedRow.uploaded_by || user.id,
+            created_at: uploadedRow.created_at,
+            file_size: uploadedRow.file_size ?? file.size,
+            mime_type: uploadedRow.mime_type ?? file.type
+          });
+        }
+      }
+
+      // Design Inputs: storage per file + one batch insert
       const designInputsFiles = formData.designInputsPID && formData.designInputsPID.length > 0 ? formData.designInputsPID : [];
+      const designPrepared: Array<{ file: File; publicUrl: string; item: { name: string; url: string; uploadedBy: string; size: number; mimeType: string } }> = [];
       for (let i = 0; i < designInputsFiles.length; i++) {
         const file = designInputsFiles[i];
         try {
-          const fileName = `${formData.projectTitle}/Design Inputs/${Date.now()}_${file.name}`;
-          const formDataUpload = new FormData();
-          formDataUpload.append('file', file);
-          const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
-            headers: {
-              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-              'apikey': SUPABASE_ANON_KEY,
-              'Content-Type': 'multipart/form-data'
-            }
+          const publicUrl = await uploadProjectFileToStorage('Design Inputs', file, i);
+          if (!publicUrl) continue;
+          designPrepared.push({
+            file,
+            publicUrl,
+            item: { name: file.name, url: publicUrl, uploadedBy: user.id, size: file.size, mimeType: file.type }
           });
-          if (response.status === 200) {
-            const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
-            const documentData = {
-              name: file.name,
-              url: publicUrl,
-              uploadedBy: user.id,
-              size: file.size,
-              mimeType: file.type
-            };
-            const uploadedDoc = await uploadDesignInputsDocument(createdProject[0].id, documentData);
-            designInputsDocuments.push({
-              id: uploadedDoc[0].id,
-              name: file.name,
-              url: publicUrl,
-              uploaded_by: user.id,
-              created_at: uploadedDoc[0].created_at,
-              file_size: file.size,
-              mime_type: file.type
-            });
-          }
         } catch (docError) {
           console.error('❌ Error processing Design Inputs/PID File:', file.name, docError);
         }
       }
-      
-      // Upload Client Reference Documents (multiple)
+      if (designPrepared.length > 0) {
+        const inserted = await batchInsertDesignInputsDocuments(projectIdForDocs, designPrepared.map((p) => p.item));
+        for (let j = 0; j < inserted.length; j++) {
+          const uploadedRow = inserted[j] as any;
+          const { file, publicUrl } = designPrepared[j];
+          designInputsDocuments.push({
+            id: uploadedRow.id,
+            name: uploadedRow.document_name || file.name,
+            url: uploadedRow.file_url || publicUrl,
+            uploaded_by: uploadedRow.uploaded_by || user.id,
+            created_at: uploadedRow.created_at,
+            file_size: uploadedRow.file_size ?? file.size,
+            mime_type: uploadedRow.mime_type ?? file.type
+          });
+        }
+      }
+
+      // Client Reference: storage per file + one batch insert
       const clientRefFiles = formData.clientReferenceDoc && formData.clientReferenceDoc.length > 0 ? formData.clientReferenceDoc : [];
+      const clientPrepared: Array<{ file: File; publicUrl: string; item: { name: string; url: string; uploadedBy: string; size: number; mimeType: string } }> = [];
       for (let i = 0; i < clientRefFiles.length; i++) {
         const file = clientRefFiles[i];
         try {
-          const fileName = `${formData.projectTitle}/Client's Reference Document/${Date.now()}_${file.name}`;
-          const formDataUpload = new FormData();
-          formDataUpload.append('file', file);
-          const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
-            headers: {
-              'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-              'apikey': SUPABASE_ANON_KEY,
-              'Content-Type': 'multipart/form-data'
-            }
+          const publicUrl = await uploadProjectFileToStorage(`Client's Reference Document`, file, i);
+          if (!publicUrl) continue;
+          clientPrepared.push({
+            file,
+            publicUrl,
+            item: { name: file.name, url: publicUrl, uploadedBy: user.id, size: file.size, mimeType: file.type }
           });
-          if (response.status === 200) {
-            const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
-            const documentData = {
-              name: file.name,
-              url: publicUrl,
-              uploadedBy: user.id,
-              size: file.size,
-              mimeType: file.type
-            };
-            const uploadedDoc = await uploadClientReferenceDocument(createdProject[0].id, documentData);
-            clientReferenceDocuments.push({
-              id: uploadedDoc[0].id,
-              name: file.name,
-              url: publicUrl,
-              uploaded_by: user.id,
-              created_at: uploadedDoc[0].created_at,
-              file_size: file.size,
-              mime_type: file.type
-            });
-          }
         } catch (docError) {
           console.error('❌ Error processing Client Reference Document:', file.name, docError);
         }
       }
-      
-      // Upload Other Documents
-      if (formData.otherDocuments && formData.otherDocuments.length > 0) {
-        for (let i = 0; i < formData.otherDocuments.length; i++) {
-          const file = formData.otherDocuments[i];
-          try {
-            // console.log(`📄 Uploading Other Document ${i + 1}...`);
-            
-            // Upload file to Supabase Storage with proper folder structure
-            const fileName = `${formData.projectTitle}/Other Documents/${Date.now()}_${file.name}`;
-            
-            // Use direct fetch API approach
-            // console.log(`📄 Using direct fetch API approach for Other Document ${i + 1}...`);
-            
-            try {
-              // console.log(`📄 About to call fetch API for Other Document ${i + 1}...`);
-              
-              // Create FormData
-              const formDataUpload = new FormData();
-              formDataUpload.append('file', file);
-              
-              // Direct API call with service role key using axios
-              const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
-                headers: {
-                  'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-                  'apikey': SUPABASE_ANON_KEY,
-                  'Content-Type': 'multipart/form-data'
-                }
-              });
-              
-              // console.log(`📄 Axios API call completed for Other Document ${i + 1}!`);
-              // console.log('📄 Response status:', response.status);
-              
-              if (response.status === 200) {
-                const uploadData = response.data;
-                // console.log(`✅ Direct API upload successful for Other Document ${i + 1}!`);
-                // console.log('📄 Upload data:', uploadData);
-            
-            // Get public URL
-                const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
-                // console.log('🌐 Public URL:', publicUrl);
-            
-                // Continue with database operations
-            const documentData = {
-              name: file.name,
-                  url: publicUrl,
-              uploadedBy: user.id,
-              size: file.size,
-              mimeType: file.type
-            };
-            
-            const uploadedDoc = await uploadOtherDocument(createdProject[0].id, documentData);
-            
-            // Add to project document links
-                const documentLink = {
-              id: uploadedDoc[0].id,
-              name: file.name,
-                  url: publicUrl,
-              uploaded_by: user.id,
-              created_at: uploadedDoc[0].created_at,
-              file_size: file.size,
-              mime_type: file.type
-                };
-                
-                otherDocuments.push(documentLink);
-                // console.log('📄 Added to otherDocuments array:', documentLink);
-                
-                // console.log(`✅ Other Document ${i + 1} uploaded successfully`);
-              } else {
-                // console.error(`❌ Direct API upload failed for Other Document ${i + 1}:`, response.status, response.statusText);
-                const errorText = response.data;
-                // console.error('❌ Error response:', errorText);
-              }
-            } catch (error) {
-              // console.error(`❌ Direct API upload error for Other Document ${i + 1}:`, error.message);
-              // console.error('❌ Error stack:', error.stack);
-            }
-          } catch (docError) {
-            // console.error(`❌ Error processing Other Document ${i + 1}:`, docError);
-          }
+      if (clientPrepared.length > 0) {
+        const inserted = await batchInsertClientReferenceDocuments(projectIdForDocs, clientPrepared.map((p) => p.item));
+        for (let j = 0; j < inserted.length; j++) {
+          const uploadedRow = inserted[j] as any;
+          const { file, publicUrl } = clientPrepared[j];
+          clientReferenceDocuments.push({
+            id: uploadedRow.id,
+            name: uploadedRow.document_name || file.name,
+            url: uploadedRow.file_url || publicUrl,
+            uploaded_by: uploadedRow.uploaded_by || user.id,
+            created_at: uploadedRow.created_at,
+            file_size: uploadedRow.file_size ?? file.size,
+            mime_type: uploadedRow.mime_type ?? file.type
+          });
+        }
+      }
+
+      // Other documents: storage per file + one batch insert
+      const otherFiles = formData.otherDocuments && formData.otherDocuments.length > 0 ? formData.otherDocuments : [];
+      const otherPrepared: Array<{ file: File; publicUrl: string; item: { name: string; url: string; uploadedBy: string; size: number; mimeType: string } }> = [];
+      for (let i = 0; i < otherFiles.length; i++) {
+        const file = otherFiles[i];
+        try {
+          const publicUrl = await uploadProjectFileToStorage('Other Documents', file, i);
+          if (!publicUrl) continue;
+          otherPrepared.push({
+            file,
+            publicUrl,
+            item: { name: file.name, url: publicUrl, uploadedBy: user.id, size: file.size, mimeType: file.type }
+          });
+        } catch (docError) {
+          console.error('❌ Error processing Other Document:', file.name, docError);
+        }
+      }
+      if (otherPrepared.length > 0) {
+        const inserted = await batchInsertOtherDocuments(projectIdForDocs, otherPrepared.map((p) => p.item));
+        for (let j = 0; j < inserted.length; j++) {
+          const uploadedRow = inserted[j] as any;
+          const { file, publicUrl } = otherPrepared[j];
+          otherDocuments.push({
+            id: uploadedRow.id,
+            name: uploadedRow.document_name || file.name,
+            url: uploadedRow.file_url || publicUrl,
+            uploaded_by: uploadedRow.uploaded_by || user.id,
+            created_at: uploadedRow.created_at,
+            file_size: uploadedRow.file_size ?? file.size,
+            mime_type: uploadedRow.mime_type ?? file.type
+          });
         }
       }
       
@@ -3016,130 +2944,100 @@ Industry: Petrochemical`;
         
         // First, create equipment and get their IDs
         // NOTE: This section ONLY runs for NEW projects, NOT edit mode
-        const createdEquipment = [];
-        for (const equipment of equipmentData) {
-          const equipmentDataForSupabase = {
-            project_id: createdProject[0].id,
-            type: equipment.type,
-            tag_number: equipment.tagNumber || 'TBD',
-            job_number: equipment.jobNumber || 'TBD',
-            manufacturing_serial: equipment.manufacturingSerial || 'TBD',
-            size: equipment.size || '',
-            material: equipment.material || '',
-            design_code: equipment.designCode || '',
-            status: 'pending',
-            progress: 0,
-            progress_phase: 'documentation'
+        const batchRows = equipmentData.map((equipment: any) => ({
+          type: equipment.type,
+          tag_number: equipment.tagNumber || 'TBD',
+          job_number: equipment.jobNumber || 'TBD',
+          manufacturing_serial: equipment.manufacturingSerial || 'TBD',
+          size: equipment.size || '',
+          material: equipment.material || '',
+          design_code: equipment.designCode || '',
+          status: 'pending',
+          progress: 0,
+          progress_phase: 'documentation'
+        }));
+        const batchResult = await createProjectEquipmentBatch(createdProject[0].id, batchRows);
+        const createdEquipment: any[] = (batchResult.created || []).map((row: any) => {
+          const match = equipmentData.find((eq: any) =>
+            (eq.jobNumber || 'TBD') === (row.job_number || 'TBD') &&
+            (eq.tagNumber || 'TBD') === (row.tag_number || 'TBD')
+          ) || equipmentData.find((eq: any) => (eq.tagNumber || 'TBD') === (row.tag_number || 'TBD')) || {};
+          return {
+            ...match,
+            type: row.type,
+            tagNumber: row.tag_number,
+            dbId: row.id
           };
-          
-          try {
-            const equipmentResponse = await fastAPI.createEquipment(equipmentDataForSupabase);
-            createdEquipment.push({
-              ...equipment,
-              dbId: equipmentResponse[0].id
-            });
-          } catch (equipmentErr: any) {
-            const msg = equipmentErr?.message || 'Unknown error';
-            console.warn(`⚠️ Skipping equipment (duplicate or invalid): ${equipment.tagNumber || equipment.type}`, equipmentErr);
-            equipmentCreationFailures.push({ tag: equipment.tagNumber || equipment.type || '—', message: msg });
-          }
+        });
+        if (batchResult.failures?.length) {
+          equipmentCreationFailures.push(...batchResult.failures);
         }
         
-        // Now upload documents using the correct equipment IDs
+        // Upload to storage per file, then one batch insert into equipment_documents
+        const equipmentDocBatchRows: Array<{
+          equipmentId: string;
+          name: string;
+          url: string;
+          uploadedBy: string;
+          size: number;
+          mimeType: string;
+          equipmentType: string;
+          equipmentTagNumber: string;
+        }> = [];
+        const equipmentDocMeta: Array<{ file: File; publicUrl: string; equipment: any }> = [];
+        let equipDocIndex = 0;
         for (const equipment of createdEquipment) {
-          // Equipment is already created, now handle documents if any
           if (equipment.documents && equipment.documents.length > 0) {
-            // console.log(`📄 Uploading documents for equipment: ${equipment.type} - ${equipment.tagNumber}`);
-            
             for (let i = 0; i < equipment.documents.length; i++) {
               const file = equipment.documents[i];
               try {
-                // console.log(`📄 Uploading equipment document ${i + 1} for ${equipment.type}...`);
-                
-                // Upload file to Supabase Storage with proper folder structure
-                const fileName = `${formData.projectTitle}/Equipment Information/${equipment.type}/${Date.now()}_${file.name}`;
-                
-                // Use direct fetch API approach for equipment documents
-                // console.log(`📄 Using direct fetch API approach for equipment document ${i + 1}...`);
-                
-                try {
-                  // console.log(`📄 About to call fetch API for equipment document ${i + 1}...`);
-                  
-                  // Create FormData
-                  const formDataUpload = new FormData();
-                  formDataUpload.append('file', file);
-                  
-                  // Direct API call with service role key using axios
-                  const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
-                    headers: {
-                      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-                      'apikey': SUPABASE_ANON_KEY,
-                      'Content-Type': 'multipart/form-data'
-                    }
-                  });
-                  
-                  // console.log(`📄 Axios API call completed for equipment document ${i + 1}!`);
-                  // console.log('📄 Response status:', response.status);
-                  
-                  if (response.status === 200) {
-                    const uploadData = response.data;
-                    // console.log(`✅ Direct API upload successful for equipment document ${i + 1}!`);
-                    // console.log('📄 Upload data:', uploadData);
-                    
-                    // Get public URL
-                    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
-                    // console.log('🌐 Public URL:', publicUrl);
-                    
-                    // Create document record in database
-                    const documentData = {
-                      name: file.name,
-                      url: publicUrl,
-                      uploadedBy: user.id,
-                      size: file.size,
-                      mimeType: file.type,
-                      equipmentType: equipment.type,
-                      equipmentTagNumber: equipment.tagNumber
-                    };
-                    
-                    // console.log('📄 About to upload equipment document to database:', {
-                    //   equipmentId: equipment.dbId, // Use the actual UUID from database
-                    //   documentData: documentData
-                    // });
-                    
-                    const uploadedDoc = await uploadEquipmentDocument(equipment.dbId, documentData);
-                    
-                    // console.log('📄 Equipment document upload result:', uploadedDoc);
-                    
-                    // Add to equipment document links
-                    const documentLink = {
-                      id: uploadedDoc[0].id,
-                      name: file.name,
-                      url: publicUrl,
-                      uploaded_by: user.id,
-                      created_at: uploadedDoc[0].created_at,
-                      file_size: file.size,
-                      mime_type: file.type,
-                      equipment_type: equipment.type,
-                      equipment_tag_number: equipment.tagNumber
-                    };
-                    
-                    equipmentDocuments.push(documentLink);
-                    // console.log('📄 Added to equipmentDocuments array:', documentLink);
-                    
-                    // console.log(`✅ Equipment document ${i + 1} for ${equipment.type} uploaded successfully`);
-                  } else {
-                    // console.error(`❌ Direct API upload failed for equipment document ${i + 1}:`, response.status, response.statusText);
-                    const errorText = response.data;
-                    // console.error('❌ Error response:', errorText);
+                const fileName = `${formData.projectTitle}/Equipment Information/${equipment.type}/${Date.now()}_${equipDocIndex}_${file.name}`;
+                equipDocIndex += 1;
+                const formDataUpload = new FormData();
+                formDataUpload.append('file', file);
+                const response = await axios.post(`${SUPABASE_URL}/storage/v1/object/project-documents/${fileName}`, formDataUpload, {
+                  headers: {
+                    'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+                    'apikey': SUPABASE_ANON_KEY,
+                    'Content-Type': 'multipart/form-data'
                   }
-                } catch (error) {
-                  // console.error(`❌ Direct API upload error for equipment document ${i + 1}:`, error.message);
-                  // console.error('❌ Error stack:', error.stack);
+                });
+                if (response.status === 200) {
+                  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/project-documents/${fileName}`;
+                  equipmentDocBatchRows.push({
+                    equipmentId: equipment.dbId,
+                    name: file.name,
+                    url: publicUrl,
+                    uploadedBy: user.id,
+                    size: file.size,
+                    mimeType: file.type,
+                    equipmentType: equipment.type,
+                    equipmentTagNumber: equipment.tagNumber
+                  });
+                  equipmentDocMeta.push({ file, publicUrl, equipment });
                 }
-          } catch (docError) {
-                // console.error(`❌ Error processing equipment document ${i + 1}:`, docError);
+              } catch (docError) {
+                console.error('❌ Error processing equipment document:', file.name, docError);
               }
             }
+          }
+        }
+        if (equipmentDocBatchRows.length > 0) {
+          const insertedEqDocs = await batchInsertEquipmentDocuments(equipmentDocBatchRows);
+          for (let k = 0; k < insertedEqDocs.length; k++) {
+            const row = insertedEqDocs[k] as any;
+            const meta = equipmentDocMeta[k];
+            equipmentDocuments.push({
+              id: row.id,
+              name: meta.file.name,
+              url: meta.publicUrl,
+              uploaded_by: user.id,
+              created_at: row.created_at,
+              file_size: meta.file.size,
+              mime_type: meta.file.type,
+              equipment_type: meta.equipment.type,
+              equipment_tag_number: meta.equipment.tagNumber
+            });
           }
         }
       } else {
@@ -3147,25 +3045,18 @@ Industry: Petrochemical`;
         // CRITICAL: This ONLY runs for NEW projects, NOT edit mode
         // In edit mode, equipment is already created/updated above
         if (!isEditMode) {
-          for (const equipment of equipmentData) {
-            const equipmentDataForSupabase = {
-              project_id: createdProject[0].id,
-              type: equipment.type,
-              tag_number: equipment.tagNumber || 'TBD',
-              job_number: equipment.jobNumber || 'TBD',
-              manufacturing_serial: equipment.manufacturingSerial || 'TBD',
-              status: 'pending',
-              progress: 0,
-              progress_phase: 'documentation'
-            };
-            
-            try {
-              await fastAPI.createEquipment(equipmentDataForSupabase);
-            } catch (equipmentErr: any) {
-              const msg = equipmentErr?.message || 'Unknown error';
-              console.warn(`⚠️ Skipping equipment (duplicate or invalid): ${equipment.tagNumber || equipment.type}`, equipmentErr);
-              equipmentCreationFailures.push({ tag: equipment.tagNumber || equipment.type || '—', message: msg });
-            }
+          const batchRows = equipmentData.map((equipment: any) => ({
+            type: equipment.type,
+            tag_number: equipment.tagNumber || 'TBD',
+            job_number: equipment.jobNumber || 'TBD',
+            manufacturing_serial: equipment.manufacturingSerial || 'TBD',
+            status: 'pending',
+            progress: 0,
+            progress_phase: 'documentation'
+          }));
+          const batchResult = await createProjectEquipmentBatch(createdProject[0].id, batchRows);
+          if (batchResult.failures?.length) {
+            equipmentCreationFailures.push(...batchResult.failures);
           }
         } else if (isEditMode && editData) {
           // DO NOTHING in edit mode - equipment already updated above
@@ -3250,31 +3141,8 @@ Industry: Petrochemical`;
              // Equipment documents are stored in equipment_documents table, no need to update projects table
            }
          } else {
-           // For new projects, use the original logic
-           // Update unpriced PO documents
-           if (unpricedPODocuments.length > 0) {
-             await updateProjectDocumentLinks(createdProject[0].id, 'unpriced_po_documents', unpricedPODocuments);
-           }
-           
-           // Update design inputs documents
-           if (designInputsDocuments.length > 0) {
-             await updateProjectDocumentLinks(createdProject[0].id, 'design_inputs_documents', designInputsDocuments);
-           }
-           
-           // Update client reference documents
-           if (clientReferenceDocuments.length > 0) {
-             await updateProjectDocumentLinks(createdProject[0].id, 'client_reference_documents', clientReferenceDocuments);
-           }
-           
-           // Update other documents
-           if (otherDocuments.length > 0) {
-             await updateProjectDocumentLinks(createdProject[0].id, 'other_documents', otherDocuments);
-           }
-           
-           // Update equipment documents
-           if (equipmentDocuments.length > 0) {
-             // Equipment documents are stored in equipment_documents table, no need to update projects table
-           }
+           // New projects: document rows are already in unpriced_po_documents / design_inputs_documents / etc.
+           // (batch insert). Skip redundant projects JSONB patches — getProjectById reads from those tables first.
          }
          
          // console.log('✅ Project document links updated successfully');
@@ -3292,15 +3160,23 @@ Industry: Petrochemical`;
     };
     
     // Resolve manager email from contacts or firm team (never use @company.com – use only saved email for notifications and assignment)
+    let firmMembersForResolve: any[] | null = null;
+    const loadFirmMembersOnce = async () => {
+      const firmId = localStorage.getItem('firmId') || JSON.parse(localStorage.getItem('userData') || '{}').firm_id;
+      if (!firmId) return [];
+      if (!firmMembersForResolve) {
+        firmMembersForResolve = await fastAPI.getAllFirmTeamMembers(firmId);
+      }
+      return firmMembersForResolve || [];
+    };
+
     const resolveManagerEmail = async (name: string, role: 'project_manager' | 'vdcr_manager'): Promise<{ email: string | null; phone: string }> => {
       const contact = role === 'project_manager' ? projectManagerContacts[name] : vdcrManagerContacts[name];
       const phone = contact?.phone || '';
       if (contact?.email && contact.email.includes('@') && !contact.email.toLowerCase().includes('@company')) return { email: contact.email, phone };
       if (name.includes('@')) return { email: name, phone };
-      const firmId = localStorage.getItem('firmId');
-      if (!firmId) return { email: null, phone };
       try {
-        const members = await fastAPI.getAllFirmTeamMembers(firmId);
+        const members = await loadFirmMembersOnce();
         const member = (members || []).find((m: any) => m.name === name && m.role === role);
         const email = member?.email && member.email.includes('@') && !member.email.toLowerCase().includes('@company') ? member.email : null;
         return { email, phone: member?.phone || phone };
@@ -3309,18 +3185,24 @@ Industry: Petrochemical`;
       }
     };
 
+    const pmResolved = formData.projectManager?.trim()
+      ? await resolveManagerEmail(formData.projectManager, 'project_manager')
+      : { email: null as string | null, phone: '' };
+    const vdcrResolved = formData.vdcrManager?.trim()
+      ? await resolveManagerEmail(formData.vdcrManager, 'vdcr_manager')
+      : { email: null as string | null, phone: '' };
+
     // Send email notifications to project team members (only when we have a valid saved email)
     try {
       const userData = JSON.parse(localStorage.getItem('userData') || '{}');
       const companyName = userData.company_name || 'Your Company';
       
       if (formData.projectManager && formData.projectManager.trim() !== '') {
-        const { email: projectManagerEmail } = await resolveManagerEmail(formData.projectManager, 'project_manager');
-        if (projectManagerEmail) {
+        if (pmResolved.email) {
           await sendProjectTeamNotifications({
             project_name: formData.projectTitle,
             team_member_name: formData.projectManager,
-            team_member_email: projectManagerEmail,
+            team_member_email: pmResolved.email,
             role: 'project_manager',
             company_name: companyName,
             dashboard_url: getDashboardUrl('project_manager')
@@ -3331,12 +3213,11 @@ Industry: Petrochemical`;
       }
       
       if (formData.vdcrManager && formData.vdcrManager.trim() !== '') {
-        const { email: vdcrManagerEmail } = await resolveManagerEmail(formData.vdcrManager, 'vdcr_manager');
-        if (vdcrManagerEmail) {
+        if (vdcrResolved.email) {
           await sendProjectTeamNotifications({
             project_name: formData.projectTitle,
             team_member_name: formData.vdcrManager,
-            team_member_email: vdcrManagerEmail,
+            team_member_email: vdcrResolved.email,
             role: 'vdcr_manager',
             company_name: companyName,
             dashboard_url: getDashboardUrl('vdcr_manager')
@@ -3409,7 +3290,8 @@ Industry: Petrochemical`;
 
       // Add Project Manager to project_members table (only with resolved email – no @company.com)
       if (formData.projectManager && formData.projectManager.trim() !== '') {
-        const { email: projectManagerEmail, phone: projectManagerPhone } = await resolveManagerEmail(formData.projectManager, 'project_manager');
+        const projectManagerEmail = pmResolved.email;
+        const projectManagerPhone = pmResolved.phone;
         if (projectManagerEmail) {
           const projectManagerData = {
             project_id: projectId,
@@ -3431,7 +3313,8 @@ Industry: Petrochemical`;
       
       // Add VDCR Manager to project_members table (only with resolved email – no @company.com)
       if (formData.vdcrManager && formData.vdcrManager.trim() !== '') {
-        const { email: vdcrManagerEmail, phone: vdcrManagerPhone } = await resolveManagerEmail(formData.vdcrManager, 'vdcr_manager');
+        const vdcrManagerEmail = vdcrResolved.email;
+        const vdcrManagerPhone = vdcrResolved.phone;
         if (vdcrManagerEmail) {
           const vdcrManagerData = {
             project_id: projectId,
@@ -3458,7 +3341,7 @@ Industry: Petrochemical`;
       const currentUserId = user?.id || localStorage.getItem('userId');
       
       if (formData.projectManager && formData.projectManager.trim() !== '') {
-        const { email: pmEmail } = await resolveManagerEmail(formData.projectManager, 'project_manager');
+        const pmEmail = pmResolved.email;
         if (pmEmail && firmId) {
           try {
             await fastAPI.createInvite({
@@ -3476,7 +3359,7 @@ Industry: Petrochemical`;
       }
       
       if (formData.vdcrManager && formData.vdcrManager.trim() !== '') {
-        const { email: vdcrEmail } = await resolveManagerEmail(formData.vdcrManager, 'vdcr_manager');
+        const vdcrEmail = vdcrResolved.email;
         if (vdcrEmail && firmId) {
           try {
             await fastAPI.createInvite({
@@ -3493,21 +3376,9 @@ Industry: Petrochemical`;
         }
       }
       
-      // Dispatch event to notify that team members were added
-      window.dispatchEvent(new CustomEvent('teamMemberCreated', {
-        detail: { projectId: createdProject.id, membersAdded: true }
-      }));
-      
-      // Also dispatch a more specific event for project creation
-      window.dispatchEvent(new CustomEvent('projectCreated', {
-        detail: { 
-          projectId: createdProject.id, 
-          projectName: createdProject.projectTitle,
-          teamMembersAdded: true,
-          projectManager: formData.projectManager,
-          vdcrManager: formData.vdcrManager
-        }
-      }));
+      // Intentionally skip global window events here.
+      // Parent onSubmit already refreshes project data and this avoids duplicate
+      // post-submit API calls across mounted dashboard listeners.
     } catch (teamError) {
       console.error('❌ Error adding team members (project still created):', teamError);
       console.error('❌ Team error details:', teamError.response?.data || teamError.message);

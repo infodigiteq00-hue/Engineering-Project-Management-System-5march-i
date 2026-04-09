@@ -16,7 +16,7 @@ import AddEquipmentForm from "@/components/forms/AddEquipmentForm";
 import AddStandaloneEquipmentFormNew from "@/components/forms/AddStandaloneEquipmentFormNew";
 import AddTechnicalSectionModal from "@/components/forms/AddTechnicalSectionModal";
 import { ProductionChecklistModal } from "@/components/dashboard/ProductionChecklistModal";
-import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getEquipmentDocumentsMetadataBatch, getStandaloneEquipmentDocumentsMetadataBatch, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument, getEquipmentVdcrRecordIds } from "@/lib/api";
+import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getEquipmentDocumentsMetadataBatch, getStandaloneEquipmentDocumentsMetadataBatch, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, uploadStandaloneEquipmentDocumentsBulk, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument, getEquipmentVdcrRecordIds, takeStandaloneEquipmentBundleExtras, takeProjectEquipmentBundleExtras, hasProjectEquipmentBundleExtras, hasStandaloneEquipmentBundleExtras } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { updateEquipment } from "@/lib/database";
 import { useToast } from "@/hooks/use-toast";
@@ -172,6 +172,18 @@ interface EquipmentGridProps {
 }    
 
 const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetails, onViewVDCR, onUserAdded, onActivityUpdate, onViewingDetailsChange, onSummaryChange, onOpenDossierReport, onViewDetailedQAP }: EquipmentGridProps) => {
+  /** After get_project_equipment_bundle seeds team positions, skip one duplicate batch fetch. */
+  const projectBundleTeamAppliedRef = useRef(false);
+  /** Stable when parent passes a new array reference with the same equipment rows (avoids effect storms + duplicate API batches). */
+  const equipmentPropIdsKey = useMemo(() => {
+    if (!equipment?.length) return '';
+    return equipment.map((e) => e.id).filter(Boolean).sort().join(',');
+  }, [equipment]);
+
+  useEffect(() => {
+    projectBundleTeamAppliedRef.current = false;
+  }, [projectId, equipmentPropIdsKey]);
+
   const { toast } = useToast();
   const { user } = useAuth();
   const { markAsSeen } = useNotificationReads();
@@ -218,6 +230,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // New progress entry state
   const [editingProgressEntryId, setEditingProgressEntryId] = useState<string | null>(null);
   const [showProgressImageModal, setShowProgressImageModal] = useState<{ url: string, description?: string, uploadedBy?: string, uploadDate?: string } | null>(null);
+  // Request dedupe/cache for project members to prevent 3-5 duplicate calls on "View Equipment" open
+  const projectMembersFetchPromiseRef = useRef<Promise<any[]> | null>(null);
+  const projectMembersFetchedForRef = useRef<string | null>(null);
   const [addingProgressEntryForEquipment, setAddingProgressEntryForEquipment] = useState<string | null>(null);
   const [editingProgressEntryForEquipment, setEditingProgressEntryForEquipment] = useState<string | null>(null);
   // Updates tab: load entry image only when user clicks preview (metadata loaded first)
@@ -275,7 +290,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   const [markCompleteSubmitting, setMarkCompleteSubmitting] = useState(false);
   const [editActivitiesModalOpen, setEditActivitiesModalOpen] = useState(false);
   const [editActivitiesModalEquipmentId, setEditActivitiesModalEquipmentId] = useState<string | null>(null);
-  const [editActivitiesDraft, setEditActivitiesDraft] = useState<Array<{ id: string; sr_no: number; activity_name: string; activity_type: 'regular_update' | 'milestone'; target_relative: string; target_date: string; sort_order: number; inspection_tpi_involved?: boolean }>>([]);
+  const [editActivitiesDraft, setEditActivitiesDraft] = useState<Array<{ id: string; sr_no: number; activity_name: string; activity_type: 'regular_update' | 'milestone'; target_relative: string; target_date: string; sort_order: number; inspection_tpi_involved?: boolean; progress_weight?: number | null }>>([]);
   const [activitiesHistoryOpen, setActivitiesHistoryOpen] = useState(false);
   const [activitiesHistoryEquipmentId, setActivitiesHistoryEquipmentId] = useState<string | null>(null);
   const [qapExpandedEquipmentId, setQapExpandedEquipmentId] = useState<string | null>(null);
@@ -314,6 +329,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   const [inspectionReportListModal, setInspectionReportListModal] = useState<{ completionId: string; reports: Array<{ id: string; report_url: string | null; file_name: string | null; sort_order: number }> } | null>(null);
   const [inspectionReportListLoading, setInspectionReportListLoading] = useState(false);
   const [inspectionReportPreview, setInspectionReportPreview] = useState<{ reportUrl: string; fileName: string } | null>(null);
+  /** Inspection report PDF preview: PDF.js canvas (iframes often blank for storage/signed URLs; avoid blob: URLs) */
+  const [inspectionReportPdfDoc, setInspectionReportPdfDoc] = useState<any>(null);
+  const [inspectionReportPdfPage, setInspectionReportPdfPage] = useState(1);
+  const [inspectionReportPdfTotalPages, setInspectionReportPdfTotalPages] = useState(0);
+  const [inspectionReportPdfLoading, setInspectionReportPdfLoading] = useState(false);
+  const [inspectionReportPdfError, setInspectionReportPdfError] = useState<string | null>(null);
   /** Clients Documentations: pick which activity's inspection reports to open (when equipment has multiple completions with reports) */
   const [inspectionReportPickerModal, setInspectionReportPickerModal] = useState<{ equipmentId: string; activities: Array<{ activityId: string; activityName: string; completionId: string; reportCount: number; department?: string | null }> } | null>(null);
   /** Clients Documentations: "Other reference / internal drawings & documents" list modal */
@@ -539,6 +560,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // Pre-fetch team members for all project equipment when equipment list loads (batched: one API call for all IDs)
   const fetchAllProjectEquipmentTeamMembers = useCallback(async (equipmentList: any[]) => {
     if (projectId === 'standalone' || !equipmentList?.length) return;
+    if (projectBundleTeamAppliedRef.current) {
+      projectBundleTeamAppliedRef.current = false;
+      return;
+    }
     try {
       const equipmentIds = equipmentList.map((eq: any) => eq.id);
       const batchMap = await fastAPI.getProjectEquipmentTeamPositionsBatch(equipmentIds);
@@ -954,9 +979,25 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     return transformEquipmentData(dbEquipment);
   }, []); // Memoized with empty dependencies (pure function)
 
+  const syncStandaloneEquipmentItem = useCallback(async (equipmentId: string) => {
+    try {
+      const freshItem = await (fastAPI as any).getStandaloneEquipmentById(equipmentId, { progressImagesLatestOnly: true });
+      if (!freshItem) return;
+      const transformed = transformEquipmentDataCallback([freshItem]);
+      const nextItem = transformed[0];
+      if (!nextItem) return;
+      setLocalEquipment(prev => prev.map(eq => (eq.id === equipmentId ? { ...eq, ...nextItem } : eq)));
+    } catch (error) {
+      console.warn('Standalone single-item sync failed (non-fatal):', error);
+    }
+  }, [transformEquipmentDataCallback]);
+
   // Initialize with empty array - will be updated by useEffect when filtered equipment arrives
   // This ensures we don't show unfiltered equipment before filtering is applied
   const [localEquipment, setLocalEquipment] = useState<Equipment[]>([]);
+  /** Latest local rows for prop-sync effect (avoids stale closure when merging optimistic creates). */
+  const localEquipmentForOptimisticSyncRef = useRef<Equipment[]>([]);
+  localEquipmentForOptimisticSyncRef.current = localEquipment;
   /** Saved display order (equipment ids) from Arrange Order modal; applied when syncing from props and when sorting grid. Frontend-only. */
   const [equipmentOrderIds, setEquipmentOrderIds] = useState<string[] | null>(null);
   const [showArrangeOrderModal, setShowArrangeOrderModal] = useState(false);
@@ -968,6 +1009,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // Performance optimization: Debouncing and request cancellation for refreshEquipmentData
   const refreshTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const refreshAbortControllerRef = useRef<AbortController | null>(null);
+  // Dedupe overlapping refreshes for the same project (prevents request storms on "View Equipment")
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
+  const refreshInFlightProjectIdRef = useRef<string | null>(null);
+  // Standalone: prevent request storms from overlapping/rapid refresh triggers.
+  const standaloneRefreshInFlightRef = useRef(false);
+  const standaloneLastRefreshAtRef = useRef(0);
+  const standaloneLastSuccessRefreshAtRef = useRef(0);
   // Ref for the projectId of the in-flight refresh (so we only abort when switching to a different project)
   const refreshProjectIdRef = useRef<string | null>(null);
   // Ref for current projectId so we can apply equipment response when it's still the selected project (fix: data returned but not shown)
@@ -978,6 +1026,17 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   localEquipmentLengthRef.current = localEquipment.length;
   // Avoid duplicate progress-image batch requests when effect re-runs (e.g. re-renders)
   const progressImageBatchIdsRef = useRef<string[] | null>(null);
+  /** Avoid repeating docs + project-members fetches when `equipment` prop reference churns with the same row ids. */
+  const lastEquipmentDocsMembersLoadKeyRef = useRef<string | null>(null);
+  const shouldLoadDocsMembersForEquipment = useCallback((equipmentList: Equipment[]) => {
+    const idsKey = equipmentList.map((e) => e.id).sort().join(',');
+    const docsMembersKey = `${projectId || ''}:${idsKey}`;
+    if (lastEquipmentDocsMembersLoadKeyRef.current === docsMembersKey) {
+      return false;
+    }
+    lastEquipmentDocsMembersLoadKeyRef.current = docsMembersKey;
+    return true;
+  }, [projectId]);
 
   // Main progress image: always load only latest (one image per equipment) to avoid slow load when many uploads
   const progressImagesApiOptions = { progressImagesLatestOnly: true as const };
@@ -1046,8 +1105,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     isStandalone: boolean
   ): Promise<Equipment[]> => {
     if (list.length === 0 || equipmentToFill.length === 0) return list;
-    const ids = equipmentToFill.map((eq) => eq.id);
-    const urlMap = await fastAPI.getLatestProgressImageUrlsBatch(ids, isStandalone);
+    const idsNeedingUrl = equipmentToFill
+      .filter((eq) => {
+        const item = list.find((e) => e.id === eq.id);
+        return !item?.progressImages?.[0];
+      })
+      .map((eq) => eq.id);
+    if (idsNeedingUrl.length === 0) return list;
+    const urlMap = await fastAPI.getLatestProgressImageUrlsBatch(idsNeedingUrl, isStandalone);
     return list.map(eq => {
       const url = urlMap[eq.id];
       if (!url) return eq;
@@ -1100,10 +1165,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     setAllCertificationTitles(Array.from(titles).sort());
   }, [localEquipment]);
 
-  // Load activities for all grid equipment (batched: one API call for all missing IDs instead of N)
+  // Load activities for visible page equipment first (lazy pagination).
+  // Avoids request growth with total equipment count when entering View Equipment.
   useEffect(() => {
     if (!localEquipment?.length || !projectId) return;
-    const missingIds = localEquipment
+    const visibleList = getFilteredAndSortedEquipment(localEquipment, selectedPhase, searchQuery);
+    const start = (currentPage - 1) * itemsPerPage;
+    const visiblePage = visibleList.slice(start, start + itemsPerPage);
+    const missingIds = visiblePage
       .map((eq: Equipment) => eq.id)
       .filter((id: string) => equipmentActivities[id] === undefined);
     if (missingIds.length === 0) return;
@@ -1127,12 +1196,17 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       }
     };
     fetchAll();
-  }, [localEquipment, projectId, equipmentActivities]);
+    // Do not depend on `equipmentActivities` — it caused extra effect runs (same visible ids re-fetching).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localEquipment, projectId, currentPage, selectedPhase, searchQuery, getFilteredAndSortedEquipment]);
 
-  // Load Production & Pre-Dispatch Checklist tasks for all grid equipment (separate from QAP)
+  // Load Production & Pre-Dispatch Checklist tasks for visible page equipment first (lazy pagination)
   useEffect(() => {
     if (!localEquipment?.length || !projectId) return;
-    const missingIds = localEquipment
+    const visibleList = getFilteredAndSortedEquipment(localEquipment, selectedPhase, searchQuery);
+    const start = (currentPage - 1) * itemsPerPage;
+    const visiblePage = visibleList.slice(start, start + itemsPerPage);
+    const missingIds = visiblePage
       .map((eq: Equipment) => eq.id)
       .filter((id: string) => productionChecklistByEquipment[id] === undefined);
     if (missingIds.length === 0) return;
@@ -1150,7 +1224,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       }
     };
     fetchChecklist();
-  }, [localEquipment, projectId, productionChecklistByEquipment]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localEquipment, projectId, currentPage, selectedPhase, searchQuery, getFilteredAndSortedEquipment]);
 
   // Initialize date fields and notes when entering edit mode or when equipment data is refreshed
   useEffect(() => {
@@ -1282,6 +1357,139 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         return;
       }
       const equipmentIds = equipmentList.map((eq) => eq.id);
+
+      // Bundle extras are set inside getEquipmentByProject / getStandaloneEquipment when the RPC returns.
+      // This effect often runs before refreshEquipmentData/Index finishes those calls — without awaiting, take* returns null and we fall back to many REST requests.
+      if (projectId && projectId !== 'standalone') {
+        if (!hasProjectEquipmentBundleExtras(projectId)) {
+          await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
+        }
+      }
+      if (projectId === 'standalone') {
+        if (!hasStandaloneEquipmentBundleExtras()) {
+          await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions);
+        }
+      }
+
+      // One-shot data from get_standalone_equipment_bundle (same shapes as batch REST); avoids duplicate API calls after Index load.
+      if (projectId === 'standalone') {
+        const bundleExtras = takeStandaloneEquipmentBundleExtras();
+        if (bundleExtras) {
+          const vdcrMap: Record<string, string> = {};
+          const transformDoc = (doc: any) => {
+            const department = doc.vdcr_record_id ? (vdcrMap[doc.vdcr_record_id] ?? null) : null;
+            return {
+              id: doc.id,
+              name: doc.document_name || doc.name,
+              document_name: doc.document_name || doc.name,
+              document_url: undefined as string | undefined,
+              uploadedBy: doc.uploaded_by_user?.full_name || doc.uploaded_by || 'Unknown',
+              uploadDate: doc.upload_date || doc.created_at,
+              document_type: doc.document_type || 'Equipment Document',
+              vdcr_code_status: doc.vdcr_code_status,
+              vdcr_document_status: doc.vdcr_document_status,
+              department: department ?? undefined
+            };
+          };
+          const documentsMap: Record<string, any[]> = {};
+          for (const eq of equipmentList) {
+            const docs = bundleExtras.documentsByEquipment[eq.id] ?? [];
+            documentsMap[eq.id] = Array.isArray(docs) ? docs.map(transformDoc) : [];
+          }
+          setDocuments(documentsMap);
+          setEquipmentActivities((prev) => ({ ...prev, ...bundleExtras.activitiesByEquipment }));
+          setProductionChecklistByEquipment((prev) => ({ ...prev, ...bundleExtras.productionChecklistByEquipment }));
+          const teamUpdates: Record<string, any[]> = {};
+          for (const eq of equipmentList) {
+            const teamData = bundleExtras.teamPositionsByEquipment[eq.id] ?? [];
+            if (teamData.length > 0) {
+              teamUpdates[eq.id] = (teamData as any[]).map((member: any, index: number) => ({
+                id: member.id || `member-${index}`,
+                name: member.person_name || 'Unknown',
+                email: member.email || '',
+                phone: member.phone || '',
+                position: member.position_name || '',
+                role: member.role || 'viewer',
+                permissions: getPermissionsByRole(member.role || 'viewer'),
+                status: 'active',
+                avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
+                lastActive: 'Unknown',
+                equipmentAssignments: [eq.id],
+                dataAccess: getDataAccessByRole(member.role || 'viewer'),
+                accessLevel: member.role || 'viewer'
+              }));
+            }
+          }
+          if (Object.keys(teamUpdates).length > 0) {
+            setAllEquipmentTeamMembers((prev) => ({ ...prev, ...teamUpdates }));
+          }
+          return;
+        }
+      }
+
+      // One-shot: get_project_equipment_bundle (same shapes as batch REST + VDCR list for doc departments).
+      if (projectId && projectId !== 'standalone') {
+        const projectExtras = projectId ? takeProjectEquipmentBundleExtras(projectId) : null;
+        if (projectExtras) {
+          let vdcrMap: Record<string, string> = {};
+          let departmentsList: string[] = [];
+          const vdcrRecords = projectExtras.vdcrRecords || [];
+          if (vdcrRecords.length > 0) {
+            const deptSet = new Set<string>();
+            vdcrRecords.forEach((r: any) => {
+              if (r.id && r.department != null && String(r.department).trim()) {
+                vdcrMap[r.id] = String(r.department).trim();
+                deptSet.add(String(r.department).trim());
+              }
+            });
+            departmentsList = Array.from(deptSet).sort();
+            setVdcrRecordIdToDepartment(vdcrMap);
+            setQaDashboardDepartments(departmentsList);
+          }
+          const transformDoc = (doc: any) => {
+            const department = doc.vdcr_record_id ? (vdcrMap[doc.vdcr_record_id] ?? null) : null;
+            return {
+              id: doc.id,
+              name: doc.document_name || doc.name,
+              document_name: doc.document_name || doc.name,
+              document_url: undefined as string | undefined,
+              uploadedBy: doc.uploaded_by_user?.full_name || doc.uploaded_by || 'Unknown',
+              uploadDate: doc.upload_date || doc.created_at,
+              document_type: doc.document_type || 'Equipment Document',
+              vdcr_code_status: doc.vdcr_code_status,
+              vdcr_document_status: doc.vdcr_document_status,
+              department: department ?? undefined
+            };
+          };
+          const documentsMap: Record<string, any[]> = {};
+          for (const eq of equipmentList) {
+            const docs = projectExtras.documentsByEquipment[eq.id] ?? [];
+            documentsMap[eq.id] = Array.isArray(docs) ? docs.map(transformDoc) : [];
+          }
+          setDocuments(documentsMap);
+          setEquipmentActivities((prev) => ({ ...prev, ...projectExtras.activitiesByEquipment }));
+          setProductionChecklistByEquipment((prev) => ({ ...prev, ...projectExtras.productionChecklistByEquipment }));
+          const teamUpdates: Record<string, any[]> = {};
+          for (const eq of equipmentList) {
+            const teamData = projectExtras.teamPositionsByEquipment[eq.id] ?? [];
+            if (teamData.length > 0) {
+              teamUpdates[eq.id] = (teamData as any[]).map((m: any, i: number) => ({
+                id: m.id || `member-${i}`,
+                name: m.person_name || 'Unknown',
+                position: m.position_name || '',
+                position_name: m.position_name,
+                person_name: m.person_name
+              }));
+            }
+          }
+          if (Object.keys(teamUpdates).length > 0) {
+            setAllEquipmentTeamMembers((prev) => ({ ...prev, ...teamUpdates }));
+          }
+          projectBundleTeamAppliedRef.current = true;
+          return;
+        }
+      }
+
       // Batch: fetch docs and (for project) VDCR records in parallel to get departments – no extra round-trip
       const isProject = projectId && projectId !== 'standalone';
       const [batchMap, vdcrRecords] = await Promise.all([
@@ -1397,6 +1605,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       } else {
         setEquipmentOrderIds(null);
       }
+
+      // Keep rows added locally before the parent prop includes them (e.g. Create Equipment merged without full refresh).
+      const propIdsOptimistic = new Set(transformedEquipment.map((e: Equipment) => e.id));
+      const optimisticExtras = localEquipmentForOptimisticSyncRef.current.filter((e: Equipment) => !propIdsOptimistic.has(e.id));
+      if (optimisticExtras.length > 0) {
+        transformedEquipment.push(...optimisticExtras);
+      }
       
       // // console.log('🔄 Transformed equipment:', transformedEquipment);
       // console.log('🔄 EquipmentGrid: Updating localEquipment with', transformedEquipment.length, 'items');
@@ -1473,12 +1688,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // // console.log('Initial Team Custom Fields:', initialTeamCustomFields);
       setTeamCustomFields(initialTeamCustomFields);
 
-      // Load documents for all equipment
-      loadDocumentsForEquipment(transformedEquipment);
-
-      // Load project members for team assignment
-      loadProjectMembers();
+      // Load documents + project members once per (project, equipment id set); parent often passes a new array ref each render.
+      if (shouldLoadDocsMembersForEquipment(transformedEquipment)) {
+        loadDocumentsForEquipment(transformedEquipment);
+        loadProjectMembers();
+      }
     } else {
+      lastEquipmentDocsMembersLoadKeyRef.current = null;
       // If equipment is empty or undefined: only clear when standalone or no projectId.
       // For project view, do NOT clear here so that refreshEquipmentData can populate localEquipment
       // (parent often passes [] because getProjectsByFirm doesn't include full equipment; clearing would wipe data we just fetched).
@@ -1486,7 +1702,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         setLocalEquipment([]);
       }
     }
-  }, [equipment, projectId, getCreatedOrderIds]);
+  }, [equipment, projectId, getCreatedOrderIds, equipmentPropIdsKey]);
 
   // Keep optional summary (total/active/dispatched/completed) in sync for standalone equipment
   useEffect(() => {
@@ -1507,15 +1723,38 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     });
   }, [localEquipment, projectId, onSummaryChange]);
 
-  // Load project members for team assignment
-  const loadProjectMembers = async () => {
-    try {
-      const members = await fastAPI.getProjectMembers(projectId);
-      setProjectMembers(Array.isArray(members) ? members : []);
-    } catch (error) {
-      console.error('❌ Error loading project members:', error);
-      setProjectMembers([]);
+  const getProjectMembersCached = useCallback(async (force: boolean = false): Promise<any[]> => {
+    if (!projectId || projectId === 'standalone') return [];
+    if (!force && projectMembersFetchedForRef.current === projectId && projectMembers.length > 0) {
+      return projectMembers;
     }
+    if (!force && projectMembersFetchPromiseRef.current) {
+      return projectMembersFetchPromiseRef.current;
+    }
+
+    const request = (async () => {
+      try {
+        const members = await fastAPI.getProjectMembers(projectId);
+        const rows = Array.isArray(members) ? members : [];
+        setProjectMembers(rows);
+        projectMembersFetchedForRef.current = projectId;
+        return rows;
+      } catch (error) {
+        console.error('❌ Error loading project members:', error);
+        setProjectMembers([]);
+        return [];
+      } finally {
+        projectMembersFetchPromiseRef.current = null;
+      }
+    })();
+
+    projectMembersFetchPromiseRef.current = request;
+    return request;
+  }, [projectId, projectMembers]);
+
+  // Load project members for team assignment
+  const loadProjectMembers = async (force: boolean = false) => {
+    await getProjectMembersCached(force);
   };
 
   // Load project members when projectId is set (e.g. after project create) so PM/VDCR show in EQU Team tab even before equipment loads
@@ -1523,13 +1762,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     if (projectId && projectId !== 'standalone') {
       loadProjectMembers();
     }
-  }, [projectId]);
+  }, [projectId, getProjectMembersCached]);
 
   // Listen for team member changes from Settings tab
   useEffect(() => {
     const handleTeamMemberChange = () => {
       // // console.log('🔄 EQUIPMENT GRID: Team member change detected, refreshing project members...');
-      loadProjectMembers();
+      loadProjectMembers(true);
     };
 
     // Listen for team member changes
@@ -1705,8 +1944,20 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         const firmMembers = await fastAPI.getTeamMembersByFirm(currentUserFirmId);
         members = Array.isArray(firmMembers) ? firmMembers : [];
       } else if (currentUserRole === 'project_manager' && projectId && projectId !== 'standalone') {
-        const projectMembers = await fastAPI.getTeamMembersByProject(projectId);
-        members = Array.isArray(projectMembers) ? projectMembers : [];
+        // Same data as getProjectMembers / fetchProjectUsers — avoid a second /project_members HTTP call.
+        const rows = await getProjectMembersCached();
+        members = Array.isArray(rows)
+          ? (rows as any[]).map((member: any) => ({
+              id: member.id,
+              name: member.name || member.users?.full_name || member.users?.name || 'Unknown',
+              email: member.email || member.users?.email || '',
+              role: member.role,
+              position: member.position || member.role,
+              user_id: member.user_id,
+              project_id: member.project_id,
+              equipment_assignments: member.equipment_assignments || [],
+            }))
+          : [];
       }
 
       // // console.log('👥 Available team members fetched:', members);
@@ -1720,7 +1971,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   const fetchProjectUsers = async () => {
     try {
       // // console.log('👥 Fetching project users for team custom fields...', projectId);
-      const users = await fastAPI.getProjectMembers(projectId);
+      const users = await getProjectMembersCached();
       // // console.log('👥 Project users fetched:', users);
       setAllUsers(Array.isArray(users) ? users : []);
     } catch (error) {
@@ -1763,11 +2014,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
   };
 
-  // Load team members when component mounts
+  // Load team members when component mounts (sequential so project_manager shares one getProjectMembersCached round-trip)
   useEffect(() => {
-    fetchAvailableTeamMembers();
-    fetchProjectUsers();
-    fetchCurrentProject();
+    void (async () => {
+      await fetchProjectUsers();
+      await fetchAvailableTeamMembers();
+    })();
+    // Removed fetchCurrentProject() from mount path: it wasn't used for initial equipment view rendering.
   }, [projectId]);
 
   // Fetch current project data
@@ -1859,7 +2112,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
   // Function to refresh equipment data from database (memoized with useCallback)
   // PERFORMANCE: Added debouncing and request cancellation to prevent race conditions
-  const refreshEquipmentData = useCallback(async (immediate: boolean = false) => {
+  const refreshEquipmentData = useCallback(async (
+    immediate: boolean = false,
+    options?: { skipDocuments?: boolean }
+  ) => {
+    const skipDocuments = options?.skipDocuments === true;
     // Cancel any pending refresh
     if (refreshTimeoutRef.current) {
       clearTimeout(refreshTimeoutRef.current);
@@ -1872,6 +2129,19 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
 
     const performRefresh = async () => {
+      // Standalone-specific guard: skip overlapping and overly-frequent refreshes.
+      if (projectId === 'standalone') {
+        if (standaloneRefreshInFlightRef.current) return;
+        const now = Date.now();
+        // Keep UI responsive while preventing burst fetch loops from multiple effects/events.
+        if (!immediate && now - standaloneLastRefreshAtRef.current < 2500) return;
+        // Additional cooldown for non-critical/background standalone refreshes.
+        // User actions that require fresh data already call refreshEquipmentData(true).
+        if (!immediate && now - standaloneLastSuccessRefreshAtRef.current < 30000) return;
+        standaloneRefreshInFlightRef.current = true;
+        standaloneLastRefreshAtRef.current = now;
+      }
+
       // Create new abort controller for this request
       const abortController = new AbortController();
       refreshAbortControllerRef.current = abortController;
@@ -1948,13 +2218,15 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             const lightweight = createLightweightEquipment(equipmentArray);
             setCache(cacheKey, lightweight, { 
               ttl: 24 * 60 * 60 * 1000, // 24 hours TTL (much longer)
-              maxSize: 2 * 1024 * 1024 // 2MB max per project
+              maxSize: 4 * 1024 * 1024 // 4MB — full equipment + progress payloads can exceed 2MB
             });
             
             // Update with fresh data when response is still for the current project (fix: data returned but not shown when request was aborted)
             if (currentProjectIdRef.current === projectId) {
               setLocalEquipment(toSet);
-              await loadDocumentsForEquipment(toSet);
+              if (!skipDocuments && shouldLoadDocsMembersForEquipment(toSet)) {
+                await loadDocumentsForEquipment(toSet);
+              }
             }
             setIsLoadingProgressImages(false);
           } catch (error) {
@@ -1963,6 +2235,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             setIsLoadingProgressImages(false);
             // Keep existing cached data visible
           }
+          if (projectId === 'standalone') standaloneLastSuccessRefreshAtRef.current = Date.now();
           return;
         }
         
@@ -1988,11 +2261,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               const lightweight = createLightweightEquipment(equipmentArray);
               setCache(cacheKey, lightweight, { 
                 ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
-                maxSize: 2 * 1024 * 1024
+                maxSize: 4 * 1024 * 1024
               });
               if (currentProjectIdRef.current === projectId) {
                 setLocalEquipment(toSet);
-                await loadDocumentsForEquipment(toSet);
+                if (!skipDocuments && shouldLoadDocsMembersForEquipment(toSet)) {
+                  await loadDocumentsForEquipment(toSet);
+                }
               }
             }
             // FIX: Don't clear state if fetch fails - preserve existing data
@@ -2000,6 +2275,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             console.warn('Background refresh failed for equipment:', error);
             // FIX: Don't clear state on error - preserve existing data
           }
+          if (projectId === 'standalone') standaloneLastSuccessRefreshAtRef.current = Date.now();
           return;
         } else if (expiredCache !== null && Array.isArray(expiredCache) && expiredCache.length > 0) {
           const transformedExpired = transformEquipmentDataCallback(expiredCache);
@@ -2029,11 +2305,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               const lightweight = createLightweightEquipment(equipmentArray);
               setCache(cacheKey, lightweight, { 
                 ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
-                maxSize: 2 * 1024 * 1024
+                maxSize: 4 * 1024 * 1024
               });
               if (currentProjectIdRef.current === projectId) {
                 setLocalEquipment(toSet);
-                await loadDocumentsForEquipment(toSet);
+                if (!skipDocuments && shouldLoadDocsMembersForEquipment(toSet)) {
+                  await loadDocumentsForEquipment(toSet);
+                }
               }
             }
             // FIX: Don't clear state if fetch fails - preserve existing expired cache
@@ -2041,6 +2319,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             console.warn('Background refresh failed for equipment:', error);
             // FIX: Don't clear state on error - preserve existing expired cache
           }
+          if (projectId === 'standalone') standaloneLastSuccessRefreshAtRef.current = Date.now();
           return;
         }
         
@@ -2061,7 +2340,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           const lightweight = createLightweightEquipment(equipmentArray);
           setCache(cacheKey, lightweight, { 
             ttl: 24 * 60 * 60 * 1000, // 24 hours TTL (much longer)
-            maxSize: 2 * 1024 * 1024 // 2MB max per project
+            maxSize: 4 * 1024 * 1024 // 4MB — full equipment + progress payloads can exceed 2MB
           });
           
           let toSet = transformEquipmentDataCallback(equipmentArray);
@@ -2091,8 +2370,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           }
 
           setLocalEquipment(transformedEquipment);
-          await loadDocumentsForEquipment(transformedEquipment);
+          if (!skipDocuments && shouldLoadDocsMembersForEquipment(transformedEquipment)) {
+            await loadDocumentsForEquipment(transformedEquipment);
+          }
           devLog('✅ refreshEquipmentData: localEquipment state updated');
+          if (projectId === 'standalone') standaloneLastSuccessRefreshAtRef.current = Date.now();
 
           // Update custom fields state with fresh data
           const updatedCustomFields: Record<string, Array<{ name: string, value: string }>> = {};
@@ -2140,6 +2422,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         } else if (equipmentArray.length === 0 && currentProjectIdRef.current === projectId) {
           // Fetch returned empty for current project - show empty (e.g. switched to project with no equipment)
           setLocalEquipment([]);
+          if (projectId === 'standalone') standaloneLastSuccessRefreshAtRef.current = Date.now();
         }
         
         // Clear loading state for progress images
@@ -2175,20 +2458,48 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         if (refreshAbortControllerRef.current === abortController) {
           refreshAbortControllerRef.current = null;
         }
+      } finally {
+        if (projectId === 'standalone') {
+          standaloneRefreshInFlightRef.current = false;
+        }
       }
     };
 
     // Debounce: Wait 300ms before refreshing (unless immediate is true)
     // This prevents multiple rapid calls from causing race conditions
     if (immediate) {
-      performRefresh();
+      if (refreshInFlightRef.current && refreshInFlightProjectIdRef.current === projectId) {
+        // Reuse in-flight refresh for same project instead of issuing duplicate API batches
+        await refreshInFlightRef.current;
+        return;
+      }
+      const p = performRefresh();
+      refreshInFlightRef.current = p;
+      refreshInFlightProjectIdRef.current = projectId;
+      await p.finally(() => {
+        if (refreshInFlightRef.current === p) {
+          refreshInFlightRef.current = null;
+          refreshInFlightProjectIdRef.current = null;
+        }
+      });
     } else {
       refreshTimeoutRef.current = setTimeout(() => {
-        performRefresh();
+        if (refreshInFlightRef.current && refreshInFlightProjectIdRef.current === projectId) {
+          return;
+        }
+        const p = performRefresh();
+        refreshInFlightRef.current = p;
+        refreshInFlightProjectIdRef.current = projectId;
+        p.finally(() => {
+          if (refreshInFlightRef.current === p) {
+            refreshInFlightRef.current = null;
+            refreshInFlightProjectIdRef.current = null;
+          }
+        });
         refreshTimeoutRef.current = null;
       }, 300);
     }
-  }, [projectId, transformEquipmentDataCallback]); // Memoized with projectId dependency
+  }, [projectId, transformEquipmentDataCallback, shouldLoadDocsMembersForEquipment]); // Memoized with projectId dependency
 
   // CRITICAL FIX: Refresh equipment data on mount to ensure progress images are loaded
   // The initial equipment prop might be stale and missing progress images
@@ -2212,7 +2523,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     // Always refresh from API when parent didn't pass equipment (empty or missing).
     // This fixes "No Equipment Added Yet" when getProjectsByFirm doesn't include equipment and for filtered users who were previously skipped.
     refreshEquipmentData(true);
-  }, [projectId, refreshEquipmentData, equipment]);
+    // equipment: use equipmentPropIdsKey so parent re-renders with same rows don't re-trigger full refresh storms.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, refreshEquipmentData, equipmentPropIdsKey]);
   
   // Reset pagination to page 1 when filters change or when switching between project and standalone
   useEffect(() => {
@@ -2255,6 +2568,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // Pre-cache next page equipment metadata when user navigates pages
   useEffect(() => {
     const preCacheNextPage = async () => {
+      // Project: get_project_equipment_bundle returns the full list; pagination is client-side only — never re-fetch here.
+      // Standalone: optional cache warm for paged views (parent may cap rows).
+      if (projectId !== 'standalone') return;
       if (!localEquipment || localEquipment.length === 0) return;
       
       const totalPages = Math.ceil(localEquipment.length / itemsPerPage);
@@ -2262,9 +2578,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       
       // Only pre-cache if next page exists and we haven't cached it yet
       if (nextPage <= totalPages) {
-        const cacheKey = projectId === 'standalone' 
-          ? `${CACHE_KEYS.EQUIPMENT}_standalone`
-          : `${CACHE_KEYS.EQUIPMENT}_${projectId}`;
+        const nextPageEndExclusive = (currentPage + 1) * itemsPerPage;
+        if (localEquipment.length >= nextPageEndExclusive) {
+          return;
+        }
+
+        const cacheKey = `${CACHE_KEYS.EQUIPMENT}_standalone`;
         
         // Check current cache
         const cached = getCache<any[]>(cacheKey);
@@ -2281,16 +2600,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         
         // Pre-cache next page in background (non-blocking)
         try {
-          const freshEquipment = projectId === 'standalone' 
-            ? await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions) 
-            : await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
+          const freshEquipment = await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions);
           
           if (freshEquipment && Array.isArray(freshEquipment)) {
-            // For standalone: only cache first 24 total (3 pages)
-            // For projects: cache all (but lightweight)
-            const equipmentToCache = projectId === 'standalone' 
-              ? freshEquipment.slice(0, 24) // Limit to 24 for standalone
-              : freshEquipment;
+            const equipmentToCache = freshEquipment.slice(0, 24); // Limit to 24 for standalone
             
             // Create lightweight version (preserve created_by_user/entry_text for Updates tab, first image for display)
             const lightweight = equipmentToCache.map((eq: any) => ({
@@ -2319,8 +2632,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             
             // Update cache with lightweight version
             setCache(cacheKey, lightweight, {
-              ttl: projectId === 'standalone' ? 10 * 60 * 1000 : 5 * 60 * 1000,
-              maxSize: 2 * 1024 * 1024
+              ttl: 10 * 60 * 1000,
+              maxSize: 4 * 1024 * 1024
             });
           }
         } catch (error) {
@@ -2467,6 +2780,99 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     });
   }, [projectId, toast, fetchAndSetBlobUrl, documents]);
 
+  // Inspection report modal: load PDF with PDF.js (iframe src often blank for Supabase/storage URLs; no blob: URLs)
+  useEffect(() => {
+    if (!inspectionReportPreview?.reportUrl) {
+      setInspectionReportPdfDoc((prev: any) => {
+        if (prev?.destroy) prev.destroy();
+        return null;
+      });
+      setInspectionReportPdfPage(1);
+      setInspectionReportPdfTotalPages(0);
+      setInspectionReportPdfLoading(false);
+      setInspectionReportPdfError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const url = inspectionReportPreview.reportUrl;
+
+    (async () => {
+      setInspectionReportPdfLoading(true);
+      setInspectionReportPdfError(null);
+      setInspectionReportPdfDoc((prev: any) => {
+        if (prev?.destroy) prev.destroy();
+        return null;
+      });
+      setInspectionReportPdfPage(1);
+
+      try {
+        const pdfjsLib = typeof window !== 'undefined' ? (window as any).pdfjsLib : null;
+        if (!pdfjsLib) {
+          if (!cancelled) setInspectionReportPdfError('PDF viewer is not available.');
+          return;
+        }
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        let pdf: any;
+        try {
+          pdf = await pdfjsLib.getDocument(url).promise;
+        } catch {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error('fetch failed');
+          const buf = await res.arrayBuffer();
+          pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        }
+
+        if (cancelled) {
+          pdf.destroy();
+          return;
+        }
+        setInspectionReportPdfDoc(pdf);
+        setInspectionReportPdfTotalPages(pdf.numPages || 0);
+      } catch {
+        if (!cancelled) {
+          setInspectionReportPdfError('Could not load PDF preview. Use Download or open in a new tab.');
+        }
+      } finally {
+        if (!cancelled) setInspectionReportPdfLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectionReportPreview?.reportUrl]);
+
+  useEffect(() => {
+    if (!inspectionReportPdfDoc || inspectionReportPdfLoading) return;
+    const canvas = document.getElementById('inspection-report-pdf-canvas') as HTMLCanvasElement | null;
+    if (!canvas) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const page = await inspectionReportPdfDoc.getPage(inspectionReportPdfPage);
+        if (cancelled) return;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const containerWidth = canvas.parentElement?.clientWidth || 800;
+        const baseViewport = page.getViewport({ scale: 1 });
+        const scale = Math.min(1.6, Math.max(0.5, (containerWidth - 24) / baseViewport.width));
+        const viewport = page.getViewport({ scale });
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        await page.render({ canvasContext: ctx, viewport }).promise;
+      } catch {
+        // non-fatal
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectionReportPdfDoc, inspectionReportPdfPage, inspectionReportPdfLoading]);
+
   // Initial document load for all equipment is done in the main equipment useEffect via loadDocumentsForEquipment(transformedEquipment).
   // Do NOT add a second effect that loops equipment and calls fetchEquipmentDocuments(item.id) — that caused 2N duplicate API calls.
 
@@ -2475,7 +2881,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     if (equipment && equipment.length > 0 && projectId !== 'standalone') {
       fetchAllProjectEquipmentTeamMembers(equipment);
     }
-  }, [equipment, projectId, fetchAllProjectEquipmentTeamMembers]);
+    // equipment: intentionally omitted from deps — parent often passes new [] reference each render; equipmentPropIdsKey is stable per row set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [equipmentPropIdsKey, projectId, fetchAllProjectEquipmentTeamMembers]);
 
   // Fetch documents when viewing equipment details
   useEffect(() => {
@@ -2780,8 +3188,17 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         ));
 
 
-        // Refresh equipment data from database
-        await refreshEquipmentData();
+        // Standalone tab: keep a lightweight single-item sync after complete.
+        // Other views keep the existing delayed list refresh behavior.
+        if (projectId === 'standalone') {
+          setTimeout(() => {
+            void syncStandaloneEquipmentItem(equipment.id);
+          }, 1200);
+        } else {
+          setTimeout(() => {
+            refreshEquipmentData(true, { skipDocuments: true });
+          }, 1200);
+        }
 
         toast({
           title: "Equipment Completed",
@@ -2887,9 +3304,16 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
         // Call backend API to delete equipment (standalone vs project)
         if (isStandalone) {
-          await fastAPI.deleteStandaloneEquipment(equipment.id);
+          await fastAPI.deleteStandaloneEquipment(equipment.id, {
+            type: equipment.type,
+            tagNumber: equipment.tagNumber,
+          });
         } else {
-          await fastAPI.deleteEquipment(equipment.id);
+          await fastAPI.deleteEquipment(equipment.id, {
+            projectId,
+            type: equipment.type,
+            tagNumber: equipment.tagNumber,
+          });
         }
 
         // Remove the equipment from the local array
@@ -2920,9 +3344,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           return newDocs;
         });
 
-
-        // Refresh equipment data from database
-        await refreshEquipmentData();
+        // No post-delete refresh: backend delete is authoritative; local state already updated above.
 
         toast({
           title: "Equipment Deleted",
@@ -3312,16 +3734,28 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           progress_weight: a.progress_weight ?? undefined,
         })),
       };
-      if (isStandalone) {
-        await fastAPI.setStandaloneEquipmentActivities(equipmentId, payload);
-      } else {
-        await fastAPI.setEquipmentActivities(equipmentId, payload);
-      }
-      const refreshed = isStandalone
-        ? await fastAPI.getStandaloneEquipmentActivities(equipmentId)
-        : await fastAPI.getEquipmentActivities(equipmentId);
+      const inserted = isStandalone
+        ? await fastAPI.setStandaloneEquipmentActivities(equipmentId, payload)
+        : await fastAPI.setEquipmentActivities(equipmentId, payload);
+      // Use POST return=representation (same rows DB just wrote). Bulk replace clears completions — merge null completion like get*Activities.
+      const refreshed = (Array.isArray(inserted) ? inserted : [])
+        .slice()
+        .sort((a: any, b: any) =>
+          (a.sort_order ?? 0) - (b.sort_order ?? 0) || (a.sr_no ?? 0) - (b.sr_no ?? 0)
+        )
+        .map((a: any) => ({ ...a, completion: null }));
       setEquipmentActivities(prev => ({ ...prev, [equipmentId]: refreshed }));
-      refreshEquipmentData();
+      // Sync commencement on this equipment only (set* already PATCHed DB). Avoid full refreshEquipmentData — that duplicated get* + project equipment + docs/VDCR.
+      const cd = payload.commencement_date;
+      if (cd !== undefined) {
+        setLocalEquipment(prev =>
+          prev.map(eq =>
+            eq.id === equipmentId
+              ? ({ ...eq, commencementDate: cd, commencement_date: cd } as Equipment)
+              : eq
+          )
+        );
+      }
       toast({ title: 'Success', description: 'Activities uploaded successfully.' });
     } catch (err: any) {
       const status = err?.response?.status;
@@ -3338,7 +3772,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     } finally {
       setUploadingActivitiesForEquipment(null);
     }
-  }, [projectId, refreshEquipmentData, toast]);
+  }, [projectId, toast]);
 
   // Download sample activities Excel template (Commencement Date in dd-mm-yyyy)
   const downloadActivitiesTemplate = useCallback(async () => {
@@ -3432,10 +3866,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       sr_no: a.sr_no ?? i + 1,
       activity_name: a.activity_name || '',
       activity_type: a.activity_type === 'milestone' ? 'milestone' : 'regular_update',
+      // Only target_relative is edited in the modal; keep target_date empty so save does not prefer a stale copy over the input field.
       target_relative: a.target_relative || a.target_date || '',
-      target_date: a.target_date || '',
+      target_date: '',
       sort_order: a.sort_order ?? i,
       inspection_tpi_involved: a.inspection_tpi_involved ?? false,
+      progress_weight: a.progress_weight != null ? Number(a.progress_weight) : null,
     })));
     setEditActivitiesModalEquipmentId(equipmentId);
     setEditActivitiesModalOpen(true);
@@ -3447,11 +3883,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     const commencementDate = (equipment as any)?.commencementDate ?? (equipment as any)?.commencement_date ?? null;
     try {
       const isStandalone = projectId === 'standalone';
+      // Do not send commencement_date — this modal never edits it; avoids an extra PATCH on equipment every save.
       const payload = {
-        commencement_date: commencementDate || undefined,
         activities: editActivitiesDraft.map((a, i) => {
-          // If user entered a date directly (target_date or target_relative), use it as-is. Only compute from commencement when it's week/days/month.
-          const explicitDate = parseExplicitTargetDate(a.target_date) ?? parseExplicitTargetDate(a.target_relative);
+          // Prefer target_relative: the modal only binds that field for targets; a duplicate target_date in draft would otherwise win and ignore edits.
+          const explicitDate = parseExplicitTargetDate(a.target_relative) ?? parseExplicitTargetDate(a.target_date);
           const targetDate = explicitDate ?? (commencementDate && a.target_relative ? computeTargetDate(commencementDate, a.target_relative) : (a.target_date || undefined));
           return {
             id: a.id,
@@ -3462,22 +3898,33 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             target_date: targetDate,
             sort_order: i,
             inspection_tpi_involved: a.inspection_tpi_involved ?? false,
+            progress_weight: a.progress_weight ?? null,
           };
         }),
       };
+      const prevActs = equipmentActivities[editActivitiesModalEquipmentId];
+      const hasActivitySnapshot = Array.isArray(prevActs) && prevActs.length > 0;
       const refreshed = isStandalone
-        ? await fastAPI.updateStandaloneEquipmentActivitiesMerge(editActivitiesModalEquipmentId, payload)
-        : await fastAPI.updateEquipmentActivitiesMerge(editActivitiesModalEquipmentId, payload);
+        ? await fastAPI.updateStandaloneEquipmentActivitiesMerge(
+            editActivitiesModalEquipmentId,
+            payload,
+            hasActivitySnapshot ? { previousActivities: prevActs } : undefined
+          )
+        : await fastAPI.updateEquipmentActivitiesMerge(
+            editActivitiesModalEquipmentId,
+            payload,
+            hasActivitySnapshot ? { previousActivities: prevActs } : undefined
+          );
       setEquipmentActivities(prev => ({ ...prev, [editActivitiesModalEquipmentId]: refreshed }));
       setEditActivitiesModalOpen(false);
       setEditActivitiesModalEquipmentId(null);
-      refreshEquipmentData();
+      // Avoid full refreshEquipmentData — merge API already returned activities; commencement unchanged from this modal.
       toast({ title: 'Success', description: 'Activities updated.' });
     } catch (err: any) {
       console.error('Save edit activities error:', err);
       toast({ title: 'Error', description: err?.message || 'Failed to save.', variant: 'destructive' });
     }
-  }, [editActivitiesModalEquipmentId, editActivitiesDraft, projectId, localEquipment, parseExplicitTargetDate, computeTargetDate, refreshEquipmentData, toast]);
+  }, [editActivitiesModalEquipmentId, editActivitiesDraft, projectId, localEquipment, equipmentActivities, parseExplicitTargetDate, computeTargetDate, toast]);
 
   // Export activities report (Excel with variance column)
   const exportActivitiesReport = useCallback(async (equipmentId: string) => {
@@ -3818,14 +4265,31 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       if (stepImageCache[cacheKey] != null || stepImageLoading[cacheKey]) continue;
       toLoad.push({ cacheKey, completionId: displayComp.id, currentIndex });
     }
-    for (const { cacheKey, completionId, currentIndex } of toLoad) {
-      setStepImageLoading(prev => ({ ...prev, [cacheKey]: true }));
-      fastAPI.getEquipmentActivityCompletionImageUrl(completionId, currentIndex, isStandalone)
-        .then((url) => {
-          if (url) setStepImageCache(prev => ({ ...prev, [cacheKey]: url }));
+    if (toLoad.length > 0) {
+      const loadingPatch: Record<string, boolean> = {};
+      for (const item of toLoad) loadingPatch[item.cacheKey] = true;
+      setStepImageLoading(prev => ({ ...prev, ...loadingPatch }));
+
+      fastAPI
+        .getEquipmentActivityCompletionImageUrlBatch(
+          toLoad.map((x) => ({ completionId: x.completionId, index: x.currentIndex })),
+          isStandalone
+        )
+        .then((urlMap) => {
+          if (!urlMap || Object.keys(urlMap).length === 0) return;
+          const cachePatch: Record<string, string> = {};
+          for (const item of toLoad) {
+            const url = urlMap[`${item.completionId}_${item.currentIndex}`];
+            if (url) cachePatch[item.cacheKey] = url;
+          }
+          if (Object.keys(cachePatch).length > 0) {
+            setStepImageCache(prev => ({ ...prev, ...cachePatch }));
+          }
         })
         .finally(() => {
-          setStepImageLoading(prev => ({ ...prev, [cacheKey]: false }));
+          const clearPatch: Record<string, boolean> = {};
+          for (const item of toLoad) clearPatch[item.cacheKey] = false;
+          setStepImageLoading(prev => ({ ...prev, ...clearPatch }));
         });
     }
   }, [localEquipment, equipmentActivities, progressSectionImageIndex, projectId, stepImageCache, stepImageLoading, completionImageCountFallback, getActivitiesProgressSegments]);
@@ -3846,9 +4310,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         toFetch.push({ completionId: comp.id });
       }
     }
-    for (const { completionId } of toFetch) {
-      fastAPI.getEquipmentActivityCompletionImageCount(completionId, isStandalone).then((count) => {
-        setCompletionImageCountFallback((prev) => ({ ...prev, [completionId]: count }));
+    if (toFetch.length > 0) {
+      const ids = toFetch.map((x) => x.completionId);
+      fastAPI.getEquipmentActivityCompletionImageCountBatch(ids, isStandalone).then((countMap) => {
+        if (!countMap || Object.keys(countMap).length === 0) return;
+        setCompletionImageCountFallback((prev) => ({ ...prev, ...countMap }));
       });
     }
   }, [localEquipment, equipmentActivities, projectId, completionImageCountFallback]);
@@ -3945,7 +4411,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             reportUrls.length,
             imageUrls.length
           );
-          if (onActivityUpdate) onActivityUpdate();
+          // Skip onActivityUpdate() here — it duplicated a full GET of equipment_activity_logs right after insert. Activity list refreshes on tab open / navigation.
         } catch (logErr) {
           console.warn('Activity completed log (non-fatal):', logErr);
         }
@@ -3977,39 +4443,92 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             image_description: notes || undefined,
             created_by: currentUserId || undefined,
           };
-          if (isStandalone) {
-            await fastAPI.createStandaloneProgressEntry(entryData);
-          } else {
-            await fastAPI.createProgressEntry(entryData);
-          }
+          const createdRaw = isStandalone
+            ? await fastAPI.createStandaloneProgressEntry(entryData)
+            : await fastAPI.createProgressEntry(entryData);
+          const row = Array.isArray(createdRaw) ? createdRaw[0] : createdRaw;
+          const uName = currentUserFullName || currentUserId || 'Unknown';
+          const newEntry: any = row?.id
+            ? {
+                id: row.id,
+                type: row.entry_type || 'general',
+                comment: row.entry_text,
+                entry_text: row.entry_text,
+                image: row.image_url,
+                image_url: row.image_url,
+                imageDescription: row.image_description,
+                image_description: row.image_description,
+                uploadDate: row.created_at,
+                created_at: row.created_at,
+                created_by_user: { full_name: uName, email: (user as any)?.email || '' },
+              }
+            : {
+                id: `progress-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+                type: 'general',
+                comment: descText,
+                entry_text: descText,
+                image: firstImageUrl,
+                image_url: firstImageUrl,
+                imageDescription: notes,
+                image_description: notes,
+                uploadDate: new Date().toISOString(),
+                created_at: new Date().toISOString(),
+                created_by_user: { full_name: uName, email: (user as any)?.email || '' },
+              };
+          setLocalEquipment(prev =>
+            prev.map(eq =>
+              eq.id === equipmentId
+                ? { ...eq, progressEntries: [newEntry, ...(eq.progressEntries || [])] }
+                : eq
+            )
+          );
         } else {
           // Only add a progress image row when user actually uploaded an image; otherwise keep showing the previous latest image (no blank white)
           if (firstImageUrl && imageUrls.length > 0) {
-          const imageData = {
-            equipment_id: equipmentId,
+            const imageData = {
+              equipment_id: equipmentId,
               image_url: firstImageUrl,
-            description: descText,
-            uploaded_by: currentUserFullName || completedByDisplayName || currentUserId || undefined,
-          };
-          if (isStandalone) {
-            await fastAPI.createStandaloneProgressImage(imageData);
-          } else {
-            await fastAPI.createProgressImage(imageData);
-            }
+              description: descText,
+              uploaded_by: currentUserFullName || completedByDisplayName || currentUserId || undefined,
+            };
+            await (isStandalone
+              ? fastAPI.createStandaloneProgressImage(imageData)
+              : fastAPI.createProgressImage(imageData));
+            setLocalEquipment(prev =>
+              prev.map(eq => (eq.id === equipmentId ? { ...eq, progressImages: [firstImageUrl] } : eq))
+            );
           }
         }
       } catch (feedErr: any) {
         console.warn('Auto-feed to Updates/Progress Image (non-fatal):', feedErr);
         toast({ title: 'Note', description: 'Activity marked complete, but the image could not be saved. You can add it again from the Progress Image section.', variant: 'destructive' });
       }
-      const refreshed = isStandalone
-        ? await fastAPI.getStandaloneEquipmentActivities(equipmentId)
-        : await fastAPI.getEquipmentActivities(equipmentId);
-      setEquipmentActivities(prev => ({ ...prev, [equipmentId]: refreshed }));
+      // Local activity + progress state updated below; avoid full refreshEquipmentData (was duplicating project equipment + progress-image batch fetches).
+      const completionPatch = {
+        id: completionId || undefined,
+        completed_on: completedOn,
+        completed_by_user_id: completedByUserId || null,
+        completed_by_display_name: completedByDisplayName || null,
+        notes: notes || null,
+        department,
+        image_url: firstImageUrl || null,
+        image_count: imageUrls.length,
+        inspection_report_count: reportUrls.length,
+      };
+      let patchedActivities: any[] = [];
+      setEquipmentActivities(prev => {
+        const current = Array.isArray(prev[equipmentId]) ? prev[equipmentId] : [];
+        patchedActivities = current.map((a: any) => (
+          a?.id === activityId
+            ? { ...a, completion: completionPatch }
+            : a
+        ));
+        return { ...prev, [equipmentId]: patchedActivities };
+      });
       // Update equipment progress: fixed weight (if step has progress_weight) or manual %
       const progressWeight = markCompleteModalData.progressWeight;
       const newProgress = progressWeight != null
-        ? Math.min(100, (refreshed as any[]).filter((a: any) => a.completion && a.progress_weight != null).reduce((sum: number, a: any) => sum + (Number(a.progress_weight) || 0), 0))
+        ? Math.min(100, (patchedActivities as any[]).filter((a: any) => a.completion && a.progress_weight != null).reduce((sum: number, a: any) => sum + (Number(a.progress_weight) || 0), 0))
         : pct;
       if (newProgress !== currentProgress) {
         try {
@@ -4026,8 +4545,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       }
       setMarkCompleteModalOpen(false);
       setMarkCompleteModalData({ activityId: '', activityName: '', activityType: 'regular_update', equipmentId: '', completedOn: '', completedByUserId: '', completedByDisplayName: '', completedBySelectValue: '', department: '', notes: '', imageFiles: [], reportFiles: [], percentageCompleted: 0, currentProgress: 0, progressWeight: null });
-      // Immediate refresh so new progress image / progress entry shows in UI right away
-      await refreshEquipmentData(true);
       toast({ title: 'Success', description: 'Activity marked complete.' });
     } catch (err: any) {
       console.error('Mark complete error:', err);
@@ -4035,7 +4552,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     } finally {
       setMarkCompleteSubmitting(false);
     }
-  }, [markCompleteModalData, projectId, user?.id, refreshEquipmentData, toast]);
+  }, [markCompleteModalData, projectId, user?.id, user, toast]);
 
   const addProgressEntry = async (equipmentId: string) => {
     if (!newProgressEntry?.trim()) {
@@ -5063,6 +5580,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       const user = userData;
 
       // Upload files to storage and database
+      let anyUploaded = false;
       for (const file of files) {
         try {
           // // console.log('🚀 MANUAL: Processing file:', file.name);
@@ -5123,15 +5641,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 docId
               );
               // // console.log('✅ Activity logged: Document uploaded');
-              
-              // Refresh activity logs if callback provided
-              if (onActivityUpdate) {
-                onActivityUpdate();
-              }
             } catch (logError) {
               console.error('⚠️ Error logging document activity (non-fatal):', logError);
             }
           }
+
+          anyUploaded = true;
 
           // Immediately update local state with new document
           const newDocument = {
@@ -5156,12 +5671,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
           // // console.log('🚀 MANUAL: Local state updated with new document');
 
-          // Force immediate UI refresh
-          setTimeout(() => {
-            // // console.log('🚀 MANUAL: Immediate UI refresh...');
-            setDocuments(prev => ({ ...prev }));
-          }, 50);
-
         } catch (fileError: any) {
           console.error(`❌ MANUAL: Error uploading document ${file.name}:`, fileError);
           console.error(`❌ MANUAL: Error details:`, {
@@ -5173,27 +5682,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         }
       }
 
-      // Force reload documents from database
-      try {
-        // // console.log('🚀 MANUAL: Force reloading documents...');
-        await fetchEquipmentDocuments(equipmentId);
-        // // console.log('🚀 MANUAL: Documents reloaded successfully');
-
-        // Force UI refresh multiple times
-        setTimeout(() => {
-          // // console.log('🚀 MANUAL: Forcing UI refresh with timeout...');
-          setDocuments(prev => ({ ...prev }));
-          // // console.log('🚀 MANUAL: UI refresh triggered');
-        }, 100);
-
-        setTimeout(() => {
-          // console.log('🚀 MANUAL: Second UI refresh...');
-          setDocuments(prev => ({ ...prev }));
-          // console.log('🚀 MANUAL: Second UI refresh triggered');
-        }, 500);
-
-      } catch (reloadError) {
-        console.error('❌ MANUAL: Error reloading documents:', reloadError);
+      // One activity-log refresh for the whole batch (was per file — duplicated parent fetches)
+      if (anyUploaded && onActivityUpdate) {
+        onActivityUpdate();
       }
 
       toast({ title: 'Success', description: 'MANUAL: Documents uploaded successfully!' });
@@ -5472,6 +5963,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       const createdEquipmentIds: string[] = [];
       const uploadErrors: string[] = [];
       const teamErrors: string[] = [];
+      const pendingDocumentsByEquipment: Record<string, any[]> = {};
 
       // 🔧 FIX: Validate that equipmentDetails exists and has equipment
       if (!equipmentDetails || Object.keys(equipmentDetails).length === 0) {
@@ -5595,7 +6087,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       equipmentType: 'Equipment Document'
                     };
                     
-                    await uploadStandaloneEquipmentDocument(equipmentId, documentData);
+                    pendingDocumentsByEquipment[equipmentId] = [
+                      ...(pendingDocumentsByEquipment[equipmentId] || []),
+                      documentData
+                    ];
                     // console.log(`✅ Equipment document ${i + 1} uploaded successfully: ${file.name}`);
                 } catch (docError: any) {
                   console.error(`❌ Error uploading equipment document ${i + 1} (${file.name}):`, docError);
@@ -5639,7 +6134,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 equipmentType: documentType
               };
               
-              await uploadStandaloneEquipmentDocument(equipmentId, documentData);
+              pendingDocumentsByEquipment[equipmentId] = [
+                ...(pendingDocumentsByEquipment[equipmentId] || []),
+                documentData
+              ];
               // console.log(`✅ ${documentType} uploaded successfully for equipment ${equipmentId}: ${file.name}`);
               return true;
           } catch (error: any) {
@@ -5683,16 +6181,46 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         }
       }
 
+      // Persist all uploaded document metadata in bulk per equipment (reduces many POST calls).
+      for (const equipmentId of Object.keys(pendingDocumentsByEquipment)) {
+        const docs = pendingDocumentsByEquipment[equipmentId] || [];
+        if (!docs.length) continue;
+        try {
+          await uploadStandaloneEquipmentDocumentsBulk(equipmentId, docs);
+        } catch (bulkDocError: any) {
+          console.error(`❌ Error bulk saving docs for equipment ${equipmentId}:`, bulkDocError);
+          uploadErrors.push(`Failed to save document metadata for equipment ${equipmentId}`);
+        }
+      }
+
+      // Cache firm members once per submit to avoid repeated network calls.
+      const getFirmMembersOnce = (() => {
+        let cache: any[] | null = null;
+        return async () => {
+          if (cache) return cache;
+          const firmId = localStorage.getItem('firmId');
+          if (!firmId) {
+            cache = [];
+            return cache;
+          }
+          try {
+            cache = await fastAPI.getAllFirmTeamMembers(firmId);
+          } catch {
+            cache = [];
+          }
+          return cache;
+        };
+      })();
+
       // Resolve Equipment Manager email from contacts, firm team, or standalone_equipment_team_positions (never use @company.com)
       const resolveEquipmentManagerEmail = async (name: string): Promise<{ email: string | null; phone: string }> => {
         const contact = equipmentManagerContacts?.[name];
         let phone = contact?.phone || '';
         if (contact?.email && contact.email.includes('@') && !contact.email.toLowerCase().includes('@company')) return { email: contact.email, phone };
         if (name.includes('@')) return { email: name, phone };
-        const firmId = localStorage.getItem('firmId');
-        if (firmId) {
+        const members = await getFirmMembersOnce();
+        if (members.length > 0) {
           try {
-            const members = await fastAPI.getAllFirmTeamMembers(firmId);
             const member = (members || []).find((m: any) => m.name === name && (m.role === 'project_manager' || m.access_level === 'project_manager'));
             if (member?.email && member.email.includes('@') && !member.email.toLowerCase().includes('@company')) {
               return { email: member.email, phone: member?.phone || phone };
@@ -5723,16 +6251,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           let equipmentManagerRole: 'editor' | 'viewer' = 'editor';
           if (equipmentManagerContacts?.[equipmentManagerName]?.role === 'project_manager') equipmentManagerRole = 'editor';
           try {
-            const firmId = localStorage.getItem('firmId');
-            if (firmId) {
-              const allMembers = await fastAPI.getAllFirmTeamMembers(firmId);
-              const existingMember = allMembers.find((m: any) => m.email?.toLowerCase() === equipmentManagerEmail.toLowerCase());
-              if (existingMember) {
-                if (existingMember.role === 'project_manager' || existingMember.access_level === 'project_manager') equipmentManagerRole = 'editor';
-                else if (existingMember.role === 'vdcr_manager' || existingMember.access_level === 'vdcr_manager') equipmentManagerRole = 'editor';
-                else if (existingMember.role === 'editor' || existingMember.access_level === 'editor') equipmentManagerRole = 'editor';
-                else equipmentManagerRole = 'viewer';
-              }
+            const allMembers = await getFirmMembersOnce();
+            const existingMember = allMembers.find((m: any) => m.email?.toLowerCase() === equipmentManagerEmail.toLowerCase());
+            if (existingMember) {
+              if (existingMember.role === 'project_manager' || existingMember.access_level === 'project_manager') equipmentManagerRole = 'editor';
+              else if (existingMember.role === 'vdcr_manager' || existingMember.access_level === 'vdcr_manager') equipmentManagerRole = 'editor';
+              else if (existingMember.role === 'editor' || existingMember.access_level === 'editor') equipmentManagerRole = 'editor';
+              else equipmentManagerRole = 'viewer';
             }
           } catch (error) {
             console.error('Error fetching user role (non-fatal):', error);
@@ -5773,15 +6298,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             let finalRole = actualRole;
             if (equipmentManagerEmail) {
               try {
-                const firmId = localStorage.getItem('firmId');
-                if (firmId) {
-                  const allMembers = await fastAPI.getAllFirmTeamMembers(firmId);
-                  const existingMember = allMembers.find((m: any) => 
-                    m.email?.toLowerCase() === equipmentManagerEmail.toLowerCase()
-                  );
-                  if (existingMember) {
-                    finalRole = existingMember.role || existingMember.access_level || actualRole;
-                  }
+                const allMembers = await getFirmMembersOnce();
+                const existingMember = allMembers.find((m: any) =>
+                  m.email?.toLowerCase() === equipmentManagerEmail.toLowerCase()
+                );
+                if (existingMember) {
+                  finalRole = existingMember.role || existingMember.access_level || actualRole;
                 }
               } catch (error) {
                 console.error('Error fetching user role (non-fatal):', error);
@@ -5810,69 +6332,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             }));
           }
           
-          // Update allEquipmentTeamMembers for ALL newly created equipment (for equipment card team tab)
-          // This ensures team members show up in the equipment card even if not viewing that equipment
-          for (const equipmentId of createdEquipmentIds) {
-            if (allEquipmentTeamMembers[equipmentId] && allEquipmentTeamMembers[equipmentId].length > 0) {
-              // console.log('✅ Team members already in state for equipment:', equipmentId);
-            } else {
-              // Fetch team members for this equipment to populate allEquipmentTeamMembers
-              try {
-                // console.log('🔄 Fetching team members for equipment card:', equipmentId);
-                const { DatabaseService } = await import('@/lib/database');
-                const teamData = await DatabaseService.getStandaloneTeamPositions(equipmentId);
-                
-                if (teamData && teamData.length > 0) {
-                  // 🆕 Fetch actual user roles from company
-                  let userRolesMap: Record<string, string> = {};
-                  try {
-                    const firmId = localStorage.getItem('firmId');
-                    if (firmId) {
-                      const allMembers = await fastAPI.getAllFirmTeamMembers(firmId);
-                      allMembers.forEach((m: any) => {
-                        if (m.email) {
-                          userRolesMap[m.email.toLowerCase()] = m.role || m.access_level || 'viewer';
-                        }
-                      });
-                    }
-                  } catch (error) {
-                    console.error('Error fetching user roles (non-fatal):', error);
-                  }
-                  
-                  const transformedMembers = (teamData as any[]).map((member, index) => {
-                    // 🆕 Get actual role from user record if available
-                    const memberEmail = (member.email || '').toLowerCase();
-                    const actualRole = userRolesMap[memberEmail] || member.role || 'viewer';
-                    
-                    return {
-                      id: member.id || `member-${index}`,
-                      name: member.person_name || 'Unknown',
-                      email: member.email || '',
-                      phone: member.phone || '',
-                      position: member.position_name || '', // Position is dynamic
-                      role: actualRole, // Role is from user record
-                      permissions: getPermissionsByRole(actualRole),
-                      status: 'active',
-                      avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
-                      lastActive: 'Unknown',
-                      equipmentAssignments: [equipmentId],
-                      dataAccess: getDataAccessByRole(actualRole),
-                      accessLevel: actualRole
-                    };
-                  });
-                  
-                  setAllEquipmentTeamMembers(prev => ({
-                    ...prev,
-                    [equipmentId]: transformedMembers
-                  }));
-                  // console.log('✅ Team members added to allEquipmentTeamMembers for equipment:', equipmentId);
-                }
-              } catch (fetchError) {
-                console.error('❌ Error fetching team members for equipment card (non-fatal):', fetchError);
-              }
-            }
-          }
-          
           // If we're viewing one of the newly created equipment, refresh team members for settings tab
           if (viewingEquipmentId && createdEquipmentIds.includes(viewingEquipmentId)) {
             try {
@@ -5899,89 +6358,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         }
       }
 
-      // Refresh equipment data - CRITICAL: Must complete to show new equipment on frontend
-      // Add a small delay to ensure database transaction is committed
-      // console.log('⏳ Waiting 500ms for database transaction to commit...');
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      try {
-        // console.log('🔄 Refreshing equipment data to show new equipment on frontend...');
-        // 🔧 FIX: Add timeout to prevent hanging on refresh
-        const refreshPromise = refreshEquipmentData();
-        const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Refresh timeout')), 10000) // 10 second timeout
-        );
-        
-        await Promise.race([refreshPromise, timeoutPromise]).catch((error) => {
-          if (error.message !== 'Refresh timeout') throw error;
-          console.warn('⚠️ Equipment refresh timed out, but equipment was created successfully');
-        });
-        // console.log('✅ Equipment data refreshed - new equipment should now be visible');
-        
-        // After equipment data is refreshed, fetch team members for all newly created equipment
-        // This ensures team members show up in equipment cards and settings tab
-        if (createdEquipmentIds.length > 0) {
-          // console.log('🔄 Fetching team members for all newly created equipment...');
-          for (const equipmentId of createdEquipmentIds) {
-            try {
-              const { DatabaseService } = await import('@/lib/database');
-              const teamData = await DatabaseService.getStandaloneTeamPositions(equipmentId);
-              
-              if (teamData && teamData.length > 0) {
-                const transformedMembers = (teamData as any[]).map((member, index) => ({
-                  id: member.id || `member-${index}`,
-                  name: member.person_name || 'Unknown',
-                  email: member.email || '',
-                  phone: member.phone || '',
-                  position: member.position_name || '',
-                  role: member.role || 'viewer',
-                  permissions: getPermissionsByRole(member.role || 'viewer'),
-                  status: 'active',
-                  avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
-                  lastActive: 'Unknown',
-                  equipmentAssignments: [equipmentId],
-                  dataAccess: getDataAccessByRole(member.role || 'viewer'),
-                  accessLevel: member.role || 'viewer'
-                }));
-                
-                setAllEquipmentTeamMembers(prev => ({
-                  ...prev,
-                  [equipmentId]: transformedMembers
-                }));
-                // console.log('✅ Team members fetched and added to state for equipment:', equipmentId);
-                
-                // If we're viewing this equipment, also update teamMembers for settings tab
-                if (viewingEquipmentId === equipmentId) {
-                  setTeamMembers(transformedMembers);
-                  setTeamMembersLoading(false);
-                  // console.log('✅ Team members updated for settings tab');
-                }
-              }
-            } catch (teamFetchError) {
-              console.error('❌ Error fetching team members for equipment', equipmentId, '(non-fatal):', teamFetchError);
-            }
-          }
-        }
-        
-        // Force a re-render by updating state again (in case React didn't detect the change)
-        // console.log('🔄 Forcing UI update...');
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-      } catch (refreshError) {
-        console.error('❌ Error refreshing equipment data:', refreshError);
-        // Try one more time after a longer delay
-        try {
-          // console.log('🔄 Retrying equipment data refresh after 2 seconds...');
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
-          await refreshEquipmentData();
-          // console.log('✅ Equipment data refreshed on retry');
-        } catch (retryError) {
-          console.error('❌ Retry also failed, but equipment was created successfully:', retryError);
-          console.error('⚠️ You may need to manually refresh the page to see the new equipment');
-          // Don't throw - equipment was created successfully, just refresh failed
-        }
-      }
-
       // 🆕 Send email invitation to Equipment Manager (only for standalone equipment)
       // 🔧 FIX: Wrap in try-catch and add timeout to prevent hanging
       try {
@@ -5989,42 +6365,49 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           const equipmentManagerName = baseFormData.equipmentManager;
           const { email: equipmentManagerEmail } = await resolveEquipmentManagerEmail(equipmentManagerName);
           if (equipmentManagerEmail) {
+            const firmMembers = await getFirmMembersOnce();
+            const existingFirmMember = (firmMembers || []).find(
+              (m: any) => m.email?.toLowerCase() === equipmentManagerEmail.toLowerCase()
+            );
             const firmId = localStorage.getItem('firmId');
             const currentUserId = user?.id || localStorage.getItem('userId');
             const companyName = localStorage.getItem('companyName') || 'Your Company';
             const equipmentName = createdEquipmentIds.length > 0 ? `Equipment ${createdEquipmentIds[0]}` : (baseFormData.equipmentType || 'Standalone Equipment');
-            try {
-              const emailPromise = sendProjectTeamEmailNotification({
-                project_name: equipmentName,
-                team_member_name: equipmentManagerName,
-                team_member_email: equipmentManagerEmail,
-                role: 'Equipment Manager',
-                company_name: companyName,
-                dashboard_url: getDashboardUrl('editor'),
-                equipment_name: equipmentName
-              });
-              const emailTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Email timeout')), 5000));
-              await Promise.race([emailPromise, emailTimeout]).catch(() => ({ success: false, message: 'Timeout' }));
-            } catch (emailError) {
-              console.error('❌ Error sending email invitation (non-fatal):', emailError);
-            }
-            if (firmId) {
+            // Skip invitation email/invite for existing firm members to avoid redundant requests.
+            if (!existingFirmMember) {
               try {
-                const invitePromise = fastAPI.createInvite({
-                  email: equipmentManagerEmail,
-                  full_name: equipmentManagerName,
-                  role: 'project_manager',
-                  firm_id: firmId,
-                  project_id: null,
-                  invited_by: currentUserId || 'system'
+                const emailPromise = sendProjectTeamEmailNotification({
+                  project_name: equipmentName,
+                  team_member_name: equipmentManagerName,
+                  team_member_email: equipmentManagerEmail,
+                  role: 'Equipment Manager',
+                  company_name: companyName,
+                  dashboard_url: getDashboardUrl('editor'),
+                  equipment_name: equipmentName
                 });
-                const inviteTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Invite timeout')), 5000));
-                await Promise.race([invitePromise, inviteTimeout]).catch((error) => {
-                  if (error.message !== 'Invite timeout') throw error;
-                  console.warn('⚠️ Invite creation timed out (non-fatal)');
-                });
-              } catch (inviteError) {
-                console.error('❌ Error creating invite (equipment still created):', inviteError);
+                const emailTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Email timeout')), 5000));
+                await Promise.race([emailPromise, emailTimeout]).catch(() => ({ success: false, message: 'Timeout' }));
+              } catch (emailError) {
+                console.error('❌ Error sending email invitation (non-fatal):', emailError);
+              }
+              if (firmId) {
+                try {
+                  const invitePromise = fastAPI.createInvite({
+                    email: equipmentManagerEmail,
+                    full_name: equipmentManagerName,
+                    role: 'project_manager',
+                    firm_id: firmId,
+                    project_id: null,
+                    invited_by: currentUserId || 'system'
+                  });
+                  const inviteTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Invite timeout')), 5000));
+                  await Promise.race([invitePromise, inviteTimeout]).catch((error) => {
+                    if (error.message !== 'Invite timeout') throw error;
+                    console.warn('⚠️ Invite creation timed out (non-fatal)');
+                  });
+                } catch (inviteError) {
+                  console.error('❌ Error creating invite (equipment still created):', inviteError);
+                }
               }
             }
           } else {
@@ -6037,14 +6420,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       
       // console.log('✅ All operations completed');
       
-      // Refresh the equipment list so the new equipment appears, then load documents for each
-      // new equipment so the Docs tab shows Step 1 uploads (standalone only; project flow untouched)
+      // Refresh once after submit. Avoid per-equipment document fetches to prevent API burst.
       if (projectId === 'standalone' && createdEquipmentIds.length > 0) {
         try {
-          await refreshEquipmentData(true);
-          for (const equipmentId of createdEquipmentIds) {
-            await fetchEquipmentDocuments(equipmentId);
-          }
+          await refreshEquipmentData(true, { skipDocuments: true });
         } catch (refreshErr) {
           console.warn('⚠️ Post-create refresh failed (non-fatal):', refreshErr);
         }
@@ -6184,8 +6563,55 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         : await fastAPI.createEquipment(equipmentData);
       // // console.log('✅ Equipment created successfully:', createdEquipment);
 
-      // Refresh equipment data from database to ensure consistency
-      await refreshEquipmentData();
+      // Merge created row into grid + cache instead of full refreshEquipmentData (avoids project-wide GET + per-equipment docs + progress-image batch).
+      const rawRow = Array.isArray(createdEquipment) ? createdEquipment[0] : createdEquipment;
+      let mergedIntoGrid = false;
+      if (rawRow?.id) {
+        try {
+          const transformed = transformEquipmentDataCallback([rawRow]);
+          let item = transformed[0];
+          if (item) {
+            item = expandProgressImagesForOnDemand([item])[0];
+            setLocalEquipment((prev) => {
+              if (prev.some((e) => e.id === item.id)) {
+                return prev.map((e) => (e.id === item.id ? { ...e, ...item } : e));
+              }
+              return [...prev, item];
+            });
+            setCustomFields((prev) => ({ ...prev, [item.id]: item.customFields || [] }));
+            setTechnicalSections((prev) => ({ ...prev, [item.id]: item.technicalSections || [] }));
+            setTeamCustomFields((prev) => ({ ...prev, [item.id]: item.teamCustomFields || [] }));
+            const ts = item.technicalSections;
+            if (ts && ts.length > 0) {
+              setSelectedSection((prev) => ({ ...prev, [item.id]: ts[0].name }));
+            }
+            // New row has no activities or production checklist yet; seed so lazy-load effects do not fire batch fetches for this id.
+            setEquipmentActivities((prev) => ({ ...prev, [item.id]: [] }));
+            setProductionChecklistByEquipment((prev) => ({ ...prev, [item.id]: [] }));
+            const cacheKey =
+              projectId === 'standalone'
+                ? `${CACHE_KEYS.EQUIPMENT}_standalone`
+                : `${CACHE_KEYS.EQUIPMENT}_${projectId}`;
+            const cached = getCache<any[]>(cacheKey);
+            if (cached !== null && Array.isArray(cached)) {
+              const exists = cached.some((r: any) => r.id === rawRow.id);
+              const nextCache = exists
+                ? cached.map((r: any) => (r.id === rawRow.id ? { ...r, ...rawRow } : r))
+                : [...cached, rawRow];
+              setCache(cacheKey, nextCache, {
+                ttl: 24 * 60 * 60 * 1000,
+                maxSize: 4 * 1024 * 1024,
+              });
+            }
+            mergedIntoGrid = true;
+          }
+        } catch (mergeErr) {
+          console.warn('Incremental equipment merge failed, falling back to refresh:', mergeErr);
+        }
+      }
+      if (!mergedIntoGrid) {
+        await refreshEquipmentData(true, { skipDocuments: true });
+      }
 
       setShowAddEquipmentForm(false);
 
@@ -9290,7 +9716,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ))}
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 p-4 border-t">
-              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length, inspection_tpi_involved: false }])}>
+              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length, inspection_tpi_involved: false, progress_weight: null }])}>
                 <Plus size={14} className="mr-1" />
                 Add activity
               </Button>
@@ -9937,7 +10363,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                             <div className="text-xs sm:text-sm font-semibold text-gray-900 truncate">{stageLabel || '—'}</div>
                             {stageDate && (
                               <div className="text-[9px] sm:text-[10px] text-gray-600 mt-0.5">
-                                {isComplete ? `Completed ${stageDate}` : `Target ${stageDate}`}
+                                {isComplete ? (
+                                  <>
+                                    <span className="font-semibold">Target date of completion</span> {stageDate}
+                                  </>
+                                ) : `Target ${stageDate}`}
                                     </div>
                                   )}
                                 </div>
@@ -11208,13 +11638,22 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         </div>
       )}
 
-      {/* Inspection report PDF preview modal */}
+      {/* Inspection report PDF preview modal — PDF.js canvas (iframe often blank for storage URLs) */}
       {inspectionReportPreview && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[110]" onClick={() => setInspectionReportPreview(null)}>
           <div className="bg-white rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-gray-800">{inspectionReportPreview.fileName}</h3>
-              <div className="flex items-center gap-2">
+            <div className="flex items-center justify-between mb-4 gap-2 flex-wrap">
+              <h3 className="text-lg font-semibold text-gray-800 truncate min-w-0 flex-1">{inspectionReportPreview.fileName}</h3>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => window.open(inspectionReportPreview.reportUrl, '_blank', 'noopener,noreferrer')}
+                  className="text-gray-700"
+                >
+                  Open in new tab
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -11226,7 +11665,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     a.click();
                     document.body.removeChild(a);
                   }}
-                  className="bg-green-600 hover:bg-green-700 text-white"
+                  className="bg-green-600 hover:bg-green-700 text-white border-0"
                 >
                   <Download size={16} className="mr-2" />
                   Download
@@ -11236,12 +11675,46 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 </Button>
               </div>
             </div>
-            <div className="border border-gray-200 rounded-lg overflow-hidden bg-gray-100">
-              <iframe
-                src={inspectionReportPreview.reportUrl}
-                title={inspectionReportPreview.fileName}
-                className="w-full h-[70vh] min-h-[400px]"
-              />
+            {inspectionReportPdfTotalPages > 1 && !inspectionReportPdfLoading && !inspectionReportPdfError && (
+              <div className="flex items-center justify-center gap-3 mb-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={inspectionReportPdfPage <= 1}
+                  onClick={() => setInspectionReportPdfPage((p) => Math.max(1, p - 1))}
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </Button>
+                <span className="text-sm text-gray-600 tabular-nums">
+                  Page {inspectionReportPdfPage} / {inspectionReportPdfTotalPages}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={inspectionReportPdfPage >= inspectionReportPdfTotalPages}
+                  onClick={() => setInspectionReportPdfPage((p) => Math.min(inspectionReportPdfTotalPages, p + 1))}
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </Button>
+              </div>
+            )}
+            <div className="border border-gray-200 rounded-lg overflow-auto bg-gray-100 flex flex-col items-center justify-center min-h-[400px] max-h-[70vh]">
+              {inspectionReportPdfLoading && (
+                <div className="flex flex-col items-center gap-2 py-16 text-gray-600">
+                  <Loader2 className="w-8 h-8 animate-spin text-indigo-600" />
+                  <span className="text-sm">Loading PDF…</span>
+                </div>
+              )}
+              {!inspectionReportPdfLoading && inspectionReportPdfError && (
+                <div className="p-8 text-center text-sm text-gray-700 max-w-md">
+                  {inspectionReportPdfError}
+                </div>
+              )}
+              {!inspectionReportPdfLoading && !inspectionReportPdfError && inspectionReportPdfDoc && (
+                <canvas id="inspection-report-pdf-canvas" className="max-w-full h-auto block" />
+              )}
             </div>
           </div>
         </div>
@@ -11304,13 +11777,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           currentUserId={user?.id ?? null}
           currentUserDisplayName={(localStorage.getItem('userName') || (user as any)?.full_name || user?.email) ?? null}
           onClose={() => setClientsDocsChecklistModal(null)}
-          onRefresh={async () => {
+          onRefresh={async (prefetchedTasks) => {
             const id = clientsDocsChecklistModal.equipmentId;
-            const list = projectId === 'standalone'
-              ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(id)
-              : await fastAPI.getEquipmentProductionChecklistTasks(id);
-            setProductionChecklistByEquipment(prev => ({ ...prev, [id]: list }));
-            await refreshEquipmentData(true);
+            const list =
+              prefetchedTasks ??
+              (projectId === 'standalone'
+                ? await fastAPI.getStandaloneEquipmentProductionChecklistTasks(id)
+                : await fastAPI.getEquipmentProductionChecklistTasks(id));
+            setProductionChecklistByEquipment((prev) => ({ ...prev, [id]: list }));
           }}
         />
       )}
@@ -12079,16 +12553,17 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       {(() => {
                       const dayMs = 24 * 60 * 60 * 1000;
                       const resolveTarget = (a: any): string | null => {
-                        const explicit = parseExplicitTargetDate(a.target_date) ?? parseExplicitTargetDate(a.target_relative);
+                        const explicit = parseExplicitTargetDate(a.target_relative) ?? parseExplicitTargetDate(a.target_date);
                         return explicit ?? (commencementRaw && a.target_relative ? computeTargetDate(commencementRaw, a.target_relative) : a.target_date || null);
                       };
                       const resolvedTargetDates = list.map((a: any) => resolveTarget(a));
                       return list.map((activity: any, idx: number) => {
                       const isCompleted = !!activity.completion;
                       const isCurrent = !isCompleted && list.slice(0, idx).every((a: any) => !!a.completion);
+                      const myTarget = resolvedTargetDates[idx];
                       const rawDate = isCompleted && activity.completion?.completed_on
                         ? activity.completion.completed_on
-                        : activity.target_date || activity.target_relative;
+                        : (myTarget || activity.target_date || activity.target_relative);
                       const dateStr = rawDate && rawDate !== activity.target_relative
                         ? (() => {
                             try {
@@ -12097,11 +12572,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                             } catch { return rawDate; }
                           })()
                         : (rawDate || '—');
-                      const daysVariance = activity.completion?.completed_on && activity.target_date
+                      const effectiveTargetForVariance = activity.target_date || myTarget;
+                      const daysVariance = activity.completion?.completed_on && effectiveTargetForVariance
                         ? (() => {
                             try {
                               const completed = new Date(activity.completion.completed_on);
-                              const target = new Date(activity.target_date);
+                              const target = new Date(effectiveTargetForVariance);
                               if (isNaN(completed.getTime()) || isNaN(target.getTime())) return null;
                               const diffMs = completed.getTime() - target.getTime();
                               return Math.round(diffMs / (24 * 60 * 60 * 1000));
@@ -12115,7 +12591,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                             ? `${Math.abs(daysVariance)} days early`
                             : `${daysVariance} days late`
                         : null;
-                      const myTarget = resolvedTargetDates[idx];
                       let predIdx: number | null = null;
                       if (myTarget) {
                         const myMs = new Date(myTarget).getTime();
@@ -12159,14 +12634,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                             return { label: 'On time', className: 'bg-gray-500 text-white' };
                           })()
                         : null;
-                      const targetDateStr = activity.target_date
+                      const targetDateStr = myTarget
                         ? (() => {
                             try {
-                              const d = new Date(activity.target_date);
-                              return isNaN(d.getTime()) ? activity.target_date : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                            } catch { return activity.target_date; }
+                              const d = new Date(myTarget);
+                              return isNaN(d.getTime()) ? myTarget : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                            } catch { return myTarget; }
                           })()
-                        : (activity.target_relative || '—');
+                        : (activity.target_relative || activity.target_date || '—');
                       const completedOnStr = activity.completion?.completed_on
                         ? (() => {
                             try {
@@ -13042,7 +13517,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ))}
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 p-4 border-t">
-              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length, inspection_tpi_involved: false }])}>
+              <Button type="button" size="sm" variant="outline" className="text-indigo-600 border-indigo-200" onClick={() => setEditActivitiesDraft(prev => [...prev, { id: `new-${Date.now()}`, sr_no: prev.length + 1, activity_name: '', activity_type: 'regular_update' as const, target_relative: '', target_date: '', sort_order: prev.length, inspection_tpi_involved: false, progress_weight: null }])}>
                 <Plus size={14} className="mr-1" />
                 Add activity
               </Button>

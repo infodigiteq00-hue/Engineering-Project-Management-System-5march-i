@@ -423,7 +423,13 @@ const UnifiedProjectView = ({
   }, [projectId, activeTab, projectData?.id]);
 
   useEffect(() => {
-    if (!projectId || activeTab !== 'vdcr') return;
+    if (!projectId) return;
+    // Avoid duplicate VDCR requests on Documentation tab:
+    // ProjectsVDCR already fetches its own data when activeTab === 'vdcr'.
+    const shouldLoadParentVdcrData =
+      activeTab === 'vdcr-overview' ||
+      activeTab === 'progress-logs';
+    if (!shouldLoadParentVdcrData) return;
     if (vdcrLoadedForProjectRef.current === projectId) return;
     loadVDCRData();
   }, [projectId, activeTab, projectData?.id]);
@@ -535,6 +541,7 @@ const UnifiedProjectView = ({
   const [isLoadingExistingMembers, setIsLoadingExistingMembers] = useState(false);
   const [selectedExistingMemberEmail, setSelectedExistingMemberEmail] = useState<string>("");
   const [isExistingMemberMode, setIsExistingMemberMode] = useState(false);
+  const [bulkMemberUploading, setBulkMemberUploading] = useState(false);
 
   // Available permissions list
   const availablePermissions = [
@@ -556,6 +563,14 @@ const UnifiedProjectView = ({
       'viewer': 'Viewer'
     };
     return roleMap[dbRole] || dbRole;
+  };
+
+  const addCustomMemberDepartment = () => {
+    const value = addMemberNewDepartmentInput.trim();
+    if (!value) return;
+    setAddMemberAvailableDepartments((prev) => Array.from(new Set([...prev, value])).sort());
+    setNewMember((prev) => ({ ...prev, department: value }));
+    setAddMemberNewDepartmentInput('');
   };
 
   // Handle existing member selection
@@ -651,8 +666,10 @@ const UnifiedProjectView = ({
   useEffect(() => {
     if (!showAddMember && !showEditMember) return;
     setAddMemberNewDepartmentInput('');
-    if (projectId && projectId !== 'standalone') {
-      fastAPI.getProjectDepartments(projectId).then(setAddMemberAvailableDepartments);
+    const userData = JSON.parse(localStorage.getItem('userData') || '{}');
+    const firmId = userData.firm_id;
+    if (firmId) {
+      fastAPI.getFirmDepartments(firmId).then(setAddMemberAvailableDepartments);
     } else {
       setAddMemberAvailableDepartments([]);
     }
@@ -666,6 +683,181 @@ const UnifiedProjectView = ({
         ? prev.permissions.filter(p => p !== permissionKey)
         : [...prev.permissions, permissionKey]
     }));
+  };
+
+  const BULK_MEMBER_ROLE_OPTIONS = ['Project Manager', 'Documentation Manager', 'Editor', 'Viewer'];
+
+  const downloadTeamMembersTemplate = async () => {
+    try {
+      const ExcelJS = await import('exceljs');
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Team Members');
+      sheet.addRow(['Full Name', 'Email', 'Phone Number', 'Position Title', 'Department', 'Equipment Assignment', 'Role']);
+      sheet.addRow(['Jane Doe', 'jane@example.com', '9876543210', 'Engineer', 'Engineering', 'All Equipment', 'Editor']);
+      sheet.addRow(['John Smith', 'john@example.com', '9123456780', 'Inspector', 'Quality', (equipment[0]?.manufacturing_serial || equipment[0]?.tag_number || equipment[0]?.type || 'Equipment Name'), 'Viewer']);
+
+      sheet.columns = [
+        { width: 22 },
+        { width: 28 },
+        { width: 16 },
+        { width: 22 },
+        { width: 20 },
+        { width: 30 },
+        { width: 26 },
+      ];
+
+      for (let row = 2; row <= 2000; row++) {
+        sheet.getCell(`G${row}`).dataValidation = {
+          type: 'list',
+          allowBlank: false,
+          formulae: [`"${BULK_MEMBER_ROLE_OPTIONS.join(',')}"`],
+          showErrorMessage: true,
+          errorTitle: 'Invalid Role',
+          error: 'Select one of: Project Manager, Documentation Manager, Editor, Viewer'
+        };
+      }
+
+      const headerRow = sheet.getRow(1);
+      headerRow.font = { bold: true };
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'Team_Members_Bulk_Template.xlsx';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast({ title: 'Downloaded', description: 'Team_Members_Bulk_Template.xlsx' });
+    } catch (err: any) {
+      toast({ title: 'Error', description: err?.message || 'Failed to download template.', variant: 'destructive' });
+    }
+  };
+
+  const parseEquipmentAssignmentsFromCell = (raw: string): string[] => {
+    const value = (raw || '').trim();
+    if (!value) return [];
+    if (value.toLowerCase() === 'all equipment') {
+      return ['All Equipment', ...equipment.map((eq: any) => eq.id)];
+    }
+    const names = value.split(',').map((s) => s.trim()).filter(Boolean);
+    const assignmentIds: string[] = [];
+    names.forEach((name) => {
+      const target = equipment.find((eq: any) => {
+        const candidates = [
+          eq.manufacturing_serial,
+          eq.tag_number,
+          eq.tagNumber,
+          eq.type,
+          eq.id,
+        ].map((x) => String(x || '').trim().toLowerCase());
+        return candidates.includes(name.toLowerCase());
+      });
+      if (target?.id && !assignmentIds.includes(target.id)) assignmentIds.push(target.id);
+    });
+    return assignmentIds;
+  };
+
+  const handleBulkTeamMembersUpload = async (file: File) => {
+    setBulkMemberUploading(true);
+    try {
+      const XLSX = await import('xlsx-js-style').then((m: any) => m.default);
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      if (!rows || rows.length < 2) {
+        toast({ title: 'No rows', description: 'No valid rows found in file.', variant: 'destructive' });
+        return;
+      }
+
+      const roleMapping: Record<string, string> = {
+        'project manager': 'project_manager',
+        'documentation manager': 'vdcr_manager',
+        editor: 'editor',
+        viewer: 'viewer'
+      };
+      const firmId = localStorage.getItem('firmId') || (JSON.parse(localStorage.getItem('userData') || '{}').firm_id ?? '');
+      const currentUserId = user?.id || localStorage.getItem('userId') || 'system';
+      const created: string[] = [];
+      const skipped: string[] = [];
+
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i] || [];
+        const fullName = String(r[0] || '').trim();
+        const email = String(r[1] || '').trim();
+        const phone = String(r[2] || '').trim();
+        const position = String(r[3] || '').trim();
+        const department = String(r[4] || '').trim();
+        const equipmentAssignmentRaw = String(r[5] || '').trim();
+        const roleDisplay = String(r[6] || '').trim();
+        if (!fullName && !email && !position && !roleDisplay) continue;
+        if (!fullName || !email || !position || !roleDisplay) {
+          skipped.push(`Row ${i + 1}`);
+          continue;
+        }
+
+        const dbRole = roleMapping[roleDisplay.toLowerCase()];
+        if (!dbRole) {
+          skipped.push(`Row ${i + 1}`);
+          continue;
+        }
+
+        const roleObj = roles.find((x) => x.name === dbRole);
+        const equipmentAssignments = parseEquipmentAssignmentsFromCell(equipmentAssignmentRaw);
+        if (equipmentAssignments.length === 0) {
+          skipped.push(`Row ${i + 1}`);
+          continue;
+        }
+
+        try {
+          // Keep the same invite flow as single Add Member submit.
+          await fastAPI.createInvite({
+            email,
+            full_name: fullName,
+            role: dbRole,
+            firm_id: firmId || '',
+            project_id: projectId,
+            invited_by: currentUserId
+          });
+
+          await fastAPI.createProjectMember({
+            project_id: projectId,
+            name: fullName,
+            email,
+            phone: phone || '',
+            position,
+            department: department || null,
+            role: dbRole,
+            status: 'active',
+            permissions: roleObj ? roleObj.permissions : getPermissionsByRole(dbRole),
+            equipment_assignments: equipmentAssignments,
+            data_access: [],
+            access_level: dbRole,
+            avatar: fullName.split(' ').map((n: string) => n[0]).join('').toUpperCase(),
+            last_active: new Date().toISOString()
+          });
+          created.push(fullName);
+        } catch {
+          skipped.push(`Row ${i + 1}`);
+        }
+      }
+
+      await fetchTeamMembers();
+      toast({
+        title: 'Bulk upload complete',
+        description: `Created ${created.length} member(s).${skipped.length ? ` Skipped ${skipped.length} row(s): ${skipped.join(', ')}` : ''}`,
+        variant: skipped.length ? 'default' : 'default'
+      });
+    } catch (err: any) {
+      toast({ title: 'Error', description: err?.message || 'Failed to upload members.', variant: 'destructive' });
+    } finally {
+      setBulkMemberUploading(false);
+    }
   };
 
   // Documentation Overview functions
@@ -849,8 +1041,12 @@ const UnifiedProjectView = ({
         const savedMember = await fastAPI.createProjectMember(memberData);
         // // console.log('✅ Team member saved to database:', savedMember);
         
+        // Keep submit path lean: only core add-member APIs should run on click.
+        // Non-critical follow-up APIs are disabled to avoid request spikes in Settings tab.
+        const runNonCriticalPostAddApis = false;
+
         // Log team member addition for all assigned equipment in a single batch entry (if any)
-        if (newMember.equipmentAssignments && newMember.equipmentAssignments.length > 0) {
+        if (runNonCriticalPostAddApis && newMember.equipmentAssignments && newMember.equipmentAssignments.length > 0) {
           const equipmentIds = newMember.equipmentAssignments.filter(id => id !== "All Equipment");
           const equipmentList = equipmentIds
             .map(equipmentId => {
@@ -904,6 +1100,7 @@ const UnifiedProjectView = ({
         
         // Send email notification to the new team member (MOVED BEFORE EQUIPMENT ASSIGNMENT)
         try {
+          if (!runNonCriticalPostAddApis) throw new Error('Email notification disabled for request optimization');
           // // console.log('📧 Sending email notification to new team member...');
           // // console.log('📧 New member data:', newMember);
           // // console.log('📧 Project name:', projectName);
@@ -987,70 +1184,80 @@ const UnifiedProjectView = ({
         }
         
         // Add user to selected equipment Team tabs (MOVED AFTER EMAIL)
-        if (newMember.equipmentAssignments && newMember.equipmentAssignments.length > 0) {
-          // // console.log('🔄 Adding user to selected equipment Team tabs...');
-          
-          // Filter out "All Equipment" and get actual equipment IDs
+        if (runNonCriticalPostAddApis && newMember.equipmentAssignments && newMember.equipmentAssignments.length > 0) {
           const equipmentIds = newMember.equipmentAssignments.filter(id => id !== "All Equipment");
-          
-          // Add user to each selected equipment's Team tab
-          for (const equipmentId of equipmentIds) {
+
+          // Map display role to equipment_team_positions role (only accepts 'editor' or 'viewer')
+          const equipmentRoleMap: { [key: string]: 'editor' | 'viewer' } = {
+            'Project Manager': 'editor',
+            'Documentation Manager': 'editor',
+            'Editor': 'editor',
+            'Viewer': 'viewer'
+          };
+          const equipmentRole = equipmentRoleMap[newMember.role] || 'viewer';
+
+          const bulkTeamPositions = equipmentIds
+            .filter((equipmentId) => equipment.some(eq => eq.id === equipmentId))
+            .map((equipmentId) => ({
+              equipment_id: equipmentId,
+              position_name: newMember.position,
+              person_name: newMember.name,
+              email: newMember.email,
+              phone: newMember.phone,
+              department: (newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : null,
+              role: equipmentRole
+            }));
+
+          if (bulkTeamPositions.length > 0) {
             try {
-              // Find the equipment to get its current team data
-              const targetEquipment = equipment.find(eq => eq.id === equipmentId);
-              if (targetEquipment) {
-                // // console.log(`🔄 Adding user to equipment ${equipmentId} Team tab...`);
-                
-                // Map display role to equipment_team_positions role (only accepts 'editor' or 'viewer')
-                const equipmentRoleMap: { [key: string]: 'editor' | 'viewer' } = {
-                  'Project Manager': 'editor',
-                  'Documentation Manager': 'editor',
-                  'Editor': 'editor',
-                  'Viewer': 'viewer'
-                };
-                const equipmentRole = equipmentRoleMap[newMember.role] || 'viewer';
-                
-                // Create team position data for this equipment
-                const teamPositionData = {
-                  equipment_id: equipmentId,
-                  position_name: newMember.position,
-                  person_name: newMember.name,
-                  email: newMember.email,
-                  phone: newMember.phone,
-                  department: (newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : null,
-                  role: equipmentRole
-                };
-                
-                // // console.log('📧 Team position data being sent:', teamPositionData);
-                
-                // Save to team_positions table
+              // Single request for all selected equipment (reduces request burst on Add Member submit)
+              await fastAPI.createTeamPositionsBulk(bulkTeamPositions);
+            } catch {
+              // Fallback to one-by-one if bulk insert fails for any reason
+              for (const teamPositionData of bulkTeamPositions) {
                 try {
                   await fastAPI.createTeamPosition(teamPositionData);
-                  // // console.log(`✅ User added to equipment ${equipmentId} Team tab`);
-                } catch (teamPosError) {
-                  // Silently fail - equipment team position is optional and non-critical
-                  // console.error(`⚠️ Failed to create equipment team position (non-fatal):`, teamPosError);
+                } catch {
+                  // Non-critical: team_positions is auxiliary data for equipment Team tabs
                 }
-                
-                // Note: Activity logging already done above after member creation
               }
-            } catch (error) {
-              // console.error(`❌ Error adding user to equipment ${equipmentId} Team tab:`, error);
             }
           }
         }
         
-        // Refresh team members list
-        await fetchTeamMembers();
-        
-        // Refresh activity logs to show the new team member addition
-        await loadEquipmentProgressEntries();
+        // Update team list locally to avoid an immediate extra fetch.
+        const savedRow = Array.isArray(savedMember) ? savedMember[0] : savedMember;
+        if (savedRow) {
+          const transformedMember = {
+            id: savedRow.id || `member-${Date.now()}`,
+            name: savedRow.name || newMember.name || 'Unknown',
+            email: savedRow.email || newMember.email || '',
+            phone: savedRow.phone || newMember.phone || '',
+            position: savedRow.position || newMember.position || '',
+            department: savedRow.department || ((newMember.department && newMember.department !== '__add_new__') ? newMember.department.trim() : ''),
+            role: savedRow.role || dbRole || 'viewer',
+            permissions: savedRow.permissions && savedRow.permissions.length > 0
+              ? savedRow.permissions
+              : (role ? role.permissions : getPermissionsByRole(savedRow.role || dbRole || 'viewer')),
+            status: savedRow.status || 'active',
+            avatar: savedRow.avatar || (savedRow.name || newMember.name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
+            lastActive: savedRow.last_active || 'Unknown',
+            equipmentAssignments: savedRow.equipment_assignments || newMember.equipmentAssignments || [],
+            dataAccess: savedRow.data_access || newMember.dataAccess || [],
+            accessLevel: savedRow.access_level || newMember.accessLevel || 'viewer'
+          };
+          setTeamMembers(prev => {
+            const exists = prev.some((m: any) => m.id === transformedMember.id);
+            if (exists) return prev;
+            return [transformedMember, ...prev];
+          });
+        }
         
         // Reset form
       setNewMember({ name: "", email: "", phone: "", position: "", department: "", role: "", permissions: [], equipmentAssignments: [], dataAccess: [], accessLevel: "viewer" });
       setShowAddMember(false);
         
-        toast({ title: 'Success', description: 'Team member added successfully! Email notification sent.' });
+        toast({ title: 'Success', description: 'Team member added successfully.' });
         
       } catch (error) {
         // console.error('❌ Error adding team member:', error);
@@ -1395,8 +1602,8 @@ const UnifiedProjectView = ({
             </TabsList>
           </div>
 
-          {/* Equipment Tab - forceMount so content stays mounted when switching tabs; preserves cache and avoids refetch on return */}
-          <TabsContent value="equipment" forceMount className="space-y-6 mt-8 data-[state=inactive]:hidden">
+          {/* Equipment Tab - mount only when active to avoid loading equipment APIs while opening other tabs (e.g., Project Details). */}
+          <TabsContent value="equipment" className="space-y-6 mt-8">
             <div className="bg-white rounded-2xl shadow-lg border-2 border-gray-200 overflow-hidden">
               <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 sm:px-6 py-3 sm:py-4 border-b border-blue-200">
                 <h2 className="text-lg font-semibold text-blue-800 flex items-center gap-2">
@@ -2532,6 +2739,41 @@ const UnifiedProjectView = ({
                       <p className="text-xs sm:text-sm text-gray-500 mt-1">Manage who has access to this project and their permissions</p>
                     </div>
                     <div className="flex items-center gap-2 sm:gap-3 ml-4">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-9 text-xs sm:text-sm border-blue-200 text-blue-600 hover:bg-blue-50 hover:text-blue-700"
+                        onClick={downloadTeamMembersTemplate}
+                      >
+                        <Download size={14} className="mr-2" />
+                        Download Sample Template
+                      </Button>
+                      <label className="inline-flex">
+                        <input
+                          type="file"
+                          accept=".xlsx,.xls"
+                          className="hidden"
+                          disabled={bulkMemberUploading}
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) handleBulkTeamMembersUpload(f);
+                            e.target.value = '';
+                          }}
+                        />
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="h-9 text-xs sm:text-sm bg-green-600 hover:bg-green-700 text-white border border-green-600"
+                          asChild
+                          disabled={bulkMemberUploading}
+                        >
+                          <span>
+                            <FileText size={14} className="mr-2" />
+                            {bulkMemberUploading ? 'Uploading...' : 'Bulk Upload Document'}
+                          </span>
+                        </Button>
+                      </label>
                     <button
                       onClick={() => setShowAddMember(true)}
                       className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2 text-sm"
@@ -2858,7 +3100,7 @@ const UnifiedProjectView = ({
                             <svg className="w-3 h-3 sm:w-4 sm:h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                             </svg>
-                            <span className="flex-1">Existing member selected. Name, email, phone, and access level are locked. Only position can be edited.</span>
+                            <span className="flex-1">Existing member selected. Name, email, phone, and access level are locked. Position and department(s) can be edited.</span>
                           </p>
                         )}
                       </div>
@@ -2942,23 +3184,20 @@ const UnifiedProjectView = ({
 
                       <div>
                         <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Department (optional)</label>
-                        <p className="text-[10px] sm:text-xs text-gray-500 mt-0.5 mb-2">From Documentation tab or add new.</p>
+                        <p className="text-[10px] sm:text-xs text-gray-500 mt-0.5 mb-2">
+                          Suggestions are dynamic and limited to this firm only.
+                        </p>
                         <Select
                           value={newMember.department || '__none__'}
                           onValueChange={(value) => {
                             if (value === '__add_new__') {
-                              setNewMember(prev => ({ ...prev, department: '__add_new__' }));
+                              setNewMember((prev) => ({ ...prev, department: '__add_new__' }));
                               return;
                             }
-                            setNewMember(prev => ({ ...prev, department: value === '__none__' ? '' : value }));
+                            setNewMember((prev) => ({ ...prev, department: value === '__none__' ? '' : value }));
                           }}
-                          disabled={isExistingMemberMode}
                         >
-                          <SelectTrigger className={`w-full h-auto px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 ${
-                            isExistingMemberMode
-                              ? 'bg-gray-100 cursor-not-allowed text-gray-600'
-                              : 'bg-gray-50 hover:bg-white'
-                          }`}>
+                          <SelectTrigger className="w-full h-auto px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-gray-50 hover:bg-white">
                             <SelectValue placeholder="Select department..." />
                           </SelectTrigger>
                           <SelectContent>
@@ -2969,39 +3208,21 @@ const UnifiedProjectView = ({
                             <SelectItem value="__add_new__">+ Add new department...</SelectItem>
                           </SelectContent>
                         </Select>
-                        {(newMember.department === '__add_new__' || (newMember.department && !addMemberAvailableDepartments.includes(newMember.department))) && !isExistingMemberMode && (
+                        {newMember.department === '__add_new__' && (
                           <div className="mt-2 flex gap-2">
                             <Input
                               value={addMemberNewDepartmentInput}
                               onChange={e => setAddMemberNewDepartmentInput(e.target.value)}
-                              placeholder="New department name"
+                              placeholder="Add new department"
                               className="h-9"
                               onKeyDown={e => {
                                 if (e.key === 'Enter') {
                                   e.preventDefault();
-                                  const v = addMemberNewDepartmentInput.trim();
-                                  if (v) {
-                                    setAddMemberAvailableDepartments(prev => [...prev, v].sort());
-                                    setNewMember(prev => ({ ...prev, department: v }));
-                                    setAddMemberNewDepartmentInput('');
-                                  }
+                                  addCustomMemberDepartment();
                                 }
                               }}
                             />
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="h-9"
-                              onClick={() => {
-                                const v = addMemberNewDepartmentInput.trim();
-                                if (v) {
-                                  setAddMemberAvailableDepartments(prev => [...prev, v].sort());
-                                  setNewMember(prev => ({ ...prev, department: v }));
-                                  setAddMemberNewDepartmentInput('');
-                                }
-                              }}
-                            >
+                            <Button type="button" size="sm" variant="outline" className="h-9" onClick={addCustomMemberDepartment}>
                               Add
                             </Button>
                           </div>
@@ -3300,15 +3521,15 @@ const UnifiedProjectView = ({
 
                       <div>
                         <label className="block text-xs sm:text-sm font-medium text-gray-700 mb-2">Department (optional)</label>
-                        <p className="text-[10px] sm:text-xs text-gray-500 mt-0.5 mb-2">From Documentation tab or add new.</p>
+                        <p className="text-[10px] sm:text-xs text-gray-500 mt-0.5 mb-2">Suggestions are dynamic and limited to this firm only.</p>
                         <Select
                           value={newMember.department || '__none__'}
                           onValueChange={(value) => {
                             if (value === '__add_new__') {
-                              setNewMember(prev => ({ ...prev, department: '__add_new__' }));
+                              setNewMember((prev) => ({ ...prev, department: '__add_new__' }));
                               return;
                             }
-                            setNewMember(prev => ({ ...prev, department: value === '__none__' ? '' : value }));
+                            setNewMember((prev) => ({ ...prev, department: value === '__none__' ? '' : value }));
                           }}
                         >
                           <SelectTrigger className="w-full h-auto px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-gray-50 hover:bg-white">
@@ -3322,39 +3543,21 @@ const UnifiedProjectView = ({
                             <SelectItem value="__add_new__">+ Add new department...</SelectItem>
                           </SelectContent>
                         </Select>
-                        {(newMember.department === '__add_new__' || (newMember.department && !addMemberAvailableDepartments.includes(newMember.department))) && (
+                        {newMember.department === '__add_new__' && (
                           <div className="mt-2 flex gap-2">
                             <Input
                               value={addMemberNewDepartmentInput}
                               onChange={e => setAddMemberNewDepartmentInput(e.target.value)}
-                              placeholder="New department name"
+                              placeholder="Add new department"
                               className="h-9"
                               onKeyDown={e => {
                                 if (e.key === 'Enter') {
                                   e.preventDefault();
-                                  const v = addMemberNewDepartmentInput.trim();
-                                  if (v) {
-                                    setAddMemberAvailableDepartments(prev => [...prev, v].sort());
-                                    setNewMember(prev => ({ ...prev, department: v }));
-                                    setAddMemberNewDepartmentInput('');
-                                  }
+                                  addCustomMemberDepartment();
                                 }
                               }}
                             />
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="h-9"
-                              onClick={() => {
-                                const v = addMemberNewDepartmentInput.trim();
-                                if (v) {
-                                  setAddMemberAvailableDepartments(prev => [...prev, v].sort());
-                                  setNewMember(prev => ({ ...prev, department: v }));
-                                  setAddMemberNewDepartmentInput('');
-                                }
-                              }}
-                            >
+                            <Button type="button" size="sm" variant="outline" className="h-9" onClick={addCustomMemberDepartment}>
                               Add
                             </Button>
                           </div>

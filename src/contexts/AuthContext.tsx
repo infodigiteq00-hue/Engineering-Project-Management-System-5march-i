@@ -1,6 +1,12 @@
 import React, { createContext, useContext, useEffect, useState, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
+import {
+  fetchUserRowWithFirmByEmail,
+  getLoginProfileFetchPending,
+  waitUntilLoginStoredUserProfile,
+  clearLoginProfileFetchPending,
+} from '@/lib/loginBootstrap';
 
 /** Cached firm data - single source for Index (no duplicate getFirmById) */
 export interface FirmData {
@@ -212,9 +218,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   const fetchUserData = async (userId: string) => {
     try {
-      // First try to get the current user's email from auth
-      const { data: { user: authUser } } = await supabase.auth.getUser();
-      
+      // getSession reads cached session (avoids extra auth round-trip vs getUser())
+      const { data: { session } } = await supabase.auth.getSession();
+      const authUser = session?.user;
+
       if (!authUser?.email) {
         console.error('⚠️ No authenticated user email found - trying localStorage fallback');
         // Try localStorage as fallback
@@ -231,18 +238,61 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         return;
       }
 
-      // Search by email instead of ID to handle ID mismatches
-      const { data: userData, error } = await supabase
-        .from('users')
-        .select('role, full_name, firm_id, is_active, id, email')
-        .eq('email', authUser.email)
-        .maybeSingle(); // Use maybeSingle() instead of single() to handle 0 rows gracefully
-      
-      const typedUserData = userData as any;
+      // Avoid duplicating Login.tsx profile API calls: SIGNED_IN runs fetchUserData while Login is still fetching invites/users/firm.
+      const pendingLoginEmail = getLoginProfileFetchPending();
+      if (
+        pendingLoginEmail &&
+        pendingLoginEmail === authUser.email.toLowerCase().trim()
+      ) {
+        const ready = await waitUntilLoginStoredUserProfile(authUser.email, 12000);
+        if (ready) {
+          clearLoginProfileFetchPending();
+          const role = localStorage.getItem('userRole');
+          const name = localStorage.getItem('userName');
+          const fid = localStorage.getItem('firmId');
+          let ud: {
+            role?: string;
+            full_name?: string;
+            firm_id?: string | null;
+            is_active?: boolean;
+            email?: string;
+            company_name?: string;
+            logo_url?: string | null;
+          } = {};
+          try {
+            ud = JSON.parse(localStorage.getItem('userData') || '{}');
+          } catch {
+            /* ignore */
+          }
+          if (role && name && fid !== null && ud.role) {
+            setUserRole(role);
+            setUserName(name);
+            setFirmId(fid || null);
+            let fd: FirmData | null = null;
+            try {
+              const fr = localStorage.getItem(FIRM_DATA_CACHE_KEY);
+              if (fr) fd = JSON.parse(fr) as FirmData;
+            } catch {
+              /* ignore */
+            }
+            if (!fd && (localStorage.getItem('companyName') || localStorage.getItem('companyLogo'))) {
+              fd = {
+                name: localStorage.getItem('companyName') || undefined,
+                logo_url: localStorage.getItem('companyLogo'),
+              };
+            }
+            setFirmData(fd);
+            return;
+          }
+        }
+        clearLoginProfileFetchPending();
+      }
+
+      // One DB round-trip: users + firms embed when FK exists; else user row + optional getFirmById
+      const { user: userRow, firm: embeddedFirm, error } = await fetchUserRowWithFirmByEmail(supabase, authUser.email);
 
       if (error) {
         console.error('⚠️ Error fetching user data:', error, '- trying localStorage fallback');
-        // Try localStorage as fallback
         const storedRole = localStorage.getItem('userRole');
         const storedName = localStorage.getItem('userName');
         const storedFirmId = localStorage.getItem('firmId');
@@ -251,12 +301,19 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
           setUserRole(storedRole);
           setUserName(storedName);
           setFirmId(storedFirmId);
-          // console.log('✅ AuthContext: Using localStorage fallback (error)', { storedFirmId, storedRole });
         }
         return;
       }
 
-      // Handle case where no user data is found
+      const typedUserData = userRow as {
+        role: string;
+        full_name: string;
+        firm_id: string | null;
+        is_active: boolean;
+        id: string;
+        email: string;
+      } | null;
+
       if (!typedUserData) {
         console.warn('No user data found in database for email:', authUser.email);
         return;
@@ -271,13 +328,24 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setUserName(typedUserData.full_name);
       setFirmId(typedUserData.firm_id);
 
-      // Single source: fetch firm once here; Index and others use firmData from context (no duplicate getFirmById)
+      // Prefer embedded firm from same query; if missing (RLS or no FK), fall back to getFirmById
       let companyName = '';
       let logoUrl: string | null = null;
       if (typedUserData.firm_id) {
         try {
-          const { fastAPI } = await import('@/lib/api');
-          const firm = await fastAPI.getFirmById(typedUserData.firm_id);
+          let firm: {
+            name?: string;
+            logo_url?: string | null;
+            services_paused?: boolean;
+            equipment_unlock_days?: number;
+            created_at?: string;
+          } | null = embeddedFirm;
+
+          if (!firm) {
+            const { fastAPI } = await import('@/lib/api');
+            firm = await fastAPI.getFirmById(typedUserData.firm_id);
+          }
+
           if (firm) {
             companyName = firm.name ?? '';
             logoUrl = firm.logo_url ?? null;

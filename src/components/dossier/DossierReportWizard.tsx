@@ -18,6 +18,7 @@ import {
   getEquipmentDocuments,
   getStandaloneEquipmentDocuments,
   getDocumentUrlById,
+  getDocumentUrlsByIds,
 } from '@/lib/api';
 import { X, FileText, Upload, ChevronRight, ChevronLeft, ChevronDown, ChevronUp, Loader2, BookMarked, Eye, Zap, Image as ImageIcon, GripVertical, Pipette } from 'lucide-react';
 import { PDFDocument } from 'pdf-lib';
@@ -487,7 +488,11 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
             });
           });
         } else {
-          const docs = await getEquipmentDocuments(equipmentId);
+          const [docs, vdcrRecords, projectResp] = await Promise.all([
+            getEquipmentDocuments(equipmentId),
+            fastAPI.getVDCRRecordsByProject(projectId),
+            fastAPI.getProjectById(projectId),
+          ]);
           const list = Array.isArray(docs) ? docs : [];
           // Only show docs that were manually uploaded to the equipment Docs tab.
           // Docs with vdcr_record_id are reflected from the Documentation tab and appear only under "From project documentation (tagged)".
@@ -503,7 +508,6 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
             });
           });
 
-          const vdcrRecords = await fastAPI.getVDCRRecordsByProject(projectId);
           const records = Array.isArray(vdcrRecords) ? vdcrRecords : [];
           const tagStr = (tagNumber || '').toString().trim();
           records.forEach((r: any) => {
@@ -522,7 +526,6 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
             }
           });
 
-          const projectResp = await fastAPI.getProjectById(projectId);
           const project = Array.isArray(projectResp) ? projectResp[0] : null;
           if (!cancelled && project) setProjectData(project as Record<string, unknown>);
           if (project) {
@@ -608,27 +611,45 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
     if (url) window.open(url, '_blank', 'noopener,noreferrer');
   };
 
-  const preloadOne = useCallback(async (doc: DossierDocItem): Promise<ArrayBuffer | null> => {
-    setPreloadStatus((s) => ({ ...s, [doc.id]: 'loading' }));
-    try {
-      let buf: ArrayBuffer;
-      if (doc.file) {
-        buf = await doc.file.arrayBuffer();
-      } else if (doc.url) {
-        const res = await fetch(doc.url, { mode: 'cors' });
-        buf = await res.arrayBuffer();
-      } else {
-        setPreloadStatus((s) => ({ ...s, [doc.id]: 'idle' }));
+  const preloadOne = useCallback(
+    async (
+      doc: DossierDocItem,
+      equipmentUrlMap?: Record<string, { document_url: string }>
+    ): Promise<ArrayBuffer | null> => {
+      setPreloadStatus((s) => ({ ...s, [doc.id]: 'loading' }));
+      try {
+        let buf: ArrayBuffer;
+        if (doc.file) {
+          buf = await doc.file.arrayBuffer();
+        } else {
+          let fetchUrl: string | null | undefined = doc.url;
+          if (doc.source === 'equipment' && doc.id.startsWith('eq-')) {
+            const rawId = doc.id.replace(/^eq-/, '');
+            if (equipmentUrlMap?.[rawId]?.document_url) {
+              fetchUrl = equipmentUrlMap[rawId].document_url;
+            } else {
+              const fresh = await getDocumentUrlById(rawId, isStandalone);
+              fetchUrl = fresh?.document_url ?? doc.url;
+            }
+          }
+          if (fetchUrl) {
+            const res = await fetch(fetchUrl, { mode: 'cors' });
+            buf = await res.arrayBuffer();
+          } else {
+            setPreloadStatus((s) => ({ ...s, [doc.id]: 'idle' }));
+            return null;
+          }
+        }
+        setPreloadedBlobs((prev) => ({ ...prev, [doc.id]: buf }));
+        setPreloadStatus((s) => ({ ...s, [doc.id]: 'done' }));
+        return buf;
+      } catch {
+        setPreloadStatus((s) => ({ ...s, [doc.id]: 'error' }));
         return null;
       }
-      setPreloadedBlobs((prev) => ({ ...prev, [doc.id]: buf }));
-      setPreloadStatus((s) => ({ ...s, [doc.id]: 'done' }));
-      return buf;
-    } catch {
-      setPreloadStatus((s) => ({ ...s, [doc.id]: 'error' }));
-      return null;
-    }
-  }, []);
+    },
+    [isStandalone]
+  );
 
   const handleDocReorder = useCallback((fromId: string, toId: string) => {
     setDossierDocOrder((prev) => {
@@ -650,9 +671,14 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
     }
     setPreloadingAll(true);
     try {
+      const equipmentIds = docs
+        .filter((d) => d.source === 'equipment' && d.id.startsWith('eq-'))
+        .map((d) => d.id.replace(/^eq-/, ''));
+      const equipmentUrlMap =
+        equipmentIds.length > 0 ? await getDocumentUrlsByIds(equipmentIds, isStandalone) : {};
       for (const doc of docs) {
         if (preloadStatus[doc.id] === 'done') continue;
-        await preloadOne(doc);
+        await preloadOne(doc, equipmentUrlMap);
       }
       toast({ title: 'Pre-load complete', description: 'Documents ready for faster export.' });
     } catch (e) {
@@ -660,7 +686,7 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
     } finally {
       setPreloadingAll(false);
     }
-  }, [selectedDocs, preloadOne, preloadStatus, toast]);
+  }, [selectedDocs, preloadOne, preloadStatus, toast, isStandalone]);
 
 
   const stepIndex = STEPS.indexOf(step);
@@ -728,16 +754,23 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
     ];
   };
 
-  /** Fetch PDF bytes for a doc: use preloaded cache, or get URL (with getDocumentUrlById for equipment docs) then fetch (cache: reload so body is available). */
+  /** Fetch PDF bytes for a doc: use preloaded cache, or batch-resolved equipment URLs + fetch (cache: reload so body is available). */
   const fetchDocPdfBytes = useCallback(
-    async (doc: DossierDocItem): Promise<ArrayBuffer | null> => {
+    async (
+      doc: DossierDocItem,
+      equipmentUrlMap?: Record<string, { document_url: string }>
+    ): Promise<ArrayBuffer | null> => {
       if (preloadedBlobs[doc.id]) return preloadedBlobs[doc.id];
       if (doc.file) return doc.file.arrayBuffer();
-      let url = doc.url;
+      let url: string | null | undefined = doc.url;
       if (doc.source === 'equipment' && doc.id.startsWith('eq-')) {
         const rawId = doc.id.replace(/^eq-/, '');
-        const fresh = await getDocumentUrlById(rawId, isStandalone);
-        if (fresh?.document_url) url = fresh.document_url;
+        const row = equipmentUrlMap?.[rawId];
+        if (row?.document_url) url = row.document_url;
+        else {
+          const fresh = await getDocumentUrlById(rawId, isStandalone);
+          if (fresh?.document_url) url = fresh.document_url;
+        }
       }
       if (!url) return null;
       try {
@@ -777,6 +810,13 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
     setExporting(true);
     const total = docs.length + 2;
     setExportProgress({ current: 0, total, phase: 'Preparing…' });
+    const equipmentIdsForExport = docs
+      .filter((d) => d.source === 'equipment' && d.id.startsWith('eq-'))
+      .map((d) => d.id.replace(/^eq-/, ''));
+    const equipmentUrlMapForExport =
+      equipmentIdsForExport.length > 0
+        ? await getDocumentUrlsByIds(equipmentIdsForExport, isStandalone)
+        : {};
     try {
       const pdfDoc = await PDFDocument.create();
       const font = await pdfDoc.embedStandardFont('Helvetica');
@@ -1110,7 +1150,7 @@ export default function DossierReportWizard({ params, onClose }: DossierReportWi
         const startPage = pageNumber;
         addSubCoverPage(title, note);
         indexEntries.push({ name: title, startPage, endPage: startPage });
-        const buf = await fetchDocPdfBytes(doc);
+        const buf = await fetchDocPdfBytes(doc, equipmentUrlMapForExport);
         if (buf && buf.byteLength > 0) {
           try {
             const src = await PDFDocument.load(buf);

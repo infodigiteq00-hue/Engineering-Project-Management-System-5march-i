@@ -5,6 +5,14 @@ import { Label } from "@/components/ui/label";
 import { Eye, EyeOff } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { fastAPI } from "@/lib/api";
+import {
+  fetchUserRowWithFirmById,
+  fetchUserRowWithFirmByEmail,
+  USER_TABLE_BASE_SELECT,
+  markLoginProfileFetchPending,
+  clearLoginProfileFetchPending,
+  type EmbeddedFirmRow,
+} from "@/lib/loginBootstrap";
 import { useToast } from "@/hooks/use-toast";
 import { useNavigate } from "react-router-dom";
 
@@ -165,6 +173,9 @@ const Login = () => {
       }
     }, 45000); // 45 seconds timeout (accounts for retries)
 
+    /** Set true only after userData/userRole are written to localStorage (for AuthContext coordination). */
+    let loginProfileWrittenToStorage = false;
+
     try {
       // Skip session cleanup - already done on mount (non-blocking)
       // Go straight to login for faster response
@@ -207,6 +218,9 @@ const Login = () => {
           isSubmittingRef.current = false;
           return;
         }
+
+        // Tells AuthContext to wait for this page to finish (avoids duplicate users/firms API calls on SIGNED_IN).
+        markLoginProfileFetchPending(authData.user.email || '');
       } catch (error: any) {
         console.error('🚨 Login error:', error);
         if (error?.message === 'Request timeout') {
@@ -225,35 +239,26 @@ const Login = () => {
       // Get user role from our users table - OPTIMIZED: use only user ID (guaranteed from auth)
       let userData = null;
       let userError = null;
+      /** Firm row from users+firms embed (avoids extra getFirmById when present). */
+      let firmEmbedFromLookup: EmbeddedFirmRow | null = null;
 
-      // 🔧 FIX: Check invites table first for pending invitations (case-insensitive)
+      // 🔧 FIX: Check invites table for pending invitations (case-insensitive) — api uses 1–2 targeted queries, not two limit=100 scans.
       let inviteData = null;
       try {
         const normalizedEmail = authData.user.email?.toLowerCase().trim();
-        // console.log('🔍 Checking invites for email (normalized):', normalizedEmail);
         inviteData = await fastAPI.getInviteByEmail(normalizedEmail || authData.user.email);
-        // console.log('🔍 Invite check result:', inviteData ? {
-        //   id: inviteData.id,
-        //   email: inviteData.email,
-        //   role: inviteData.role,
-        //   status: inviteData.status,
-        //   firm_id: inviteData.firm_id,
-        //   project_id: inviteData.project_id
-        // } : 'No invite found');
       } catch (inviteError) {
         console.error('❌ Error checking invites:', inviteError);
       }
 
       try {
-        // Use only ID query (faster, guaranteed to exist from auth) - reduced from 8s to 5s timeout
-        const idResult = await withTimeout(
-          supabase
-            .from('users')
-            .select('id, role, full_name, firm_id, email, is_active')
-            .eq('id', authData.user.id)
-            .maybeSingle() as unknown as Promise<any>,
-          5000 // 5 second timeout (reduced from 8s)
+        // One query: user + embedded firm when FK exists (falls back inside helper)
+        const idWrapped = await withTimeout(
+          fetchUserRowWithFirmById(supabase, authData.user.id),
+          5000
         );
+        const idResult = { data: idWrapped.user, error: idWrapped.error };
+        if (idWrapped.firm) firmEmbedFromLookup = idWrapped.firm;
 
         if (idResult.data && !idResult.error) {
           userData = idResult.data;
@@ -272,7 +277,7 @@ const Login = () => {
                 assigned_by: inviteData.invited_by || userData.assigned_by
               } as any)
               .eq('id', authData.user.id)
-              .select();
+              .select(USER_TABLE_BASE_SELECT);
             
             if (!updateError && updateData) {
               userData = updateData;
@@ -298,16 +303,17 @@ const Login = () => {
           try {
             const emailResult = await retryWithBackoff(
               () => withTimeout(
-                supabase
-                  .from('users')
-                  .select('id, role, full_name, firm_id, email, is_active')
-                  .eq('email', authData.user.email)
-                  .maybeSingle() as unknown as Promise<any>,
+                (async () => {
+                  const w = await fetchUserRowWithFirmByEmail(supabase, authData.user.email!);
+                  return { data: w.user, error: w.error, firm: w.firm };
+                })(),
                 5000 // 5 second timeout
               ),
               2, // retry 2 times
               500 // 500ms delay
             );
+
+            if (emailResult.firm) firmEmbedFromLookup = emailResult.firm;
 
             if (emailResult.data && !emailResult.error) {
               // 🔧 FIX: Check for ID mismatch
@@ -568,17 +574,22 @@ const Login = () => {
         timeoutRef.current = null;
       }
       
-      // Fetch company name and logo from firms table if user has firm_id (for header display)
+      // Company name/logo: prefer firms row from users+firms embed; else same as before (getFirmById)
       let companyName = '';
       let logoUrl: string | null = null;
       if (userData.firm_id) {
         try {
-          const firmData = await fastAPI.getFirmById(userData.firm_id);
-          if (firmData?.name) {
-            companyName = firmData.name;
-          }
-          if (firmData?.logo_url) {
-            logoUrl = firmData.logo_url;
+          if (firmEmbedFromLookup && (firmEmbedFromLookup.name || firmEmbedFromLookup.logo_url)) {
+            companyName = firmEmbedFromLookup.name || '';
+            logoUrl = firmEmbedFromLookup.logo_url ?? null;
+          } else {
+            const firmData = await fastAPI.getFirmById(userData.firm_id);
+            if (firmData?.name) {
+              companyName = firmData.name;
+            }
+            if (firmData?.logo_url) {
+              logoUrl = firmData.logo_url;
+            }
           }
         } catch (firmError) {
           console.warn('⚠️ Could not fetch company data (non-fatal):', firmError);
@@ -621,6 +632,17 @@ const Login = () => {
         if (logoUrl) {
           localStorage.setItem('companyLogo', logoUrl);
         }
+        try {
+          if (companyName || logoUrl) {
+            localStorage.setItem(
+              'epms_firm_data_cache',
+              JSON.stringify({ name: companyName || undefined, logo_url: logoUrl ?? undefined })
+            );
+          }
+        } catch {
+          // non-fatal
+        }
+        loginProfileWrittenToStorage = true;
       } catch (storageError) {
         console.error('⚠️ localStorage error (non-fatal):', storageError);
         // Continue with redirect even if localStorage fails
@@ -655,6 +677,10 @@ const Login = () => {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
       setLoading(false);
       isSubmittingRef.current = false;
+    } finally {
+      if (!loginProfileWrittenToStorage) {
+        clearLoginProfileFetchPending();
+      }
     }
   };
 

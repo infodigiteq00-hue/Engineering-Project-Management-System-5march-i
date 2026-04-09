@@ -470,6 +470,8 @@ const SuperAdminDashboard = () => {
               }, 35000); // 35 second timeout (slightly longer than API timeout)
             })
           ]);
+
+          
           
           logoUrl = await uploadWithTimeout;
           const uploadTime = Date.now() - uploadStartTime;
