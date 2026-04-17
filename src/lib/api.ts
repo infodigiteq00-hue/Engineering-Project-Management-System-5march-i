@@ -1267,39 +1267,47 @@ export const fastAPI = {
       // When progressImagesLatestOnly: fetch metadata only (no image_url) to keep payload small
       const progressImagesSelect = progressImagesLatestOnly
         ? 'id,equipment_id,description,uploaded_by,upload_date,created_at'
-        : 'id,equipment_id,image_url,description,uploaded_by,upload_date,created_at,audio_data,audio_duration';
+        : 'id,equipment_id,image_url,description,uploaded_by,upload_date,created_at,audio_duration';
       
       // Progress entries: metadata only (no image_url, no audio_data) so list loads fast and doesn't timeout
       const progressEntriesSelect = 'id,equipment_id,entry_text,entry_type,created_by,created_at,image_description,audio_duration';
-      // Process batches sequentially to avoid overwhelming the database
+      // Process batches with small bounded concurrency to reduce end-to-end latency
+      // without creating DB request storms.
+      const batches: string[][] = [];
       for (let i = 0; i < equipmentIds.length; i += batchSize) {
-        const batch = equipmentIds.slice(i, i + batchSize);
-        
-        try {
-          // PERFORMANCE: Process sequentially instead of Promise.all to reduce database load
-          // Fetch progress images first
-          const progressImagesResponse = await api.get(
-            `/equipment_progress_images?equipment_id=in.(${batch.join(',')})&select=${progressImagesSelect}&order=created_at.desc&limit=250`, 
-            { timeout: 15000 }
-          ).catch(() => ({ data: [] }));
-          
-          // Then fetch progress entries (metadata only - image_url loaded on preview click)
-          const progressEntriesResponse = await api.get(
-            `/equipment_progress_entries?equipment_id=in.(${batch.join(',')})&select=${progressEntriesSelect}&order=created_at.desc&limit=250`, 
-            { timeout: 15000 }
-          ).catch(() => ({ data: [] }));
-          
-          allProgressImages.push(...(progressImagesResponse.data || []));
-          allProgressEntries.push(...(progressEntriesResponse.data || []));
-        } catch (error: any) {
-          // Log but continue with other batches
-          if (error?.code === 'ECONNABORTED' || error?.response?.data?.code === '57014') {
-            console.warn(`⚠️ Timeout fetching progress data for batch ${i / batchSize + 1} (non-fatal):`, error);
-          } else {
-            console.warn(`⚠️ Error fetching progress data for batch ${i / batchSize + 1} (non-fatal):`, error);
+        batches.push(equipmentIds.slice(i, i + batchSize));
+      }
+      const MAX_CONCURRENT_BATCHES = 3;
+      let batchCursor = 0;
+      const runBatchWorker = async () => {
+        while (batchCursor < batches.length) {
+          const currentIndex = batchCursor++;
+          const batch = batches[currentIndex];
+          try {
+            const [progressImagesResponse, progressEntriesResponse] = await Promise.all([
+              api.get(
+                `/equipment_progress_images?equipment_id=in.(${batch.join(',')})&select=${progressImagesSelect}&order=created_at.desc&limit=250`,
+                { timeout: 15000 }
+              ).catch(() => ({ data: [] })),
+              api.get(
+                `/equipment_progress_entries?equipment_id=in.(${batch.join(',')})&select=${progressEntriesSelect}&order=created_at.desc&limit=250`,
+                { timeout: 15000 }
+              ).catch(() => ({ data: [] })),
+            ]);
+            allProgressImages.push(...(progressImagesResponse.data || []));
+            allProgressEntries.push(...(progressEntriesResponse.data || []));
+          } catch (error: any) {
+            if (error?.code === 'ECONNABORTED' || error?.response?.data?.code === '57014') {
+              console.warn(`⚠️ Timeout fetching progress data for batch ${currentIndex + 1} (non-fatal):`, error);
+            } else {
+              console.warn(`⚠️ Error fetching progress data for batch ${currentIndex + 1} (non-fatal):`, error);
+            }
           }
         }
-      }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(MAX_CONCURRENT_BATCHES, batches.length) }, () => runBatchWorker())
+      );
 
       // Fetch user data for progress entries separately (more reliable than joins)
       const userIds = [...new Set(allProgressEntries.map((entry: any) => entry.created_by).filter(Boolean))];
@@ -1504,7 +1512,7 @@ export const fastAPI = {
       
       const standaloneProgressImagesSelect = progressImagesLatestOnly
         ? 'id,equipment_id,description,uploaded_by,upload_date,created_at'
-        : 'id,equipment_id,image_url,description,uploaded_by,upload_date,created_at,audio_data,audio_duration';
+        : 'id,equipment_id,image_url,description,uploaded_by,upload_date,created_at,audio_duration';
       
       // PERFORMANCE: Use larger batches, then split only failing batches.
       // This reduces total API calls significantly while preserving timeout resilience.
@@ -1545,11 +1553,26 @@ export const fastAPI = {
         }
       };
 
-      // Process top-level batches sequentially to avoid overwhelming the database.
+      // Process top-level batches with bounded concurrency to lower total wait time.
+      const standaloneBatches: string[][] = [];
       for (let i = 0; i < equipmentIds.length; i += batchSize) {
-        const batch = equipmentIds.slice(i, i + batchSize);
-        await fetchStandaloneProgressBatch(batch);
+        standaloneBatches.push(equipmentIds.slice(i, i + batchSize));
       }
+      const MAX_STANDALONE_CONCURRENT_BATCHES = 2;
+      let standaloneBatchCursor = 0;
+      const runStandaloneWorker = async () => {
+        while (standaloneBatchCursor < standaloneBatches.length) {
+          const currentIndex = standaloneBatchCursor++;
+          const batch = standaloneBatches[currentIndex];
+          await fetchStandaloneProgressBatch(batch);
+        }
+      };
+      await Promise.all(
+        Array.from(
+          { length: Math.min(MAX_STANDALONE_CONCURRENT_BATCHES, standaloneBatches.length) },
+          () => runStandaloneWorker()
+        )
+      );
       
       const progressImagesResponse = { data: standaloneProgressImages };
       const progressEntriesResponse = { data: standaloneProgressEntries };

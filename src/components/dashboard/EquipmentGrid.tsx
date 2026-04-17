@@ -16,7 +16,7 @@ import AddEquipmentForm from "@/components/forms/AddEquipmentForm";
 import AddStandaloneEquipmentFormNew from "@/components/forms/AddStandaloneEquipmentFormNew";
 import AddTechnicalSectionModal from "@/components/forms/AddTechnicalSectionModal";
 import { ProductionChecklistModal } from "@/components/dashboard/ProductionChecklistModal";
-import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getEquipmentDocumentsMetadataBatch, getStandaloneEquipmentDocumentsMetadataBatch, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, uploadStandaloneEquipmentDocumentsBulk, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument, getEquipmentVdcrRecordIds, takeStandaloneEquipmentBundleExtras, takeProjectEquipmentBundleExtras, hasProjectEquipmentBundleExtras, hasStandaloneEquipmentBundleExtras } from "@/lib/api";
+import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, uploadStandaloneEquipmentDocumentsBulk, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument, getEquipmentVdcrRecordIds } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { updateEquipment } from "@/lib/database";
 import { useToast } from "@/hooks/use-toast";
@@ -1038,8 +1038,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     return true;
   }, [projectId]);
 
-  // Main progress image: always load only latest (one image per equipment) to avoid slow load when many uploads
-  const progressImagesApiOptions = { progressImagesLatestOnly: true as const };
+  // Restore eager image payloads (pre-batching behavior): include progress image URLs in the initial equipment load.
+  const progressImagesApiOptions = { progressImagesLatestOnly: false as const };
 
   // One slot only for the latest progress image (no multi-image navigation)
   const expandProgressImagesForOnDemand = useCallback((list: Equipment[]): Equipment[] => {
@@ -1340,163 +1340,24 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
   }, [editingEquipmentId, localEquipment]);
 
-  // Load documents for all equipment (batched: one API call for all IDs instead of N)
+  // Load documents for all equipment (legacy behavior): per-equipment metadata fetch in parallel.
   const loadDocumentsForEquipment = async (equipmentList: Equipment[]) => {
     try {
-      // Batch fetch: single request for all equipment IDs
-      // DISABLED: This function uses hardcoded invalid values and causes errors
-      // Documents are already imported and loaded from database correctly
-      // try {
-      //   await fastAPI.importExistingDocuments();
-      // } catch (error) {
-      //   devError('❌ Error importing existing documents:', error);
-      // }
-
       if (!equipmentList.length) {
         setDocuments({});
         return;
       }
-      const equipmentIds = equipmentList.map((eq) => eq.id);
-
-      // Bundle extras are set inside getEquipmentByProject / getStandaloneEquipment when the RPC returns.
-      // This effect often runs before refreshEquipmentData/Index finishes those calls — without awaiting, take* returns null and we fall back to many REST requests.
-      if (projectId && projectId !== 'standalone') {
-        if (!hasProjectEquipmentBundleExtras(projectId)) {
-          await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
-        }
-      }
-      if (projectId === 'standalone') {
-        if (!hasStandaloneEquipmentBundleExtras()) {
-          await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions);
-        }
-      }
-
-      // One-shot data from get_standalone_equipment_bundle (same shapes as batch REST); avoids duplicate API calls after Index load.
-      if (projectId === 'standalone') {
-        const bundleExtras = takeStandaloneEquipmentBundleExtras();
-        if (bundleExtras) {
-          const vdcrMap: Record<string, string> = {};
-          const transformDoc = (doc: any) => {
-            const department = doc.vdcr_record_id ? (vdcrMap[doc.vdcr_record_id] ?? null) : null;
-            return {
-              id: doc.id,
-              name: doc.document_name || doc.name,
-              document_name: doc.document_name || doc.name,
-              document_url: undefined as string | undefined,
-              uploadedBy: doc.uploaded_by_user?.full_name || doc.uploaded_by || 'Unknown',
-              uploadDate: doc.upload_date || doc.created_at,
-              document_type: doc.document_type || 'Equipment Document',
-              vdcr_code_status: doc.vdcr_code_status,
-              vdcr_document_status: doc.vdcr_document_status,
-              department: department ?? undefined
-            };
-          };
-          const documentsMap: Record<string, any[]> = {};
-          for (const eq of equipmentList) {
-            const docs = bundleExtras.documentsByEquipment[eq.id] ?? [];
-            documentsMap[eq.id] = Array.isArray(docs) ? docs.map(transformDoc) : [];
-          }
-          setDocuments(documentsMap);
-          setEquipmentActivities((prev) => ({ ...prev, ...bundleExtras.activitiesByEquipment }));
-          setProductionChecklistByEquipment((prev) => ({ ...prev, ...bundleExtras.productionChecklistByEquipment }));
-          const teamUpdates: Record<string, any[]> = {};
-          for (const eq of equipmentList) {
-            const teamData = bundleExtras.teamPositionsByEquipment[eq.id] ?? [];
-            if (teamData.length > 0) {
-              teamUpdates[eq.id] = (teamData as any[]).map((member: any, index: number) => ({
-                id: member.id || `member-${index}`,
-                name: member.person_name || 'Unknown',
-                email: member.email || '',
-                phone: member.phone || '',
-                position: member.position_name || '',
-                role: member.role || 'viewer',
-                permissions: getPermissionsByRole(member.role || 'viewer'),
-                status: 'active',
-                avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
-                lastActive: 'Unknown',
-                equipmentAssignments: [eq.id],
-                dataAccess: getDataAccessByRole(member.role || 'viewer'),
-                accessLevel: member.role || 'viewer'
-              }));
-            }
-          }
-          if (Object.keys(teamUpdates).length > 0) {
-            setAllEquipmentTeamMembers((prev) => ({ ...prev, ...teamUpdates }));
-          }
-          return;
-        }
-      }
-
-      // One-shot: get_project_equipment_bundle (same shapes as batch REST + VDCR list for doc departments).
-      if (projectId && projectId !== 'standalone') {
-        const projectExtras = projectId ? takeProjectEquipmentBundleExtras(projectId) : null;
-        if (projectExtras) {
-          let vdcrMap: Record<string, string> = {};
-          let departmentsList: string[] = [];
-          const vdcrRecords = projectExtras.vdcrRecords || [];
-          if (vdcrRecords.length > 0) {
-            const deptSet = new Set<string>();
-            vdcrRecords.forEach((r: any) => {
-              if (r.id && r.department != null && String(r.department).trim()) {
-                vdcrMap[r.id] = String(r.department).trim();
-                deptSet.add(String(r.department).trim());
-              }
-            });
-            departmentsList = Array.from(deptSet).sort();
-            setVdcrRecordIdToDepartment(vdcrMap);
-            setQaDashboardDepartments(departmentsList);
-          }
-          const transformDoc = (doc: any) => {
-            const department = doc.vdcr_record_id ? (vdcrMap[doc.vdcr_record_id] ?? null) : null;
-            return {
-              id: doc.id,
-              name: doc.document_name || doc.name,
-              document_name: doc.document_name || doc.name,
-              document_url: undefined as string | undefined,
-              uploadedBy: doc.uploaded_by_user?.full_name || doc.uploaded_by || 'Unknown',
-              uploadDate: doc.upload_date || doc.created_at,
-              document_type: doc.document_type || 'Equipment Document',
-              vdcr_code_status: doc.vdcr_code_status,
-              vdcr_document_status: doc.vdcr_document_status,
-              department: department ?? undefined
-            };
-          };
-          const documentsMap: Record<string, any[]> = {};
-          for (const eq of equipmentList) {
-            const docs = projectExtras.documentsByEquipment[eq.id] ?? [];
-            documentsMap[eq.id] = Array.isArray(docs) ? docs.map(transformDoc) : [];
-          }
-          setDocuments(documentsMap);
-          setEquipmentActivities((prev) => ({ ...prev, ...projectExtras.activitiesByEquipment }));
-          setProductionChecklistByEquipment((prev) => ({ ...prev, ...projectExtras.productionChecklistByEquipment }));
-          const teamUpdates: Record<string, any[]> = {};
-          for (const eq of equipmentList) {
-            const teamData = projectExtras.teamPositionsByEquipment[eq.id] ?? [];
-            if (teamData.length > 0) {
-              teamUpdates[eq.id] = (teamData as any[]).map((m: any, i: number) => ({
-                id: m.id || `member-${i}`,
-                name: m.person_name || 'Unknown',
-                position: m.position_name || '',
-                position_name: m.position_name,
-                person_name: m.person_name
-              }));
-            }
-          }
-          if (Object.keys(teamUpdates).length > 0) {
-            setAllEquipmentTeamMembers((prev) => ({ ...prev, ...teamUpdates }));
-          }
-          projectBundleTeamAppliedRef.current = true;
-          return;
-        }
-      }
-
-      // Batch: fetch docs and (for project) VDCR records in parallel to get departments – no extra round-trip
       const isProject = projectId && projectId !== 'standalone';
-      const [batchMap, vdcrRecords] = await Promise.all([
-        projectId === 'standalone'
-          ? getStandaloneEquipmentDocumentsMetadataBatch(equipmentIds)
-          : getEquipmentDocumentsMetadataBatch(equipmentIds),
-        isProject ? fastAPI.getVDCRRecordsByProject(projectId) : Promise.resolve(null)
+      const [docsRowsByEquipment, vdcrRecords] = await Promise.all([
+        Promise.all(
+          equipmentList.map(async (eq) => ({
+            equipmentId: eq.id,
+            docs: projectId === 'standalone'
+              ? await getStandaloneEquipmentDocumentsMetadata(eq.id)
+              : await getEquipmentDocumentsMetadata(eq.id),
+          }))
+        ),
+        isProject ? fastAPI.getVDCRRecordsByProject(projectId) : Promise.resolve(null),
       ]);
 
       let vdcrMap: Record<string, string> = {};
@@ -1531,9 +1392,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       };
 
       const documentsMap: Record<string, any[]> = {};
-      for (const eq of equipmentList) {
-        const docs = batchMap[eq.id] ?? [];
-        documentsMap[eq.id] = Array.isArray(docs) ? docs.map(transformDoc) : [];
+      for (const row of docsRowsByEquipment) {
+        documentsMap[row.equipmentId] = Array.isArray(row.docs) ? row.docs.map(transformDoc) : [];
       }
       setDocuments(documentsMap);
     } catch (error) {
@@ -2651,9 +2511,48 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   const [newDocumentName, setNewDocumentName] = useState('');
   const [documentPreview, setDocumentPreview] = useState<{ file: File, name: string } | null>(null);
   const [documentUrlModal, setDocumentUrlModal] = useState<{ url?: string, blobUrl?: string, name: string, uploadedBy?: string, uploadDate?: string, loading?: boolean, previewLoading?: boolean, documentId?: string } | null>(null);
+  const [documentPreviewNonce, setDocumentPreviewNonce] = useState<number>(Date.now());
   const [loadingStates, setLoadingStates] = useState<Record<string, boolean>>({});
   const [documentsLoading, setDocumentsLoading] = useState<Record<string, boolean>>({});
   const [docsSearchByEquipmentId, setDocsSearchByEquipmentId] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (!documentUrlModal) return;
+    // Force a fresh PDF viewer state each time modal opens/changes document.
+    setDocumentPreviewNonce(Date.now());
+  }, [documentUrlModal?.documentId, documentUrlModal?.url, documentUrlModal?.name]);
+
+  const buildFreshPdfPreviewUrl = useCallback((url: string) => {
+    const [baseUrl, existingHash = ''] = url.split('#');
+    const hashParams = new URLSearchParams(existingHash);
+    hashParams.set('page', '1');
+    hashParams.set('zoom', 'page-fit');
+    hashParams.set('view', 'Fit');
+
+    try {
+      const parsed = new URL(baseUrl);
+      parsed.searchParams.set('_preview', String(documentPreviewNonce));
+      return `${parsed.toString()}#${hashParams.toString()}`;
+    } catch {
+      const joinChar = baseUrl.includes('?') ? '&' : '?';
+      return `${baseUrl}${joinChar}_preview=${documentPreviewNonce}#${hashParams.toString()}`;
+    }
+  }, [documentPreviewNonce]);
+
+  useEffect(() => {
+    if (!documentUrlModal || documentUrlModal.loading || !documentUrlModal.url) return;
+    const isPdf = documentUrlModal.name.toLowerCase().endsWith('.pdf');
+    if (!isPdf) return;
+
+    // Route PDF documents through the existing PDF.js modal to avoid browser PDF viewer
+    // restoring stale zoom/scroll state inside iframe/object embeds.
+    setInspectionReportPreview({
+      reportUrl: documentUrlModal.url,
+      fileName: documentUrlModal.name,
+    });
+    if (documentUrlModal.blobUrl) URL.revokeObjectURL(documentUrlModal.blobUrl);
+    setDocumentUrlModal(null);
+  }, [documentUrlModal]);
 
   // Fetch equipment documents metadata only (no document_url) - document URL loaded on-demand when user clicks View
   const fetchEquipmentDocuments = async (equipmentId: string) => {
@@ -2706,6 +2605,26 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       .catch(() => {
         setDocumentUrlModal((prev) => (prev ? { ...prev, previewLoading: false } : null));
       });
+  }, []);
+
+  const openInNewTabReliable = useCallback(async (url: string) => {
+    const newTab = window.open('', '_blank');
+    if (!newTab) {
+      window.open(url, '_blank');
+      return;
+    }
+    newTab.opener = null;
+    try {
+      newTab.document.write('<title>Loading document...</title><p style="font-family:sans-serif;padding:16px;">Loading document preview...</p>');
+      const response = await fetch(url);
+      if (!response.ok) throw new Error('Failed to fetch document');
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      newTab.location.href = blobUrl;
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    } catch {
+      newTab.location.href = url;
+    }
   }, []);
 
   // Open document preview: if URL already loaded use it; else fetch document URL on-demand and show loader. Use blob URL for iframe so preview works.
@@ -2858,7 +2777,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         if (!ctx) return;
         const containerWidth = canvas.parentElement?.clientWidth || 800;
         const baseViewport = page.getViewport({ scale: 1 });
-        const scale = Math.min(1.6, Math.max(0.5, (containerWidth - 24) / baseViewport.width));
+        const scale = Math.min(1, Math.max(0.5, (containerWidth - 24) / baseViewport.width));
         const viewport = page.getViewport({ scale });
         canvas.width = viewport.width;
         canvas.height = viewport.height;
@@ -9240,11 +9159,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
       {/* Document URL Modal - Always rendered via portal outside conditional returns. Blob URL used for iframe so preview works (storage URLs block embedding). */}
       {documentUrlModal && createPortal(
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-2 sm:p-4" style={{ zIndex: 99999 }} onClick={() => {
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-start sm:items-center justify-center overflow-y-auto p-2 sm:p-4" style={{ zIndex: 99999 }} onClick={() => {
           if (documentUrlModal.blobUrl) URL.revokeObjectURL(documentUrlModal.blobUrl);
           setDocumentUrlModal(null);
         }}>
-          <div className="bg-white rounded-lg p-3 sm:p-4 md:p-6 max-w-4xl w-full max-h-[95vh] sm:max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+          <div className="bg-white rounded-lg p-3 sm:p-4 md:p-6 max-w-4xl w-full my-2 sm:my-0 max-h-[calc(100vh-1rem)] sm:max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-2 mb-4">
               <h3 className="text-sm sm:text-base md:text-lg font-semibold text-gray-800 truncate pr-2">Document: {documentUrlModal.name}</h3>
               <div className="flex items-center gap-2 flex-shrink-0">
@@ -9253,7 +9172,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => { window.open(documentUrlModal.url!, '_blank'); }}
+                      onClick={() => { openInNewTabReliable(documentUrlModal.url!); }}
                       className="bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm px-2 sm:px-3 h-7 sm:h-8"
                     >
                       <FileText size={14} className="sm:mr-1 sm:w-4 sm:h-4" />
@@ -9277,7 +9196,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                           URL.revokeObjectURL(url);
                         } catch (error) {
                           console.error('Error downloading file:', error);
-                          window.open(documentUrlModal.url!, '_blank');
+                          openInNewTabReliable(documentUrlModal.url!);
                         }
                       }}
                       className="bg-green-600 hover:bg-green-700 text-white text-xs sm:text-sm px-2 sm:px-3 h-7 sm:h-8"
@@ -9323,13 +9242,32 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 const hasKnownExtension = isPDF || !!isImage;
                 const tryIframe = isPDF || hasKnownExtension === false;
                 if (isPDF || tryIframe) {
+                  const pdfUrl = documentUrlModal.url || previewUrl;
+                  const freshPdfUrl = buildFreshPdfPreviewUrl(pdfUrl);
                   return (
                     <div className="text-center">
-                      <iframe
-                        src={previewUrl}
-                        className="w-full h-[400px] sm:h-[500px] md:h-[600px] border border-gray-200 rounded-lg"
-                        title={documentUrlModal.name}
-                      />
+                      {isPDF ? (
+                        <object
+                          key={freshPdfUrl}
+                          data={freshPdfUrl}
+                          type="application/pdf"
+                          className="w-full h-[60vh] sm:h-[65vh] md:h-[70vh] border border-gray-200 rounded-lg"
+                          aria-label={documentUrlModal.name}
+                        >
+                          <iframe
+                            src={freshPdfUrl}
+                            className="w-full h-[60vh] sm:h-[65vh] md:h-[70vh] border border-gray-200 rounded-lg"
+                            title={documentUrlModal.name}
+                          />
+                        </object>
+                      ) : (
+                        <iframe
+                          key={previewUrl}
+                          src={previewUrl}
+                          className="w-full h-[400px] sm:h-[500px] md:h-[600px] border border-gray-200 rounded-lg"
+                          title={documentUrlModal.name}
+                        />
+                      )}
                     </div>
                   );
                 } else if (isImage) {
@@ -9353,7 +9291,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       <div className="flex flex-col sm:flex-row gap-2 justify-center">
                         <Button
                           variant="outline"
-                          onClick={() => window.open(documentUrlModal.url, '_blank')}
+                          onClick={() => openInNewTabReliable(documentUrlModal.url!)}
                           className="bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm px-3 sm:px-4 h-8 sm:h-9"
                         >
                           <FileText size={14} className="mr-1 sm:w-4 sm:h-4" />
@@ -9375,7 +9313,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                               URL.revokeObjectURL(url);
                             } catch (error) {
                               console.error('Error downloading file:', error);
-                              window.open(documentUrlModal.url!, '_blank');
+                              openInNewTabReliable(documentUrlModal.url!);
                             }
                           }}
                           className="bg-green-600 hover:bg-green-700 text-white text-xs sm:text-sm px-3 sm:px-4 h-8 sm:h-9"
@@ -10378,7 +10316,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         </div>
                         {/* Progress image: QAP latest completed step images (navigable) or fallback to single progress image */}
                         <div className="relative mt-4">
-                          {isLoadingProgressImages ? (
+                          {(isLoadingProgressImages && !(item.progressImages?.[0] || item.progressImagesMetadata?.length)) ? (
                           <div className="w-full h-40 sm:h-52 md:h-64 bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-dashed border-blue-200 rounded-md border border-indigo-100 flex items-center justify-center min-h-0">
                             <div className="text-center">
                               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-3"></div>
@@ -11649,7 +11587,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() => window.open(inspectionReportPreview.reportUrl, '_blank', 'noopener,noreferrer')}
+                  onClick={() => openInNewTabReliable(inspectionReportPreview.reportUrl)}
                   className="text-gray-700"
                 >
                   Open in new tab
@@ -11700,7 +11638,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 </Button>
               </div>
             )}
-            <div className="border border-gray-200 rounded-lg overflow-auto bg-gray-100 flex flex-col items-center justify-center min-h-[400px] max-h-[70vh]">
+            <div className="border border-gray-200 rounded-lg overflow-auto bg-gray-100 flex flex-col items-center justify-start min-h-[400px] max-h-[70vh] p-2 sm:p-3">
               {inspectionReportPdfLoading && (
                 <div className="flex flex-col items-center gap-2 py-16 text-gray-600">
                   <Loader2 className="w-8 h-8 animate-spin text-indigo-600" />
@@ -12356,7 +12294,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ) : documentPreview.file.type === 'application/pdf' ? (
                 <div className="text-center">
                   <iframe
-                    src={URL.createObjectURL(documentPreview.file)}
+                    key={`${documentPreview.name}-${documentPreview.file.lastModified}`}
+                    src={`${URL.createObjectURL(documentPreview.file)}#page=1&view=FitH`}
                     className="w-full h-96 border border-gray-200 rounded-lg"
                     title={documentPreview.name}
                   />
@@ -13053,8 +12992,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
       {/* Document URL Modal - for database documents - Blob URL used for iframe so preview works */}
       {documentUrlModal && createPortal(
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-2 sm:p-4" style={{ zIndex: 99999 }} onClick={() => { if (documentUrlModal.blobUrl) URL.revokeObjectURL(documentUrlModal.blobUrl); setDocumentUrlModal(null); }}>
-          <div className="bg-white rounded-lg p-3 sm:p-4 md:p-6 max-w-4xl w-full max-h-[95vh] sm:max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-start sm:items-center justify-center overflow-y-auto p-2 sm:p-4" style={{ zIndex: 99999 }} onClick={() => { if (documentUrlModal.blobUrl) URL.revokeObjectURL(documentUrlModal.blobUrl); setDocumentUrlModal(null); }}>
+          <div className="bg-white rounded-lg p-3 sm:p-4 md:p-6 max-w-4xl w-full my-2 sm:my-0 max-h-[calc(100vh-1rem)] sm:max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-2 mb-4">
               <h3 className="text-sm sm:text-base md:text-lg font-semibold text-gray-800 truncate pr-2">Document: {documentUrlModal.name}</h3>
               <div className="flex items-center gap-2 flex-shrink-0">
@@ -13063,7 +13002,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => { window.open(documentUrlModal.url!, '_blank'); }}
+                      onClick={() => { openInNewTabReliable(documentUrlModal.url!); }}
                       className="bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm px-2 sm:px-3 h-7 sm:h-8"
                     >
                       <FileText size={14} className="sm:mr-1 sm:w-4 sm:h-4" />
@@ -13087,7 +13026,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                           URL.revokeObjectURL(url);
                         } catch (error) {
                           console.error('Error downloading file:', error);
-                          window.open(documentUrlModal.url!, '_blank');
+                          openInNewTabReliable(documentUrlModal.url!);
                         }
                       }}
                       className="bg-green-600 hover:bg-green-700 text-white text-xs sm:text-sm px-2 sm:px-3 h-7 sm:h-8"
@@ -13133,13 +13072,32 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 const hasKnownExtension = isPDF || !!isImage;
                 const tryIframe = isPDF || hasKnownExtension === false;
                 if (isPDF || tryIframe) {
+                  const pdfUrl = documentUrlModal.url || previewUrl;
+                  const freshPdfUrl = buildFreshPdfPreviewUrl(pdfUrl);
                   return (
                     <div className="text-center">
-                      <iframe
-                        src={previewUrl}
-                        className="w-full h-[400px] sm:h-[500px] md:h-[600px] border border-gray-200 rounded-lg"
-                        title={documentUrlModal.name}
-                      />
+                      {isPDF ? (
+                        <object
+                          key={freshPdfUrl}
+                          data={freshPdfUrl}
+                          type="application/pdf"
+                          className="w-full h-[60vh] sm:h-[65vh] md:h-[70vh] border border-gray-200 rounded-lg"
+                          aria-label={documentUrlModal.name}
+                        >
+                          <iframe
+                            src={freshPdfUrl}
+                            className="w-full h-[60vh] sm:h-[65vh] md:h-[70vh] border border-gray-200 rounded-lg"
+                            title={documentUrlModal.name}
+                          />
+                        </object>
+                      ) : (
+                        <iframe
+                          key={previewUrl}
+                          src={previewUrl}
+                          className="w-full h-[400px] sm:h-[500px] md:h-[600px] border border-gray-200 rounded-lg"
+                          title={documentUrlModal.name}
+                        />
+                      )}
                     </div>
                   );
                 } else if (isImage) {
@@ -13163,7 +13121,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       <div className="flex flex-col sm:flex-row gap-2 justify-center">
                         <Button
                           variant="outline"
-                          onClick={() => window.open(documentUrlModal.url!, '_blank')}
+                          onClick={() => openInNewTabReliable(documentUrlModal.url!)}
                           className="bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm px-3 sm:px-4 h-8 sm:h-9"
                         >
                           <FileText size={14} className="mr-1 sm:w-4 sm:h-4" />
@@ -13185,7 +13143,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                               URL.revokeObjectURL(url);
                             } catch (error) {
                               console.error('Error downloading file:', error);
-                              window.open(documentUrlModal.url!, '_blank');
+                              openInNewTabReliable(documentUrlModal.url!);
                             }
                           }}
                           className="bg-green-600 hover:bg-green-700 text-white text-xs sm:text-sm px-3 sm:px-4 h-8 sm:h-9"

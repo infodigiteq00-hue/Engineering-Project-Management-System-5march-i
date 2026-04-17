@@ -435,46 +435,51 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   };
 
-  // Realtime: update firmData when firm row changes (e.g. services_paused) so no polling needed
+  // One-time fetch: load firmData for current firmId
   useEffect(() => {
     const id = firmId;
     if (!id) return;
-    const channel = supabase
-      .channel(`firm-data-${id}`)
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'firms', filter: `id=eq.${id}` },
-        (payload: { new?: Record<string, unknown> }) => {
-          if (payload.new && typeof payload.new === 'object') {
-            setFirmData((prev) => {
-              const next: FirmData = prev ? { ...prev } : {};
-              if (typeof payload.new?.services_paused === 'boolean') next.services_paused = payload.new.services_paused;
-              if (payload.new?.name !== undefined) next.name = String(payload.new.name);
-              if (payload.new?.logo_url !== undefined) next.logo_url = payload.new.logo_url as string | null;
-              if (payload.new?.equipment_unlock_days !== undefined) next.equipment_unlock_days = Number(payload.new.equipment_unlock_days);
-              if (payload.new?.created_at !== undefined) next.created_at = String(payload.new.created_at);
-              return Object.keys(next).length ? next : null;
-            });
-            try {
-              const stored = localStorage.getItem(FIRM_DATA_CACHE_KEY);
-              const parsed = stored ? JSON.parse(stored) as FirmData : {};
-              if (typeof payload.new?.services_paused === 'boolean') parsed.services_paused = payload.new.services_paused;
-              if (payload.new?.name !== undefined) parsed.name = String(payload.new.name);
-              if (payload.new?.logo_url !== undefined) parsed.logo_url = payload.new.logo_url as string | null;
-              if (payload.new?.equipment_unlock_days !== undefined) parsed.equipment_unlock_days = Number(payload.new.equipment_unlock_days);
-              if (payload.new?.created_at !== undefined) parsed.created_at = String(payload.new.created_at);
-              localStorage.setItem(FIRM_DATA_CACHE_KEY, JSON.stringify(parsed));
-            } catch {
-              // ignore
-            }
-          }
-        }
-      )
-      .subscribe();
-    firmRealtimeChannelRef.current = channel;
+    let isCancelled = false;
+    const fetchFirmData = async () => {
+      const { data, error } = await supabase
+        .from('firms')
+        .select('services_paused, name, logo_url, equipment_unlock_days, created_at')
+        .eq('id', id)
+        .single();
+      const firm = data as {
+        services_paused?: boolean;
+        name?: unknown;
+        logo_url?: string | null;
+        equipment_unlock_days?: number;
+        created_at?: string;
+      } | null;
+      if (error || !firm || isCancelled) return;
+
+      setFirmData((prev) => {
+        const next: FirmData = prev ? { ...prev } : {};
+        if (typeof firm.services_paused === 'boolean') next.services_paused = firm.services_paused;
+        if (firm.name !== undefined) next.name = String(firm.name);
+        if (firm.logo_url !== undefined) next.logo_url = firm.logo_url as string | null;
+        if (firm.equipment_unlock_days !== undefined) next.equipment_unlock_days = Number(firm.equipment_unlock_days);
+        if (firm.created_at !== undefined) next.created_at = String(firm.created_at);
+        return Object.keys(next).length ? next : null;
+      });
+      try {
+        const stored = localStorage.getItem(FIRM_DATA_CACHE_KEY);
+        const parsed = stored ? JSON.parse(stored) as FirmData : {};
+        if (typeof firm.services_paused === 'boolean') parsed.services_paused = firm.services_paused;
+        if (firm.name !== undefined) parsed.name = String(firm.name);
+        if (firm.logo_url !== undefined) parsed.logo_url = firm.logo_url as string | null;
+        if (firm.equipment_unlock_days !== undefined) parsed.equipment_unlock_days = Number(firm.equipment_unlock_days);
+        if (firm.created_at !== undefined) parsed.created_at = String(firm.created_at);
+        localStorage.setItem(FIRM_DATA_CACHE_KEY, JSON.stringify(parsed));
+      } catch {
+        // ignore
+      }
+    };
+    fetchFirmData();
     return () => {
-      supabase.removeChannel(channel);
-      firmRealtimeChannelRef.current = null;
+      isCancelled = true;
     };
   }, [firmId]);
 

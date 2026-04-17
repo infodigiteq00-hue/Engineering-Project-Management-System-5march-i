@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import UnifiedProjectView from "@/components/dashboard/UnifiedProjectView";
 import ProjectFilters from "@/components/dashboard/ProjectFilters";
 import ProjectHeader from "@/components/dashboard/ProjectHeader";
@@ -14,6 +14,8 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import AddProjectForm from "@/components/forms/AddProjectForm";
 import { fastAPI } from "@/lib/api";
+import { activityApi } from "@/lib/activityApi";
+import { supabase } from "@/lib/supabase";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/contexts/AuthContext";
 import { useNotificationReads, UnreadEntityDot } from "@/contexts/NotificationReadsContext";
@@ -616,6 +618,8 @@ const Index = () => {
   const [mainTab, setMainTab] = useState<'projects' | 'equipment' | 'tasks' | 'certificates'>('projects');
   // Store the previous tab before navigating to project view (for back navigation)
   const [previousTab, setPreviousTab] = useState<'projects' | 'equipment' | 'tasks' | 'certificates' | null>(null);
+  // Welcome screen should appear only once right after a fresh login (not on normal refresh).
+  const [showWelcomeScreen, setShowWelcomeScreen] = useState<boolean>(false);
 
   // Manage Weightage modal state (per-project VDCR doc weighting for documentation progress)
   const [weightageModalProjectId, setWeightageModalProjectId] = useState<string | null>(null);
@@ -1058,6 +1062,148 @@ const Index = () => {
   // Equipment onboarding lock: firm's Equipment tab is locked for N days after creation (set by super admin)
   const [equipmentLock, setEquipmentLock] = useState<{ isLocked: boolean; daysRemaining: number; totalDays: number } | null>(null);
   const [equipmentLockModalOpen, setEquipmentLockModalOpen] = useState(false);
+  const [welcomeUpdatesCount, setWelcomeUpdatesCount] = useState(0);
+  useEffect(() => {
+    if (authLoading) return;
+
+    let isCancelled = false;
+    const resolveWelcomeVisibility = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const loginAt = session?.user?.last_sign_in_at || '';
+        const userId = session?.user?.id || localStorage.getItem('userId') || 'anonymous';
+        if (!loginAt) {
+          if (!isCancelled) setShowWelcomeScreen(false);
+          return;
+        }
+
+        const shownKey = `projectflo_welcome_shown_${userId}_${loginAt}`;
+        const alreadyShownForThisLogin = sessionStorage.getItem(shownKey) === '1';
+
+        if (!alreadyShownForThisLogin) {
+          sessionStorage.setItem(shownKey, '1');
+          if (!isCancelled) setShowWelcomeScreen(true);
+          return;
+        }
+
+        if (!isCancelled) setShowWelcomeScreen(false);
+      } catch {
+        if (!isCancelled) setShowWelcomeScreen(false);
+      }
+    };
+
+    void resolveWelcomeVisibility();
+    return () => {
+      isCancelled = true;
+    };
+  }, [authLoading, authFirmId, authUserRole]);
+  const welcomeSalutation = useMemo(() => {
+    const hour = new Date().getHours();
+    if (hour < 12) return 'Good Morning';
+    if (hour < 17) return 'Good Afternoon';
+    return 'Good Evening';
+  }, []);
+  const welcomeFirstName = useMemo(() => {
+    const source = (userName || authUserName || 'User').trim();
+    if (!source) return 'User';
+    return source.split(/\s+/)[0] || 'User';
+  }, [userName, authUserName]);
+  const welcomeProjectIds = useMemo(() => {
+    return projects
+      .filter((p: any) => String(p?.status || '').toLowerCase() !== 'completed')
+      .map((p: any) => p.id)
+      .filter(Boolean);
+  }, [projects]);
+  const shouldShowWelcomeScreen = showWelcomeScreen && !servicesPaused;
+  const resolveWelcomeLoginCutoff = useCallback(async () => {
+    const fallbackIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const sessionSignInAt = session?.user?.last_sign_in_at || '';
+      const sessionUserId = session?.user?.id || localStorage.getItem('userId') || 'anonymous';
+      if (!sessionSignInAt) return fallbackIso;
+
+      const keyBase = `epms_welcome_login_${sessionUserId}`;
+      const currentKey = `${keyBase}_current`;
+      const previousKey = `${keyBase}_previous`;
+      const storedCurrent = localStorage.getItem(currentKey) || '';
+      const storedPrevious = localStorage.getItem(previousKey) || '';
+
+      // Only rotate markers when an actual new sign-in timestamp is observed.
+      if (storedCurrent !== sessionSignInAt) {
+        if (storedCurrent) localStorage.setItem(previousKey, storedCurrent);
+        localStorage.setItem(currentKey, sessionSignInAt);
+        // First observed login for this browser has no previous marker;
+        // use fallback window so welcome count doesn't stay at 0.
+        return storedCurrent || fallbackIso;
+      }
+      return storedPrevious || fallbackIso;
+    } catch {
+      return fallbackIso;
+    }
+  }, []);
+  useEffect(() => {
+    if (!shouldShowWelcomeScreen || authLoading) return;
+    if (!welcomeProjectIds.length) {
+      setWelcomeUpdatesCount(0);
+      return;
+    }
+
+    let isCancelled = false;
+    const loadWelcomeUpdatesCount = async () => {
+      try {
+        const startIso = await resolveWelcomeLoginCutoff();
+        const endIso = new Date().toISOString();
+
+        const [progressEntries, progressImages, documentationUpdates, equipmentUpdates] = await Promise.all([
+          fastAPI.getAllProgressEntriesMetadata(startIso, endIso, welcomeProjectIds, 500, 0).catch(() => []),
+          fastAPI.getAllProgressImagesMetadata(startIso, endIso, welcomeProjectIds, 500, 0).catch(() => []),
+          fastAPI.getAllVDCRDocuments(startIso, endIso, welcomeProjectIds).catch(() => []),
+          activityApi.getEquipmentActivityLogsBatch(welcomeProjectIds, {
+            activityType: 'equipment_updated',
+            dateFrom: startIso,
+            dateTo: endIso
+          }).catch(() => []),
+        ]);
+
+        const total =
+          (Array.isArray(progressEntries) ? progressEntries.length : 0) +
+          (Array.isArray(progressImages) ? progressImages.length : 0) +
+          (Array.isArray(documentationUpdates) ? documentationUpdates.length : 0) +
+          (Array.isArray(equipmentUpdates) ? equipmentUpdates.length : 0);
+
+        if (!isCancelled) setWelcomeUpdatesCount(total);
+      } catch {
+        if (!isCancelled) setWelcomeUpdatesCount(0);
+      }
+    };
+
+    void loadWelcomeUpdatesCount();
+    return () => {
+      isCancelled = true;
+    };
+  }, [authLoading, resolveWelcomeLoginCutoff, shouldShowWelcomeScreen, welcomeProjectIds]);
+  const closeWelcomeScreen = useCallback(() => {
+    setShowWelcomeScreen(false);
+  }, []);
+  const handleWelcomeTabSelection = useCallback((tab: 'projects' | 'equipment') => {
+    if (tab === 'equipment' && equipmentLock?.isLocked) {
+      setEquipmentLockModalOpen(true);
+      return;
+    }
+    if (tab === 'projects') {
+      markAsSeen('projects');
+      if (projectsPageWhenLeftRef.current != null) {
+        setCurrentPage(projectsPageWhenLeftRef.current);
+        projectsPageWhenLeftRef.current = null;
+      }
+    } else {
+      if (mainTab === 'projects') projectsPageWhenLeftRef.current = currentPage;
+      markAsSeen('standalone_equipment');
+    }
+    setMainTab(tab);
+    closeWelcomeScreen();
+  }, [closeWelcomeScreen, currentPage, equipmentLock?.isLocked, mainTab, markAsSeen]);
 
   // Compute equipment lock from AuthContext firmData (no duplicate getFirmById)
   useEffect(() => {
@@ -2450,6 +2596,93 @@ Note: Please download the Recommendation Letter template using the link above, f
   
   // Debug: Log selected project data
 
+  if (shouldShowWelcomeScreen) {
+    return (
+      /* Same shell + palette as main dashboard (ProjectSummaryCards: blue/emerald gradients, gray-50 page, white cards) */
+      <div className="min-h-screen bg-gray-50">
+        <div className="container mx-auto flex min-h-screen max-w-4xl flex-col items-center justify-center px-4 py-8 sm:px-6">
+          <div className="mb-8 flex justify-center">
+            {firmLogo ? (
+              <div className="rounded-xl border border-gray-200 bg-white p-2 shadow-sm">
+                <img
+                  src={firmLogo}
+                  alt={firmName || 'Company logo'}
+                  className="h-11 max-w-[200px] object-contain"
+                />
+              </div>
+            ) : (
+              <div className="rounded-xl border border-gray-200 bg-white px-5 py-2.5 text-sm font-medium text-gray-600 shadow-sm">
+                {firmName || 'Company logo'}
+              </div>
+            )}
+          </div>
+
+          <div className="w-full text-center">
+            <h1 className="text-3xl font-bold tracking-tight text-gray-800 sm:text-4xl">
+              {welcomeSalutation}, {welcomeFirstName}
+            </h1>
+            <p className="mt-2 text-lg text-gray-600">Welcome back to ProjectFlo</p>
+            <div className="mt-4 flex justify-center">
+              <span className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-white px-4 py-2 text-sm text-gray-600 shadow-sm">
+                <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-hidden />
+                <span>
+                  <span className="font-semibold text-gray-800">{welcomeUpdatesCount}</span> updates need your attention
+                </span>
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-10 grid w-full max-w-2xl gap-4 sm:grid-cols-2 sm:gap-6">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleWelcomeTabSelection('projects')}
+              className="relative h-auto min-h-[168px] flex-col items-stretch justify-start gap-0 overflow-hidden rounded-xl border-gray-200 bg-white p-0 text-center font-normal shadow-sm transition-all hover:border-gray-300 hover:bg-white hover:text-gray-900 hover:shadow-md [&_svg]:!size-7"
+            >
+              <div className="h-2 w-full bg-gradient-to-r from-blue-500 via-blue-600 to-blue-700" aria-hidden />
+              <div className="flex flex-col items-center gap-3 p-6">
+                <div className="flex flex-col items-center gap-3">
+                  <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-blue-500/25">
+                    <div className="flex h-11 w-11 items-center justify-center rounded-full bg-blue-500">
+                      <svg className="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                      </svg>
+                    </div>
+                  </div>
+                  <span className="text-xl font-bold text-gray-800">Projects</span>
+                </div>
+                <p className="text-sm leading-snug text-gray-600">Track progress, documents & dispatch</p>
+              </div>
+            </Button>
+
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => handleWelcomeTabSelection('equipment')}
+              className="relative h-auto min-h-[168px] flex-col items-stretch justify-start gap-0 overflow-hidden rounded-xl border-gray-200 bg-white p-0 text-center font-normal shadow-sm transition-all hover:border-gray-300 hover:bg-white hover:text-gray-900 hover:shadow-md [&_svg]:!size-7"
+            >
+              <div className="h-2 w-full bg-gradient-to-r from-emerald-500 via-emerald-600 to-emerald-700" aria-hidden />
+              <div className="flex flex-col items-center gap-3 p-6">
+                <div className="flex flex-col items-center gap-3">
+                  <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-emerald-500/25">
+                    <div className="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-500">
+                      <svg className="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      </svg>
+                    </div>
+                  </div>
+                  <span className="text-xl font-bold text-gray-800">Standalone Equipments</span>
+                </div>
+                <p className="text-sm leading-snug text-gray-600">Monitor individual equipment status</p>
+              </div>
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Blocking modal when super admin has paused company services */}
@@ -2467,7 +2700,6 @@ Note: Please download the Recommendation Letter template using the link above, f
           </div>
         </div>
       )}
-
       <div className="container mx-auto px-4 sm:px-6 py-4 sm:py-8">
         <ProjectHeader loading={loading} userName={userName} userRole={userRole} firmName={firmName} firmLogo={firmLogo} />
 
